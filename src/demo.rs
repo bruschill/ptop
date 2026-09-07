@@ -199,6 +199,8 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
             config_root: "~/.claude".into(),
+            telemetry: None,
+            process_start_id: None,
             file_accesses: vec![
                 FileAccess {
                     path: "src/checkout/payment.rs".into(),
@@ -307,6 +309,8 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.claude-work".into(),
+            telemetry: None,
+            process_start_id: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -411,6 +415,8 @@ pub fn populate_demo(app: &mut App) {
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
             config_root: "~/.claude".into(),
+            telemetry: None,
+            process_start_id: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -465,6 +471,8 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.codex".into(),
+            telemetry: None,
+            process_start_id: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -507,6 +515,8 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.local/share/opencode".into(),
+            telemetry: None,
+            process_start_id: None,
             file_accesses: vec![],
         },
     ];

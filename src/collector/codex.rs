@@ -670,6 +670,8 @@ impl CodexCollector {
                         .parent()
                         .unwrap_or(std::path::Path::new(".")),
                 ),
+                telemetry: None,
+                process_start_id: None,
             },
             rate_limit,
         ))

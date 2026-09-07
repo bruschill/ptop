@@ -1347,6 +1347,25 @@ mod tests {
     }
 
     #[test]
+    fn pi_process_only_layouts_are_truthful_at_supported_sizes() {
+        for (width, height) in [(80, 24), (100, 24), (160, 40)] {
+            let text = render_pi_process(width, height);
+            assert!(
+                text.contains("πPI"),
+                "missing Pi row at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("process only"),
+                "missing attachment state at {width}x{height}\n{text}"
+            );
+            assert!(
+                !text.contains("quota"),
+                "quota rendered in Pi mode at {width}x{height}\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn desktop_size_keeps_mid_panels() {
         let text = render_demo(120, 40);
         for label in ["quota", "tokens", "projects", "ports", "sessions"] {
@@ -1360,6 +1379,29 @@ mod tests {
     fn render_demo(width: u16, height: u16) -> String {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    fn render_pi_process(width: u16, height: u16) -> String {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.agent_cli = "pi";
+        session.pid = 42;
+        session.session_id = "process-42".to_string();
+        session.context_percent = 0.0;
+        session.context_window = 0;
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(1));
+        app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();

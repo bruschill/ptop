@@ -64,7 +64,7 @@ pub enum SessionStatus {
     Executing,
     /// Idle, waiting for user input or permission prompt
     Waiting,
-    /// Session appears recent, but process ownership is not confirmed
+    /// Activity is unavailable, or process ownership is not confirmed.
     Unknown,
     /// Waiting due to rate limit
     RateLimited,
@@ -77,6 +77,171 @@ impl SessionStatus {
     pub fn is_active(&self) -> bool {
         matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryPrecision {
+    Unknown,
+    Inferred,
+    Estimated,
+    Exact,
+}
+
+impl TelemetryPrecision {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Exact => "",
+            Self::Inferred => "~",
+            Self::Estimated => "≈",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Inferred => "inferred",
+            Self::Estimated => "estimated",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryCompleteness {
+    Unknown,
+    Partial,
+    Complete,
+}
+
+impl TelemetryCompleteness {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentState {
+    ProcessOnly,
+    Attached,
+}
+
+impl AttachmentState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ProcessOnly => "process only",
+            Self::Attached => "attached",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentConfidence {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl AttachmentConfidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHealth {
+    Unavailable,
+    Healthy,
+    Stale,
+    Error,
+}
+
+impl SourceHealth {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Healthy => "healthy",
+            Self::Stale => "stale",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryMetadata {
+    pub precision: TelemetryPrecision,
+    pub completeness: TelemetryCompleteness,
+    pub provenance: String,
+    pub source_updated_at_ms: Option<u64>,
+    pub observed_at_ms: u64,
+    pub last_successful_parse_at_ms: Option<u64>,
+    pub stale: bool,
+}
+
+impl TelemetryMetadata {
+    pub fn unknown(provenance: &str, observed_at_ms: u64) -> Self {
+        Self {
+            precision: TelemetryPrecision::Unknown,
+            completeness: TelemetryCompleteness::Unknown,
+            provenance: provenance.to_string(),
+            source_updated_at_ms: None,
+            observed_at_ms,
+            last_successful_parse_at_ms: None,
+            stale: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionTelemetry {
+    pub attachment: AttachmentState,
+    pub attachment_confidence: AttachmentConfidence,
+    pub source_health: SourceHealth,
+    pub error: Option<String>,
+    pub context: TelemetryMetadata,
+    pub usage: TelemetryMetadata,
+}
+
+impl SessionTelemetry {
+    pub fn process_only(observed_at_ms: u64) -> Self {
+        Self {
+            attachment: AttachmentState::ProcessOnly,
+            attachment_confidence: AttachmentConfidence::None,
+            source_health: SourceHealth::Unavailable,
+            error: None,
+            context: TelemetryMetadata::unknown("process", observed_at_ms),
+            usage: TelemetryMetadata::unknown("process", observed_at_ms),
+        }
+    }
+}
+
+/// Return only a process executable name, never command arguments. Pi output
+/// uses this label to avoid exposing prompts, task text, or tool arguments
+/// embedded in a child command line.
+pub fn safe_process_label(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['\'', '"'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +358,13 @@ pub struct AgentSession {
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
     /// For OpenCode: the data directory containing opencode.db.
     pub config_root: String,
+    /// Structured telemetry metadata. Legacy collectors keep this as `None`;
+    /// their existing numeric fields remain authoritative. Pi sets this from
+    /// its first process-only row so unknown values are not presented as zero.
+    pub telemetry: Option<SessionTelemetry>,
+    /// Platform process-start identity used to detect PID reuse where the host
+    /// exposes it. The value is opaque and only compared for equality.
+    pub process_start_id: Option<String>,
 }
 
 impl AgentSession {
@@ -207,6 +379,33 @@ impl AgentSession {
     /// Used for rate calculation to avoid inflated numbers from cache_read.
     pub fn active_tokens(&self) -> u64 {
         self.total_input_tokens + self.total_output_tokens + self.total_cache_create
+    }
+
+    pub fn context_precision(&self) -> TelemetryPrecision {
+        self.telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.context.precision)
+            .unwrap_or(TelemetryPrecision::Exact)
+    }
+
+    pub fn usage_precision(&self) -> TelemetryPrecision {
+        self.telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.usage.precision)
+            .unwrap_or(TelemetryPrecision::Exact)
+    }
+
+    pub fn context_value(&self) -> Option<f64> {
+        (self.context_precision() != TelemetryPrecision::Unknown).then_some(self.context_percent)
+    }
+
+    pub fn context_window_value(&self) -> Option<u64> {
+        (self.context_precision() != TelemetryPrecision::Unknown && self.context_window > 0)
+            .then_some(self.context_window)
+    }
+
+    pub fn total_tokens_value(&self) -> Option<u64> {
+        (self.usage_precision() != TelemetryPrecision::Unknown).then(|| self.total_tokens())
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -302,7 +501,18 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            telemetry: None,
+            process_start_id: None,
         }
+    }
+
+    #[test]
+    fn safe_process_label_drops_private_arguments() {
+        assert_eq!(
+            safe_process_label("/usr/local/bin/node --task 'private prompt'"),
+            "node"
+        );
+        assert_eq!(safe_process_label(r#"C:\tools\bun.exe secret"#), "bun.exe");
     }
 
     #[test]
@@ -315,5 +525,17 @@ mod tests {
     fn test_active_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    }
+
+    #[test]
+    fn process_only_telemetry_distinguishes_unknown_from_known_zero() {
+        let mut session = make_session(0, 0, 0, 0);
+        assert_eq!(session.context_value(), Some(0.0));
+        assert_eq!(session.total_tokens_value(), Some(0));
+
+        session.telemetry = Some(SessionTelemetry::process_only(123));
+        assert_eq!(session.context_value(), None);
+        assert_eq!(session.context_window_value(), None);
+        assert_eq!(session.total_tokens_value(), None);
     }
 }

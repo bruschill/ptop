@@ -40,8 +40,16 @@ pub(crate) fn draw_context_panel_active(
         let ticks_per_min = 30usize;
         let rates: Vec<f64> = app.token_rates.iter().copied().collect();
         let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
-        let total: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
-        let active = app.sessions.iter().filter(|s| s.status.is_active()).count();
+        let total = aggregate_tokens_label(app);
+        let active = if app.is_pi_mode() {
+            "—".to_string()
+        } else {
+            app.sessions
+                .iter()
+                .filter(|s| s.status.is_active())
+                .count()
+                .to_string()
+        };
 
         let rate_label = t("context.rate");
         let total_label = t("context.total");
@@ -52,14 +60,18 @@ pub(crate) fn draw_context_panel_active(
                 Style::default().fg(theme.graph_text),
             ),
             Span::styled(
-                format!("{}/min", fmt_tokens(tokens_per_min as u64)),
+                if app.token_rate_known {
+                    format!("{}/min", fmt_tokens(tokens_per_min as u64))
+                } else {
+                    "—/min".to_string()
+                },
                 Style::default().fg(grad_at(&cpu_grad, 50.0)),
             ),
             Span::styled(
                 format!("  {} ", total_label),
                 Style::default().fg(theme.graph_text),
             ),
-            Span::styled(fmt_tokens(total), Style::default().fg(theme.main_fg)),
+            Span::styled(total, Style::default().fg(theme.main_fg)),
             Span::styled(
                 format!("  {} {}", active, active_label),
                 Style::default().fg(theme.proc_misc),
@@ -91,7 +103,11 @@ fn draw_context_sparkline(
     let mut lines: Vec<Line> = Vec::new();
 
     let spark_w = avail_w.saturating_sub(2).max(4);
-    let rates: Vec<f64> = app.token_rates.iter().copied().collect();
+    let rates: Vec<f64> = if app.token_rate_known {
+        app.token_rates.iter().copied().collect()
+    } else {
+        Vec::new()
+    };
     let max_rate = rates.iter().cloned().fold(1.0_f64, f64::max);
     let normalized: Vec<f64> = rates.iter().map(|&v| v / max_rate).collect();
 
@@ -104,7 +120,11 @@ fn draw_context_sparkline(
     lines.push(Line::from(vec![
         Span::styled(token_rate_label, Style::default().fg(theme.graph_text)),
         Span::styled(
-            format!("  {}/min", fmt_tokens(tokens_per_min as u64)),
+            if app.token_rate_known {
+                format!("  {}/min", fmt_tokens(tokens_per_min as u64))
+            } else {
+                "  —/min".to_string()
+            },
             Style::default().fg(pct_color),
         ),
     ]));
@@ -120,11 +140,11 @@ fn draw_context_sparkline(
     }
 
     // Summary line: total tokens
-    let total_tokens: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
+    let total_tokens = aggregate_tokens_label(app);
     let total_label = t("context.total");
     lines.push(Line::from(vec![
         Span::styled(
-            format!(" {}", fmt_tokens(total_tokens)),
+            format!(" {total_tokens}"),
             Style::default().fg(theme.main_fg),
         ),
         Span::styled(
@@ -151,23 +171,36 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
     let window_label = t("context.window");
 
     for session in &app.sessions {
-        let raw_pct = session.context_percent;
-        let bar_pct = raw_pct.min(100.0);
-        let warn = if raw_pct >= 90.0 {
-            "⚠"
-        } else if raw_pct >= 75.0 {
-            "!"
+        let context_cell = if let Some(raw_pct) = session.context_value() {
+            let bar_pct = raw_pct.min(100.0);
+            let warn = if raw_pct >= 90.0 {
+                "⚠"
+            } else if raw_pct >= 75.0 {
+                "!"
+            } else {
+                ""
+            };
+            let pct_color = grad_at(cpu_grad, bar_pct);
+            let mut spans = meter_bar(bar_pct, bar_width, cpu_grad, theme.meter_bg);
+            spans.push(Span::styled(
+                format!(
+                    " {}{:>3.0}%{}",
+                    session.context_precision().prefix(),
+                    raw_pct,
+                    warn
+                ),
+                Style::default().fg(pct_color),
+            ));
+            Line::from(spans)
         } else {
-            ""
+            Line::from(Span::styled("—", Style::default().fg(theme.inactive_fg)))
         };
-        let pct_color = grad_at(cpu_grad, bar_pct);
 
-        // Context info: window size + compaction count (e.g. "200k C2")
-        let ctx_info = match (session.context_window > 0, session.compaction_count) {
-            (true, 0) => fmt_tokens(session.context_window),
-            (true, n) => format!("{} C{}", fmt_tokens(session.context_window), n),
-            (false, 0) => String::new(),
-            (false, n) => format!("C{}", n),
+        let ctx_info = match (session.context_window_value(), session.compaction_count) {
+            (Some(window), 0) => fmt_tokens(window),
+            (Some(window), n) => format!("{} C{}", fmt_tokens(window), n),
+            (None, 0) => "—".to_string(),
+            (None, n) => format!("— C{n}"),
         };
 
         rows.push(Row::new(vec![
@@ -175,14 +208,7 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
                 truncate_str(&session.project_name, 10),
                 Style::default().fg(theme.title),
             )),
-            Cell::from(Line::from({
-                let mut spans = meter_bar(bar_pct, bar_width, cpu_grad, theme.meter_bg);
-                spans.push(Span::styled(
-                    format!(" {:>3.0}%{}", raw_pct, warn),
-                    Style::default().fg(pct_color),
-                ));
-                spans
-            })),
+            Cell::from(context_cell),
             Cell::from(Span::styled(
                 ctx_info,
                 Style::default().fg(theme.graph_text),
@@ -216,4 +242,51 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
 
     let table = Table::new(rows, widths).header(header);
     f.render_widget(table, area);
+}
+
+fn aggregate_tokens_label(app: &App) -> String {
+    if app.all_usage_known() {
+        fmt_tokens(
+            app.sessions
+                .iter()
+                .map(|session| session.total_tokens())
+                .sum(),
+        )
+    } else {
+        "—".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelVisibility;
+    use crate::model::SessionTelemetry;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn process_only_context_has_no_zero_bar() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.context_percent = 0.0;
+        session.context_window = 0;
+        session.telemetry = Some(SessionTelemetry::process_only(1));
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_context_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(text.contains('—'), "missing unknown marker\n{text}");
+        assert!(text.contains("—/min"), "missing unknown rate\n{text}");
+        assert!(
+            !text.contains("0%"),
+            "unknown context rendered as zero\n{text}"
+        );
+    }
 }

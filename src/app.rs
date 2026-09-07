@@ -84,12 +84,29 @@ impl NarrowSection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorMode {
+    Pi,
+    Legacy,
+}
+
+struct KillConfirmation {
+    pid: u32,
+    agent_cli: &'static str,
+    session_id: String,
+    process_start_id: Option<String>,
+    created_at: Instant,
+}
+
 pub struct App {
     pub sessions: Vec<AgentSession>,
     pub selected: usize,
     pub should_quit: bool,
     /// Token rate per tick (delta). Ring buffer for the braille graph.
     pub token_rates: VecDeque<f64>,
+    /// Whether the latest token-rate observation is authoritative.
+    pub token_rate_known: bool,
     /// Account-level rate limits (Claude, Codex, etc.)
     pub rate_limits: Vec<RateLimitInfo>,
     /// Per-session previous token totals, keyed by (agent_cli, session_id).
@@ -97,6 +114,7 @@ pub struct App {
     /// Rate limit poll counter (read every 5 ticks = 10s)
     rate_limit_counter: u32,
     collector: MultiCollector,
+    pub monitor_mode: MonitorMode,
     /// Cached LLM-generated summaries, keyed by session_id.
     pub summaries: HashMap<String, String>,
     /// Session IDs currently being summarized.
@@ -111,16 +129,18 @@ pub struct App {
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
-    /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
-    kill_confirm: Option<(usize, Instant)>,
+    /// Stable process/session identity awaiting a second kill key press.
+    kill_confirm: Option<KillConfirmation>,
     pub theme: Theme,
     pub show_context: bool,
     pub show_quota: bool,
+    legacy_quota_preference: bool,
     pub show_tokens: bool,
     pub show_projects: bool,
     pub show_ports: bool,
     pub show_sessions: bool,
     pub show_mcp: bool,
+    legacy_mcp_preference: bool,
     pub narrow_tab: NarrowTab,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
@@ -167,20 +187,52 @@ impl App {
         panels: crate::config::PanelVisibility,
         claude_config_dirs: &[PathBuf],
     ) -> Self {
+        Self::new_with_collector(
+            theme,
+            panels,
+            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs),
+            MonitorMode::Legacy,
+        )
+    }
+
+    pub fn new_pi(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+    ) -> Self {
+        Self::new_with_collector(
+            theme,
+            panels,
+            MultiCollector::pi_only(hidden_agents),
+            MonitorMode::Pi,
+        )
+    }
+
+    fn new_with_collector(
+        theme: Theme,
+        panels: crate::config::PanelVisibility,
+        mut collector: MultiCollector,
+        monitor_mode: MonitorMode,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let summaries = load_summary_cache();
-        let mut collector =
-            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
+        let summaries = if monitor_mode == MonitorMode::Legacy {
+            load_summary_cache()
+        } else {
+            HashMap::new()
+        };
         collector.set_mcp_suppress(true);
+        let pi_mode = monitor_mode == MonitorMode::Pi;
         Self {
             sessions: Vec::new(),
             selected: 0,
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
+            token_rate_known: !pi_mode,
             rate_limits: Vec::new(),
             prev_tokens: HashMap::new(),
             rate_limit_counter: 5,
             collector,
+            monitor_mode,
             summaries,
             pending_summaries: HashSet::new(),
             summary_retries: HashMap::new(),
@@ -191,12 +243,14 @@ impl App {
             kill_confirm: None,
             theme,
             show_context: panels.context,
-            show_quota: panels.quota,
+            show_quota: panels.quota && !pi_mode,
+            legacy_quota_preference: panels.quota,
             show_tokens: panels.tokens,
             show_projects: panels.projects,
             show_ports: panels.ports,
             show_sessions: panels.sessions,
-            show_mcp: panels.mcp,
+            show_mcp: panels.mcp && !pi_mode,
+            legacy_mcp_preference: panels.mcp,
             narrow_tab: NarrowTab::Work,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
@@ -218,6 +272,47 @@ impl App {
         }
     }
 
+    pub fn is_pi_mode(&self) -> bool {
+        self.monitor_mode == MonitorMode::Pi
+    }
+
+    pub fn summaries_enabled(&self) -> bool {
+        self.monitor_mode == MonitorMode::Legacy
+    }
+
+    pub fn all_usage_known(&self) -> bool {
+        self.sessions
+            .iter()
+            .all(|session| session.total_tokens_value().is_some())
+    }
+
+    fn update_token_rate(&mut self) {
+        // Unknown samples are omitted instead of entering the graph as false
+        // zero activity. If telemetry later attaches, its first known sample
+        // establishes the baseline and contributes no fabricated delta.
+        self.token_rate_known =
+            (!self.is_pi_mode() || !self.sessions.is_empty()) && self.all_usage_known();
+        if !self.token_rate_known {
+            self.token_rates.clear();
+            self.prev_tokens.clear();
+            return;
+        }
+
+        let mut rate: f64 = 0.0;
+        for session in &self.sessions {
+            let key = (session.agent_cli.to_string(), session.session_id.clone());
+            let total = session.active_tokens();
+            let previous = self.prev_tokens.get(&key).copied().unwrap_or(total);
+            rate += total.saturating_sub(previous) as f64;
+            self.prev_tokens.insert(key, total);
+        }
+
+        self.token_rates.push_back(rate);
+        if self.token_rates.len() > GRAPH_HISTORY_LEN {
+            self.token_rates.pop_front();
+        }
+    }
+
     pub fn toggle_help(&mut self) {
         self.help_open = !self.help_open;
         if self.help_open {
@@ -233,6 +328,10 @@ impl App {
     }
 
     pub fn toggle_panel(&mut self, panel: u8) {
+        if self.is_pi_mode() && matches!(panel, 2 | 7) {
+            self.set_status("This panel is unavailable in Pi mode".to_string());
+            return;
+        }
         match panel {
             1 => self.show_context = !self.show_context,
             2 => self.show_quota = !self.show_quota,
@@ -252,6 +351,9 @@ impl App {
     /// behavior so the user can see exactly what mcp-server fd holding
     /// produces (mostly stale "Done" rows).
     pub fn toggle_mcp_session_suppression(&mut self) {
+        if self.is_pi_mode() {
+            return;
+        }
         self.mcp_suppress_sessions = !self.mcp_suppress_sessions;
         let label = if self.mcp_suppress_sessions {
             "on"
@@ -264,12 +366,20 @@ impl App {
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
             context: self.show_context,
-            quota: self.show_quota,
+            quota: if self.is_pi_mode() {
+                self.legacy_quota_preference
+            } else {
+                self.show_quota
+            },
             tokens: self.show_tokens,
             projects: self.show_projects,
             ports: self.show_ports,
             sessions: self.show_sessions,
-            mcp: self.show_mcp,
+            mcp: if self.is_pi_mode() {
+                self.legacy_mcp_preference
+            } else {
+                self.show_mcp
+            },
         };
         if let Err(e) = crate::config::save_panel_visibility(&panels) {
             self.set_status(format!("panels save failed: {}", e));
@@ -302,6 +412,10 @@ impl App {
     }
 
     pub fn config_toggle_selected(&mut self) {
+        if self.is_pi_mode() && matches!(self.config_selected, 2 | 7) {
+            self.set_status("This panel is unavailable in Pi mode".to_string());
+            return;
+        }
         match self.config_selected {
             0 => {
                 self.cycle_theme();
@@ -491,20 +605,20 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
-    /// Full refresh used by the TUI: collect monitored data, then generate and
-    /// retry session summaries. Equivalent to [`App::tick_no_summaries`] followed
-    /// by [`App::drain_and_retry_summaries`].
+    /// Full refresh used by the TUI. Legacy mode also generates and retries
+    /// session summaries; Pi mode only performs passive collection.
     pub fn tick(&mut self) {
         self.tick_no_summaries();
-        self.drain_and_retry_summaries();
+        if self.summaries_enabled() {
+            self.drain_and_retry_summaries();
+        }
     }
 
     /// Refresh all monitored data WITHOUT spawning background summary jobs.
     ///
-    /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
-    /// shells out to `claude --print` to generate session titles. Headless
-    /// consumers (e.g. the web snapshot API) call this variant so they never
-    /// spawn subprocesses or consume the user's Claude quota.
+    /// In legacy mode, `tick` can call [`App::drain_and_retry_summaries`],
+    /// which shells out to `claude --print`. Headless consumers can call this
+    /// variant to prevent summary subprocesses. Pi mode never enables them.
     pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
@@ -517,41 +631,34 @@ impl App {
         }
         self.clamp_selection_to_visible();
 
-        // Compute rate as sum of per-session deltas (stable across session churn).
-        // Update prev_tokens in place; stale entries are harmless (bounded by
-        // total unique sessions ever seen) and keeping them avoids false spikes
-        // when a session transiently disappears from one poll.
-        let mut rate: f64 = 0.0;
-        for s in &self.sessions {
-            let key = (s.agent_cli.to_string(), s.session_id.clone());
-            let total = s.active_tokens();
-            let prev = self.prev_tokens.get(&key).copied().unwrap_or(total);
-            rate += total.saturating_sub(prev) as f64;
-            self.prev_tokens.insert(key, total);
-        }
+        self.update_token_rate();
 
-        self.token_rates.push_back(rate);
-        if self.token_rates.len() > GRAPH_HISTORY_LEN {
-            self.token_rates.pop_front();
-        }
-
-        // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
-        if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
-            self.rate_limit_counter = 0;
-            let extra_dirs = self.collector.all_config_dirs();
-            self.rate_limits = read_rate_limits(&extra_dirs);
-            // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
-            self.rate_limits.extend(self.collector.agent_rate_limits());
+        // Pi has no provider-independent account quota source. Do not read or
+        // publish legacy Claude/Codex quota files in Pi mode.
+        if self.is_pi_mode() {
+            self.rate_limits.clear();
         } else {
-            self.rate_limit_counter += 1;
-        }
+            // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
+            if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
+                self.rate_limit_counter = 0;
+                let extra_dirs = self.collector.all_config_dirs();
+                self.rate_limits = read_rate_limits(&extra_dirs);
+                // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
+                self.rate_limits.extend(self.collector.agent_rate_limits());
+            } else {
+                self.rate_limit_counter += 1;
+            }
 
-        promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+            promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+        }
     }
 
     /// Drain completed summary results and spawn retries. Does NOT recollect
     /// sessions, so it is safe for `--once` mode (stable snapshot).
     pub fn drain_and_retry_summaries(&mut self) {
+        if !self.summaries_enabled() {
+            return;
+        }
         while let Ok((sid, prompt, maybe_summary)) = self.summary_rx.try_recv() {
             self.pending_summaries.remove(&sid);
             match maybe_summary {
@@ -712,50 +819,79 @@ impl App {
             return;
         }
         let session = &self.sessions[self.selected];
-        if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
+        if matches!(session.status, SessionStatus::Done)
+            || (matches!(session.status, SessionStatus::Unknown) && session.agent_cli != "pi")
+            || session.pid == 0
+        {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if session.agent_cli == "pi" {
+            self.set_status("Pi process controls are unavailable on Windows".to_string());
             return;
         }
 
-        // Check if we have a pending confirmation for this exact session
-        if let Some((idx, ts)) = self.kill_confirm.take() {
-            if idx == self.selected && ts.elapsed().as_secs() < 2 {
-                // Confirmed — verify PID still runs a killable agent before killing
-                let pid = session.pid;
-                let verified = std::process::Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "command="])
-                    .output()
-                    .ok()
-                    .map(|output| {
-                        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        is_killable_agent_command(&cmd)
-                    })
-                    .unwrap_or(false);
+        let selected_identity = (session.pid, session.agent_cli, session.session_id.clone());
+
+        // Confirm against stable process/session identity, not a mutable table row.
+        if let Some(target) = self.kill_confirm.take() {
+            let same_target = target.pid == selected_identity.0
+                && target.agent_cli == selected_identity.1
+                && target.session_id == selected_identity.2;
+            if same_target && target.created_at.elapsed().as_secs() < 2 {
+                let process_info = crate::collector::process::get_process_info();
+                let verified = process_info.get(&target.pid).is_some_and(|proc| {
+                    let same_start = target.process_start_id.as_ref().is_none_or(|expected| {
+                        crate::collector::pi::process_start_id(target.pid).as_ref()
+                            == Some(expected)
+                    });
+                    same_start
+                        && command_matches_agent(&proc.command, target.agent_cli)
+                        && is_killable_agent_command(&proc.command)
+                });
                 if !verified {
-                    self.set_status(format!("PID {} is no longer a known agent process", pid));
+                    self.set_status(format!(
+                        "PID {} no longer matches the selected process",
+                        target.pid
+                    ));
                     return;
                 }
                 let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
+                    .args(["-9", &target.pid.to_string()])
                     .output();
                 self.tick();
                 return;
             }
         }
 
-        // First press — ask for confirmation
         let name = self
             .summaries
             .get(&session.session_id)
             .cloned()
             .unwrap_or_else(|| format!("PID {}", session.pid));
-        self.kill_confirm = Some((self.selected, Instant::now()));
-        self.set_status(format!("Press x again to kill: {}", name));
+        self.kill_confirm = Some(KillConfirmation {
+            pid: session.pid,
+            agent_cli: session.agent_cli,
+            session_id: session.session_id.clone(),
+            process_start_id: session
+                .process_start_id
+                .clone()
+                .or_else(|| crate::collector::pi::process_start_id(session.pid)),
+            created_at: Instant::now(),
+        });
+        self.set_status(format!("Press x again to kill: {name}"));
     }
 
     /// Kill all orphan port processes (Shift+X).
     /// Does a fresh port scan and validates PID identity + port ownership
     /// immediately before sending any signals to avoid PID reuse / stale cache issues.
     pub fn kill_orphan_ports(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.is_pi_mode() {
+            self.set_status("Pi process controls are unavailable on Windows".to_string());
+            return;
+        }
+
         use crate::collector::process::get_listening_ports;
 
         // Fresh port scan right now — don't rely on cached data
@@ -798,13 +934,42 @@ impl App {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
-        let target_pid = self.sessions[self.selected].pid;
+        let session = &self.sessions[self.selected];
+        let target_pid = session.pid;
+        let agent_cli = session.agent_cli;
+        let process_start_id = session.process_start_id.clone();
+
+        #[cfg(target_os = "windows")]
+        if agent_cli == "pi" {
+            self.set_status("Pi process controls are unavailable on Windows".to_string());
+            return JumpOutcome::NoOp;
+        }
+
+        if agent_cli == "pi" {
+            let process_info = crate::collector::process::get_process_info();
+            let verified = process_info.get(&target_pid).is_some_and(|proc| {
+                let same_start = process_start_id.as_ref().is_none_or(|expected| {
+                    crate::collector::pi::process_start_id(target_pid).as_ref() == Some(expected)
+                });
+                same_start && command_matches_agent(&proc.command, agent_cli)
+            });
+            if !verified {
+                self.set_status(format!(
+                    "PID {target_pid} no longer matches the selected process"
+                ));
+                return JumpOutcome::NoOp;
+            }
+        }
+
         crate::jump::run_jump(target_pid)
     }
 
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
     /// Done sessions skip pending state to avoid stuck "..." display.
     pub fn session_summary(&self, session: &AgentSession) -> String {
+        if session.telemetry.is_some() && session.agent_cli == "pi" {
+            return "process only".to_string();
+        }
         if let Some(summary) = self.summaries.get(&session.session_id) {
             summary.clone()
         } else if matches!(session.status, SessionStatus::Done) {
@@ -998,10 +1163,21 @@ fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &
     }
 }
 
+fn command_matches_agent(cmd: &str, agent_cli: &str) -> bool {
+    match agent_cli {
+        "claude" | "codex" | "opencode" => {
+            crate::collector::process::cmd_has_binary(cmd, agent_cli)
+        }
+        "pi" => crate::collector::pi::is_pi_command(cmd),
+        _ => false,
+    }
+}
+
 fn is_supported_agent_command(cmd: &str) -> bool {
-    crate::collector::process::cmd_has_binary(cmd, "claude")
-        || crate::collector::process::cmd_has_binary(cmd, "codex")
-        || crate::collector::process::cmd_has_binary(cmd, "opencode")
+    command_matches_agent(cmd, "claude")
+        || command_matches_agent(cmd, "codex")
+        || command_matches_agent(cmd, "opencode")
+        || command_matches_agent(cmd, "pi")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {
@@ -1052,6 +1228,8 @@ mod tests {
             config_root: String::new(),
             git_added: 0,
             git_modified: 0,
+            telemetry: None,
+            process_start_id: None,
         }
     }
 
@@ -1097,11 +1275,96 @@ mod tests {
     }
 
     #[test]
-    fn supported_agent_command_accepts_opencode() {
+    fn supported_agent_command_accepts_opencode_and_pi() {
         assert!(is_supported_agent_command("/usr/local/bin/claude"));
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(is_supported_agent_command("pi --mode rpc"));
         assert!(!is_supported_agent_command("node server.js"));
+        assert!(!command_matches_agent(
+            "node app.js /opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+            "pi"
+        ));
+    }
+
+    #[test]
+    fn pi_mode_disables_legacy_quota_mcp_and_summaries() {
+        let app = App::new_pi(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        assert_eq!(app.monitor_mode, MonitorMode::Pi);
+        assert!(!app.show_quota);
+        assert!(!app.show_mcp);
+        assert!(!app.summaries_enabled());
+    }
+
+    #[test]
+    fn unknown_pi_usage_is_not_aggregated_as_known_zero() {
+        let mut app = App::new_pi(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("pi");
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(1));
+        app.sessions.push(session);
+        app.token_rates.push_back(99.0);
+        app.prev_tokens
+            .insert(("pi".to_string(), "session".to_string()), 99);
+
+        app.update_token_rate();
+
+        assert!(!app.all_usage_known());
+        assert!(!app.token_rate_known);
+        assert!(app.token_rates.is_empty());
+    }
+
+    #[test]
+    fn empty_pi_fleet_keeps_token_rate_unknown() {
+        let mut app = App::new_pi(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+
+        app.update_token_rate();
+
+        assert!(!app.token_rate_known);
+        assert!(app.token_rates.is_empty());
+    }
+
+    #[test]
+    fn known_zero_usage_records_a_zero_rate() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions.push(waiting_session("claude"));
+
+        app.update_token_rate();
+
+        assert!(app.token_rate_known);
+        assert_eq!(app.token_rates.back(), Some(&0.0));
+    }
+
+    #[test]
+    fn pi_mode_never_queues_summary_generation() {
+        let mut app = App::new_pi(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("pi");
+        session.initial_prompt = "must remain local".to_string();
+        app.sessions.push(session);
+
+        app.drain_and_retry_summaries();
+
+        assert!(!app.has_pending_summaries());
+        assert!(app.summaries.is_empty());
     }
 
     #[test]

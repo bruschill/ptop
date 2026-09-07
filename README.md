@@ -2,17 +2,18 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+The default Pi Fleet mode shows local Pi coding-agent processes, child processes, open ports, and project state. It reports session telemetry as unavailable until it can attach a session file with high-confidence ownership evidence.
+
+The previous Claude Code, Codex CLI, and OpenCode monitor remains available through `abtop --legacy` during the Pi rollout.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
 ## Why
 
 - Running 3+ agents across projects? See them all in one screen.
-- Hitting rate limits? Watch your quota in real-time.
+- Using legacy mode? Watch supported provider quota in real time.
 - Agent spawned a server and forgot to kill it? Orphan port detection.
-- Context window filling up? Per-session % bars with warnings.
+- When telemetry is available, see per-session context warnings.
 
 All read-only. No API keys. No auth.
 
@@ -35,7 +36,7 @@ cargo install abtop
 
 ### Windows
 
-Native support — no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows has no load average, so LOAD is reported as 0. OpenCode session discovery additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
+Native support — no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows Pi support is process-only; Pi terminal jump and kill controls are disabled until trusted identity checks are available. Windows has no load average, so LOAD is reported as 0. OpenCode discovery in legacy mode additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
 
 ```powershell
 powershell -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
@@ -50,10 +51,11 @@ Pre-built binaries for all platforms are available on the [GitHub Releases](http
 ## Usage
 
 ```bash
-abtop                    # Launch TUI
-abtop --once             # Print snapshot and exit
-abtop --json             # Print one JSON snapshot and exit (for scripts/tools)
-abtop --setup            # Install rate limit collection hook
+abtop                    # Launch the Pi Fleet TUI
+abtop --once             # Print a Pi Fleet snapshot and exit
+abtop --json             # Print one Pi Fleet JSON snapshot and exit
+abtop --legacy           # Use Claude/Codex/OpenCode collection
+abtop --setup            # Install the legacy Claude rate-limit hook
 abtop --theme dracula    # Launch with a specific theme
 abtop --mouse            # Enable mouse click/scroll navigation
 ```
@@ -75,18 +77,19 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Pi          | Claude Code | Codex CLI | OpenCode |
+| ----------------- | :---------: | :---------: | :-------: | :------: |
+| Process Discovery |     ✅      |     ✅      |    ✅     |    ✅    |
+| Session Telemetry |     🚧      |     ✅      |    ✅     |    ✅    |
+| Token Tracking    |      —      |     ✅      |    ✅     |    ✅    |
+| Context Window %  |      —      |     ✅      |    ✅     |    ❌    |
+| Status Detection  |      —      |     ✅      |    ✅     |    ✅    |
+| Current Task      |      —      |     ✅      |    ✅     |    ❌    |
+| Rate Limit        |      —      |     ✅      |    ✅     |    ❌    |
+| Git Status        |     ✅      |     ✅      |    ✅     |    ✅    |
+| Children / Ports  |     ✅      |     ✅      |    ✅     |    ✅    |
+| Subagents         |      —      |     ✅      |    ❌     |    ❌    |
+| Memory Status     |      —      |     ✅      |    ❌     |    ❌    |
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
@@ -124,8 +127,8 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ```toml
 theme = "btop"
-# Hide specific agent CLIs from the TUI (case-insensitive).
-# Useful if you only use one agent and want a cleaner view.
+# Hide agent CLIs from the TUI (case-insensitive).
+# Use "pi" for Pi Fleet, or legacy CLI names with --legacy.
 hidden_agents = ["codex"]
 # Additional Claude Code profile roots to scan.
 # abtop also auto-discovers ~/.claude and ~/.claude-* roots that contain
@@ -178,8 +181,8 @@ use abtop::app::App;
 use abtop::{config, theme::Theme};
 
 let cfg = config::load_config();
-let mut app = App::new_with_config_and_claude_dirs(
-    Theme::default(), &cfg.hidden_agents, cfg.panels, &cfg.claude_config_dirs,
+let mut app = App::new_pi(
+    Theme::default(), &cfg.hidden_agents, cfg.panels,
 );
 app.tick_no_summaries();
 let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
@@ -191,9 +194,9 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 ## Privacy
 
-abtop reads local files and local process/open-file metadata only. No API keys, no auth. In the TUI and `--once` output, tool names and file paths are shown, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Pi Fleet mode is metadata-only and does not generate summaries or make network calls. Legacy mode can generate session summaries through `claude --print`; that command may call the Claude API.
 
-The JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
+The JSON snapshot includes `monitor_mode`, `token_rate_value`, and structured Pi `telemetry` fields. Process-only Pi rows use `null` for authoritative context, usage, and token-rate values; the legacy numeric fields remain compatibility placeholders. Pi output never includes child command arguments, prompts, task text, tool arguments, tool results, or transcript content. It reduces child commands to executable labels. Legacy snapshots can include `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Treat snapshots as local/private data. Do not write them to shared logs or expose them on a network without access controls.
 
 ## Acknowledgements
 

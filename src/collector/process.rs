@@ -111,6 +111,15 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     map
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn quote_process_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     use std::sync::{Mutex, OnceLock};
@@ -147,7 +156,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
             proc_
                 .cmd()
                 .iter()
-                .map(|s| s.to_string_lossy().into_owned())
+                .map(|s| quote_process_arg(&s.to_string_lossy()))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
@@ -533,6 +542,20 @@ pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_process_args_preserve_windows_path_boundaries() {
+        let command = [
+            r#"C:\Program Files\nodejs\node.exe"#,
+            r#"C:\Users\me\pi-coding-agent\dist\cli.js"#,
+        ]
+        .map(quote_process_arg)
+        .join(" ");
+        assert_eq!(
+            command,
+            r#""C:\Program Files\nodejs\node.exe" C:\Users\me\pi-coding-agent\dist\cli.js"#
+        );
+    }
 
     #[test]
     fn cmd_has_binary_basename_match() {
