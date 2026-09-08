@@ -1,8 +1,11 @@
-use super::{process, AgentCollector, SharedProcessData};
+use super::{
+    pi_subagents::{pi_subagent_runner_run_id, PiSubagentParent, PiSubagentsCollector},
+    process, AgentCollector, SharedProcessData,
+};
 use crate::model::{
     AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
-    SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness, TelemetryMetadata,
-    TelemetryPrecision, UsageTelemetryDetails,
+    FleetTelemetry, SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness,
+    TelemetryMetadata, TelemetryPrecision, UsageTelemetryDetails,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -40,6 +43,7 @@ pub struct PiCollector {
     attachments: HashMap<u32, PiAttachment>,
     tails: HashMap<PathBuf, PiTail>,
     model_catalogs: HashMap<PathBuf, ModelCatalogCache>,
+    subagents: PiSubagentsCollector,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +226,7 @@ impl PiCollector {
             attachments: HashMap::new(),
             tails: HashMap::new(),
             model_catalogs: HashMap::new(),
+            subagents: PiSubagentsCollector::new(),
         }
     }
 
@@ -272,6 +277,32 @@ impl PiCollector {
             .collect();
         self.model_catalogs
             .retain(|root, _| owned_agent_roots.contains(root));
+        let fleet_parents: Vec<PiSubagentParent> = attachment_results
+            .values()
+            .filter_map(|result| {
+                result
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| PiSubagentParent {
+                        session_id: attachment.session_id.clone(),
+                        session_file: attachment.path.clone(),
+                    })
+            })
+            .collect();
+        let live_pids: HashSet<u32> = shared.process_info.keys().copied().collect();
+        let verified_runner_runs: HashMap<u32, String> = shared
+            .process_info
+            .iter()
+            .filter_map(|(pid, process)| {
+                pi_subagent_runner_run_id(&process.command).map(|run_id| (*pid, run_id))
+            })
+            .collect();
+        let mut fleet_by_session = self.subagents.collect(
+            &fleet_parents,
+            &live_pids,
+            &verified_runner_runs,
+            observed_at_ms,
+        );
 
         pi_pids
             .into_iter()
@@ -286,7 +317,7 @@ impl PiCollector {
                 let process_start_id = self.start_id_cache.get(&pid).cloned().flatten();
                 let attachment_result = attachment_results.get(&pid)?;
                 let requested_attachment = attachment_result.attachment.as_ref();
-                let (attachment, telemetry, data) = match requested_attachment {
+                let (attachment, mut telemetry, data) = match requested_attachment {
                     Some(attachment) => match self.telemetry_for_attachment(
                         attachment,
                         observed_at_ms,
@@ -308,6 +339,11 @@ impl PiCollector {
                         PiSessionData::default(),
                     ),
                 };
+                if let Some(attachment) = attachment {
+                    if let Some(fleet) = fleet_by_session.remove(&attachment.session_id) {
+                        telemetry.fleet = fleet;
+                    }
+                }
                 Some(AgentSession {
                     agent_cli: "pi",
                     pid,
@@ -665,6 +701,10 @@ impl PiCollector {
                     reported_cost: data.cost,
                     reason: data.usage_reason.clone(),
                 },
+                fleet: FleetTelemetry::unavailable(
+                    observed_at_ms,
+                    "pi-subagents status root unavailable",
+                ),
             },
             data,
         ))

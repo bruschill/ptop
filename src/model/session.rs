@@ -181,6 +181,251 @@ impl SourceHealth {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetVisibility {
+    Supported,
+    Unavailable,
+}
+
+impl FleetVisibility {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetRunState {
+    Unknown,
+    Queued,
+    Running,
+    Complete,
+    Failed,
+    Partial,
+    Paused,
+    Stopped,
+    Rejected,
+}
+
+impl FleetRunState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Partial => "partial",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Complete
+                | Self::Failed
+                | Self::Partial
+                | Self::Paused
+                | Self::Stopped
+                | Self::Rejected
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetRunMode {
+    Unknown,
+    Single,
+    Parallel,
+    Chain,
+    Workflow,
+}
+
+impl FleetRunMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Single => "single",
+            Self::Parallel => "parallel",
+            Self::Chain => "chain",
+            Self::Workflow => "workflow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetExecution {
+    Unknown,
+    InProcess,
+    Background,
+}
+
+impl FleetExecution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "execution unknown",
+            Self::InProcess => "in process",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetIdentitySource {
+    ChildId,
+    WorkflowKey,
+    RunId,
+    Index,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetProcessTerminalState {
+    Pending,
+    Observed,
+    Unknown,
+    NotStarted,
+}
+
+impl FleetProcessTerminalState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Observed => "observed",
+            Self::Unknown => "unknown",
+            Self::NotStarted => "not started",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FleetProcessTerminal {
+    pub state: FleetProcessTerminalState,
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetUsageAccounting {
+    /// Extension aggregate kept separate because Pi transcript tool results may
+    /// already include the same child usage.
+    SeparateRunAggregate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FleetUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reported_cost: Option<f64>,
+    pub accounting: FleetUsageAccounting,
+}
+
+impl FleetUsage {
+    pub fn separate_run_aggregate() -> Self {
+        Self {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            reported_cost: None,
+            accounting: FleetUsageAccounting::SeparateRunAggregate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FleetChild {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub identity_source: FleetIdentitySource,
+    pub name: String,
+    pub state: FleetRunState,
+    pub execution: FleetExecution,
+    pub model: Option<String>,
+    pub current_tool: Option<String>,
+    pub activity: Option<String>,
+    pub started_at_ms: Option<u64>,
+    pub updated_at_ms: Option<u64>,
+    pub ended_at_ms: Option<u64>,
+    pub usage: FleetUsage,
+    pub children: Vec<FleetChild>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FleetRun {
+    pub lifecycle_version: Option<u64>,
+    pub run_id: String,
+    pub parent_run_id: Option<String>,
+    pub nested: bool,
+    pub mode: FleetRunMode,
+    pub state: FleetRunState,
+    pub execution: FleetExecution,
+    pub runner_pid: Option<u32>,
+    pub started_at_ms: Option<u64>,
+    pub updated_at_ms: Option<u64>,
+    pub ended_at_ms: Option<u64>,
+    pub source_updated_at_ms: u64,
+    pub stale: bool,
+    pub process_terminal: Option<FleetProcessTerminal>,
+    pub usage: FleetUsage,
+    pub children: Vec<FleetChild>,
+    pub omitted_children: u32,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FleetTelemetry {
+    pub source_health: SourceHealth,
+    pub provenance: String,
+    pub foreground_visibility: FleetVisibility,
+    pub background_visibility: FleetVisibility,
+    pub observed_at_ms: u64,
+    pub source_updated_at_ms: Option<u64>,
+    pub stale: bool,
+    pub retention_days: u64,
+    pub scanned_statuses: u32,
+    pub malformed_statuses: u32,
+    pub unsupported_statuses: u32,
+    pub omitted_statuses: u32,
+    pub runs: Vec<FleetRun>,
+    pub reason: Option<String>,
+}
+
+impl FleetTelemetry {
+    pub fn unavailable(observed_at_ms: u64, reason: &str) -> Self {
+        Self {
+            source_health: SourceHealth::Unavailable,
+            provenance: "pi-subagents status.json".to_string(),
+            foreground_visibility: FleetVisibility::Unavailable,
+            background_visibility: FleetVisibility::Supported,
+            observed_at_ms,
+            source_updated_at_ms: None,
+            stale: false,
+            retention_days: 30,
+            scanned_statuses: 0,
+            malformed_statuses: 0,
+            unsupported_statuses: 0,
+            omitted_statuses: 0,
+            runs: Vec::new(),
+            reason: Some(reason.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TelemetryMetadata {
     pub precision: TelemetryPrecision,
@@ -232,6 +477,7 @@ pub struct SessionTelemetry {
     pub usage: TelemetryMetadata,
     pub context_details: ContextTelemetryDetails,
     pub usage_details: UsageTelemetryDetails,
+    pub fleet: FleetTelemetry,
 }
 
 impl SessionTelemetry {
@@ -255,6 +501,10 @@ impl SessionTelemetry {
                 reported_cost: None,
                 reason: Some("no owned Pi session JSONL".to_string()),
             },
+            fleet: FleetTelemetry::unavailable(
+                observed_at_ms,
+                "owned parent session identity unavailable",
+            ),
         }
     }
 }

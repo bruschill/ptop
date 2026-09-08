@@ -3,6 +3,7 @@ pub mod codex;
 pub mod mcp;
 pub mod opencode;
 pub mod pi;
+mod pi_subagents;
 pub mod process;
 pub mod rate_limit;
 
