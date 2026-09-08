@@ -1,7 +1,8 @@
 use super::{process, AgentCollector, SharedProcessData};
 use crate::model::{
-    AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, SessionStatus,
-    SessionTelemetry, SourceHealth, TelemetryCompleteness, TelemetryMetadata,
+    AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
+    SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness, TelemetryMetadata,
+    TelemetryPrecision, UsageTelemetryDetails,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,12 @@ const MAX_OPEN_FDS_SCANNED_PER_COLLECT: usize = 4096;
 const MAX_LSOF_RECORD_BYTES: usize = 4096;
 const HEADER_READ_CHUNK_BYTES: usize = 4096;
 const MAX_TELEMETRY_ERROR_BYTES: usize = 160;
+const MAX_SEMANTIC_ENTRIES: usize = 8_192;
+const MAX_SEMANTIC_ID_BYTES: usize = 256;
+const MAX_SEMANTIC_PARENT_BYTES: usize = 256;
+const MAX_SEMANTIC_METADATA_BYTES: usize = 256;
+const MAX_MODEL_CATALOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MODEL_CATALOG_ENTRIES: usize = 1_024;
 
 /// Passive collector for local Pi coding-agent processes.
 ///
@@ -32,6 +39,7 @@ pub struct PiCollector {
     start_id_cache: HashMap<u32, Option<String>>,
     attachments: HashMap<u32, PiAttachment>,
     tails: HashMap<PathBuf, PiTail>,
+    model_catalogs: HashMap<PathBuf, ModelCatalogCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +82,117 @@ struct PiTail {
     last_successful_parse_at_ms: Option<u64>,
     complete: bool,
     error: Option<String>,
+    semantic: PiSemantic,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PiSemantic {
+    entries: HashMap<String, PiEntry>,
+    order: Vec<String>,
+    limited: bool,
+    invalid: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PiEntry {
+    parent_id: Option<String>,
+    kind: PiEntryKind,
+    usage: Option<PiUsage>,
+    context_chars: u64,
+    provider: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    valid_baseline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiEntryKind {
+    Assistant,
+    ToolResult,
+    Compaction,
+    BranchSummary,
+    Other,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PiUsage {
+    components: Option<(u64, u64, u64, u64)>,
+    total_tokens: Option<u64>,
+    cost: Option<f64>,
+    invalid_cost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogRevision {
+    length: u64,
+    modified: Option<SystemTime>,
+    identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelCatalogCache {
+    store_revision: Option<CatalogRevision>,
+    config_revision: Option<CatalogRevision>,
+    /// Normalized provider/model window metadata only. Raw catalog JSON can contain secrets.
+    windows: HashMap<(String, String), u64>,
+    unavailable: bool,
+}
+
+#[derive(Debug)]
+struct PiSessionData {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: Option<f64>,
+    turns: u32,
+    token_history: Vec<u64>,
+    context_history: Vec<u64>,
+    compactions: u32,
+    provider: String,
+    model: String,
+    effort: String,
+    context_tokens: Option<u64>,
+    baseline_tokens: Option<u64>,
+    trailing_tokens: Option<u64>,
+    context_window: Option<u64>,
+    context_precision: TelemetryPrecision,
+    usage_completeness: TelemetryCompleteness,
+    context_completeness: TelemetryCompleteness,
+    context_reason: Option<String>,
+    usage_reason: Option<String>,
+    usage_available: bool,
+    active_leaf_id: Option<String>,
+}
+
+impl Default for PiSessionData {
+    fn default() -> Self {
+        Self {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost: None,
+            turns: 0,
+            token_history: Vec::new(),
+            context_history: Vec::new(),
+            compactions: 0,
+            provider: String::new(),
+            model: String::new(),
+            effort: String::new(),
+            context_tokens: None,
+            baseline_tokens: None,
+            trailing_tokens: None,
+            context_window: None,
+            context_precision: TelemetryPrecision::Unknown,
+            usage_completeness: TelemetryCompleteness::Unknown,
+            context_completeness: TelemetryCompleteness::Unknown,
+            context_reason: None,
+            usage_reason: None,
+            usage_available: true,
+            active_leaf_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +221,7 @@ impl PiCollector {
             start_id_cache: HashMap::new(),
             attachments: HashMap::new(),
             tails: HashMap::new(),
+            model_catalogs: HashMap::new(),
         }
     }
 
@@ -146,6 +266,12 @@ impl PiCollector {
             })
             .collect();
         self.tails.retain(|path, _| owned_paths.contains(path));
+        let owned_agent_roots: HashSet<PathBuf> = owned_paths
+            .iter()
+            .filter_map(|path| pi_agent_root(path))
+            .collect();
+        self.model_catalogs
+            .retain(|root, _| owned_agent_roots.contains(root));
 
         pi_pids
             .into_iter()
@@ -160,21 +286,26 @@ impl PiCollector {
                 let process_start_id = self.start_id_cache.get(&pid).cloned().flatten();
                 let attachment_result = attachment_results.get(&pid)?;
                 let requested_attachment = attachment_result.attachment.as_ref();
-                let (attachment, telemetry) = match requested_attachment {
+                let (attachment, telemetry, data) = match requested_attachment {
                     Some(attachment) => match self.telemetry_for_attachment(
                         attachment,
                         observed_at_ms,
                         &mut read_budget,
                     ) {
-                        Ok(telemetry) => (Some(attachment), telemetry),
+                        Ok((telemetry, data)) => (Some(attachment), telemetry, data),
                         Err(error) => {
                             self.attachments.remove(&pid);
-                            (None, process_only_telemetry(observed_at_ms, Some(error)))
+                            (
+                                None,
+                                process_only_telemetry(observed_at_ms, Some(error)),
+                                PiSessionData::default(),
+                            )
                         }
                     },
                     None => (
                         None,
                         process_only_telemetry(observed_at_ms, attachment_result.error.clone()),
+                        PiSessionData::default(),
                     ),
                 };
                 Some(AgentSession {
@@ -197,24 +328,33 @@ impl PiCollector {
                         .copied()
                         .unwrap_or(observed_at_ms),
                     status: SessionStatus::Unknown,
-                    model: String::new(),
-                    effort: String::new(),
-                    context_percent: 0.0,
-                    total_input_tokens: 0,
-                    total_output_tokens: 0,
-                    total_cache_read: 0,
-                    total_cache_create: 0,
-                    turn_count: 0,
-                    current_tasks: vec!["session telemetry unavailable".to_string()],
+                    model: data.model.clone(),
+                    effort: data.effort.clone(),
+                    context_percent: match (data.context_tokens, data.context_window) {
+                        (Some(tokens), Some(window)) if window > 0 => {
+                            tokens as f64 / window as f64 * 100.0
+                        }
+                        _ => 0.0,
+                    },
+                    total_input_tokens: data.input,
+                    total_output_tokens: data.output,
+                    total_cache_read: data.cache_read,
+                    total_cache_create: data.cache_write,
+                    turn_count: data.turns,
+                    current_tasks: vec![if data.active_leaf_id.is_some() {
+                        "persisted Pi session telemetry".to_string()
+                    } else {
+                        "session telemetry unavailable".to_string()
+                    }],
                     mem_mb: proc.rss_kb / 1024,
                     version: String::new(),
                     git_branch: String::new(),
                     git_added: 0,
                     git_modified: 0,
-                    token_history: Vec::new(),
-                    context_history: Vec::new(),
-                    compaction_count: 0,
-                    context_window: 0,
+                    token_history: data.token_history,
+                    context_history: data.context_history,
+                    compaction_count: data.compactions,
+                    context_window: data.context_window.unwrap_or(0),
                     subagents: Vec::new(),
                     mem_file_count: 0,
                     mem_line_count: 0,
@@ -426,42 +566,128 @@ impl PiCollector {
         attachment: &PiAttachment,
         observed_at_ms: u64,
         tail_budget: &mut usize,
-    ) -> Result<SessionTelemetry, String> {
+    ) -> Result<(SessionTelemetry, PiSessionData), String> {
         let expected_header = (&attachment.session_id[..], &attachment.header_cwd[..]);
-        let tail = self.tail_session_with_expected_header(
-            &attachment.path,
-            observed_at_ms,
-            tail_budget,
-            Some(expected_header),
-            Some(&attachment.identity),
-        )?;
-        let source_health = if tail.error.is_some() {
+        let (
+            mut data,
+            context_is_complete,
+            tail_error,
+            source_updated_at_ms,
+            last_successful_parse_at_ms,
+        ) = {
+            let tail = self.tail_session_with_expected_header(
+                &attachment.path,
+                observed_at_ms,
+                tail_budget,
+                Some(expected_header),
+                Some(&attachment.identity),
+            )?;
+            let complete = tail.complete
+                && !tail.parse_limited
+                && !tail.semantic.limited
+                && !tail.semantic.invalid;
+            (
+                tail.semantic.session_data(complete),
+                complete,
+                tail.error.clone(),
+                tail.source_updated_at_ms,
+                tail.last_successful_parse_at_ms,
+            )
+        };
+        data.context_window = self.resolve_context_window(attachment);
+        if data.context_tokens.is_none() {
+            data.context_precision = TelemetryPrecision::Unknown;
+        }
+        if data.context_window.is_none() {
+            data.context_reason = Some(match data.context_reason.take() {
+                Some(reason) => format!("{reason}; provider/model context window is unavailable"),
+                None => "provider/model context window is unavailable".to_string(),
+            });
+        }
+        if !context_is_complete {
+            data.usage_completeness = TelemetryCompleteness::Partial;
+            data.context_completeness = TelemetryCompleteness::Partial;
+            data.context_tokens = None;
+            data.baseline_tokens = None;
+            data.trailing_tokens = None;
+            data.active_leaf_id = None;
+            data.context_precision = TelemetryPrecision::Unknown;
+            append_reason(
+                &mut data.context_reason,
+                "context unavailable because session parsing is incomplete",
+            );
+        }
+        let source_health = if tail_error.is_some() {
             SourceHealth::Error
         } else {
             SourceHealth::Healthy
         };
-        let completeness = if tail.complete && !tail.parse_limited {
-            TelemetryCompleteness::Complete
-        } else {
-            TelemetryCompleteness::Partial
-        };
         let metadata = TelemetryMetadata {
-            precision: crate::model::TelemetryPrecision::Unknown,
-            completeness,
+            precision: data.context_precision,
+            completeness: data.context_completeness,
             provenance: "owned Pi session JSONL".to_string(),
-            source_updated_at_ms: tail.source_updated_at_ms,
+            source_updated_at_ms,
             observed_at_ms,
-            last_successful_parse_at_ms: tail.last_successful_parse_at_ms,
+            last_successful_parse_at_ms,
             stale: false,
         };
-        Ok(SessionTelemetry {
-            attachment: AttachmentState::Attached,
-            attachment_confidence: AttachmentConfidence::High,
-            source_health,
-            error: tail.error.clone(),
-            context: metadata.clone(),
-            usage: metadata,
-        })
+        Ok((
+            SessionTelemetry {
+                attachment: AttachmentState::Attached,
+                attachment_confidence: AttachmentConfidence::High,
+                source_health,
+                error: tail_error.clone(),
+                context: metadata.clone(),
+                usage: TelemetryMetadata {
+                    precision: if !data.usage_available
+                        || data.usage_completeness == TelemetryCompleteness::Unknown
+                    {
+                        TelemetryPrecision::Unknown
+                    } else {
+                        TelemetryPrecision::Exact
+                    },
+                    completeness: data.usage_completeness,
+                    provenance: "observed Pi session JSONL entries".to_string(),
+                    source_updated_at_ms,
+                    observed_at_ms,
+                    last_successful_parse_at_ms,
+                    stale: false,
+                },
+                context_details: ContextTelemetryDetails {
+                    tokens: data.context_tokens,
+                    baseline_tokens: data.baseline_tokens,
+                    trailing_tokens: data.trailing_tokens,
+                    active_leaf_id: data.active_leaf_id.clone(),
+                    provider: (!data.provider.is_empty()).then_some(data.provider.clone()),
+                    reason: data.context_reason.clone(),
+                },
+                usage_details: UsageTelemetryDetails {
+                    reported_cost: data.cost,
+                    reason: data.usage_reason.clone(),
+                },
+            },
+            data,
+        ))
+    }
+
+    fn resolve_context_window(&mut self, attachment: &PiAttachment) -> Option<u64> {
+        let tail = self.tails.get(&attachment.path)?;
+        let data = tail.semantic.session_data(
+            tail.complete
+                && !tail.parse_limited
+                && !tail.semantic.limited
+                && !tail.semantic.invalid,
+        );
+        if data.provider.is_empty() || data.model.is_empty() {
+            return None;
+        }
+        let root = pi_agent_root(&attachment.path)?;
+        let catalog = self.model_catalogs.entry(root.clone()).or_default();
+        refresh_model_catalog(catalog, &root);
+        if catalog.unavailable {
+            return None;
+        }
+        model_window_from_catalog(catalog, &data.provider, &data.model)
     }
 
     #[cfg(test)]
@@ -545,6 +771,7 @@ impl PiCollector {
                     last_successful_parse_at_ms: None,
                     complete: false,
                     error: None,
+                    semantic: PiSemantic::default(),
                 },
             );
         }
@@ -832,6 +1059,630 @@ fn parse_header(line: &[u8]) -> Result<PiHeader, String> {
     })
 }
 
+impl PiSemantic {
+    /// Add one fully framed JSONL entry. The session header is metadata, not a tree node.
+    fn add(&mut self, value: &Value) -> bool {
+        if value.get("type").and_then(Value::as_str) == Some("session") {
+            return true;
+        }
+        let Some(id) = bounded_string(value.get("id"), MAX_SEMANTIC_ID_BYTES) else {
+            // Unknown extension metadata without a tree identity is irrelevant to both
+            // lifetime accounting and branch reconstruction. Known tree entries are not.
+            if matches!(
+                value.get("type").and_then(Value::as_str),
+                Some(
+                    "message"
+                        | "compaction"
+                        | "branch_summary"
+                        | "model_change"
+                        | "thinking_level_change"
+                        | "custom_message"
+                        | "custom"
+                        | "label"
+                        | "session_info"
+                )
+            ) {
+                self.invalid = true;
+                return false;
+            }
+            return true;
+        };
+        if self.entries.contains_key(&id) {
+            return true;
+        }
+        if self.entries.len() >= MAX_SEMANTIC_ENTRIES {
+            self.limited = true;
+            return false;
+        }
+        match parse_pi_entry(value) {
+            Some(entry) => {
+                self.order.push(id.clone());
+                self.entries.insert(id, entry);
+                true
+            }
+            None => {
+                self.invalid = true;
+                false
+            }
+        }
+    }
+
+    fn session_data(&self, context_complete: bool) -> PiSessionData {
+        let mut data = PiSessionData::default();
+        data.usage_completeness = if self.limited || self.invalid {
+            TelemetryCompleteness::Partial
+        } else {
+            TelemetryCompleteness::Complete
+        };
+        data.context_completeness = data.usage_completeness;
+
+        // Lifetime accounting intentionally covers all persisted branches.
+        for id in &self.order {
+            let Some(entry) = self.entries.get(id) else {
+                continue;
+            };
+            if let Some(usage) = &entry.usage {
+                if matches!(
+                    entry.kind,
+                    PiEntryKind::Assistant
+                        | PiEntryKind::ToolResult
+                        | PiEntryKind::Compaction
+                        | PiEntryKind::BranchSummary
+                ) {
+                    if let Some((input, output, cache_read, cache_write)) = usage.components {
+                        let totals = (
+                            data.input.checked_add(input),
+                            data.output.checked_add(output),
+                            data.cache_read.checked_add(cache_read),
+                            data.cache_write.checked_add(cache_write),
+                        );
+                        if let (Some(input), Some(output), Some(cache_read), Some(cache_write)) =
+                            totals
+                        {
+                            data.input = input;
+                            data.output = output;
+                            data.cache_read = cache_read;
+                            data.cache_write = cache_write;
+                        } else {
+                            data.usage_available = false;
+                            data.usage_completeness = TelemetryCompleteness::Partial;
+                            append_reason(
+                                &mut data.usage_reason,
+                                "usage component total overflowed",
+                            );
+                        }
+                        if let Some(cost) = usage.cost {
+                            match (data.cost.unwrap_or(0.0) + cost)
+                                .is_finite()
+                                .then(|| data.cost.unwrap_or(0.0) + cost)
+                            {
+                                Some(cost) => data.cost = Some(cost),
+                                None => {
+                                    data.cost = None;
+                                    data.usage_completeness = TelemetryCompleteness::Partial;
+                                    append_reason(
+                                        &mut data.usage_reason,
+                                        "reported cost total overflowed",
+                                    );
+                                }
+                            }
+                        }
+                        if usage.invalid_cost {
+                            data.cost = None;
+                            data.usage_completeness = TelemetryCompleteness::Partial;
+                            append_reason(&mut data.usage_reason, "reported cost is invalid");
+                        }
+                    } else {
+                        data.usage_completeness = TelemetryCompleteness::Partial;
+                        append_reason(
+                            &mut data.usage_reason,
+                            "an observed usage record is incomplete",
+                        );
+                    }
+                }
+            }
+            if entry.kind == PiEntryKind::Assistant {
+                data.turns = data.turns.saturating_add(1);
+            }
+        }
+        if data.usage_available
+            && data
+                .input
+                .checked_add(data.output)
+                .and_then(|total| total.checked_add(data.cache_read))
+                .and_then(|total| total.checked_add(data.cache_write))
+                .is_none()
+        {
+            data.usage_available = false;
+            data.usage_completeness = TelemetryCompleteness::Partial;
+            append_reason(&mut data.usage_reason, "combined usage total overflowed");
+        }
+        if !context_complete {
+            data.context_completeness = TelemetryCompleteness::Partial;
+            return data;
+        }
+        let Some(leaf) = self.order.last().cloned() else {
+            // A header-only attached session is a complete, known-zero lifetime total.
+            data.context_reason = Some("no persisted tree entry".to_string());
+            return data;
+        };
+        data.active_leaf_id = Some(leaf.clone());
+        append_reason(
+            &mut data.context_reason,
+            "active leaf is inferred from the latest persisted entry",
+        );
+        let mut branch = Vec::new();
+        let mut current = leaf.clone();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                data.context_reason = Some("active branch has a cycle".to_string());
+                data.context_completeness = TelemetryCompleteness::Partial;
+                return data;
+            }
+            let Some(entry) = self.entries.get(&current) else {
+                data.context_reason = Some("active branch parent is missing".to_string());
+                data.context_completeness = TelemetryCompleteness::Partial;
+                return data;
+            };
+            branch.push(current.clone());
+            match &entry.parent_id {
+                Some(parent) => current = parent.clone(),
+                None => break,
+            }
+        }
+        branch.reverse();
+        for id in &branch {
+            let e = &self.entries[id];
+            if let Some(provider) = &e.provider {
+                data.provider = provider.clone();
+                data.model = e.model.clone().unwrap_or_default();
+            }
+            if let Some(effort) = &e.effort {
+                data.effort = effort.clone();
+            }
+        }
+        data.compactions = branch
+            .iter()
+            .filter(|id| self.entries[*id].kind == PiEntryKind::Compaction)
+            .count() as u32;
+        let latest_compaction = branch
+            .iter()
+            .rposition(|id| self.entries[id].kind == PiEntryKind::Compaction);
+        let baseline_index = branch.iter().enumerate().rev().find_map(|(i, id)| {
+            let e = &self.entries[id];
+            (e.kind == PiEntryKind::Assistant
+                && e.valid_baseline
+                && valid_baseline(e.usage.as_ref()))
+            .then_some(i)
+        });
+        if latest_compaction.is_some_and(|i| baseline_index.is_none_or(|b| b <= i)) {
+            append_reason(
+                &mut data.context_reason,
+                "context is unknown until a post-compaction assistant baseline",
+            );
+            return data;
+        }
+        let (baseline, index) = if let Some(index) = baseline_index {
+            (
+                context_baseline(self.entries[&branch[index]].usage.as_ref())
+                    .expect("validated baseline"),
+                index,
+            )
+        } else {
+            // Pi estimates all context-visible messages before the first valid assistant usage.
+            let estimate = branch
+                .iter()
+                .map(|id| self.entries[id].context_chars.div_ceil(4))
+                .sum();
+            data.context_tokens = Some(estimate);
+            data.trailing_tokens = Some(estimate);
+            data.context_precision = TelemetryPrecision::Estimated;
+            data.context_history.push(estimate);
+            return data;
+        };
+        let trailing: u64 = branch[index + 1..]
+            .iter()
+            .map(|id| self.entries[id].context_chars.div_ceil(4))
+            .sum();
+        if trailing > 0 {
+            append_reason(&mut data.context_reason, "trailing context is estimated");
+        }
+        data.baseline_tokens = Some(baseline);
+        data.trailing_tokens = Some(trailing);
+        let Some(context_tokens) = baseline.checked_add(trailing) else {
+            data.context_tokens = None;
+            data.context_precision = TelemetryPrecision::Unknown;
+            data.context_completeness = TelemetryCompleteness::Partial;
+            append_reason(&mut data.context_reason, "context token total overflowed");
+            return data;
+        };
+        data.context_tokens = Some(context_tokens);
+        data.context_precision = if trailing == 0 {
+            TelemetryPrecision::Inferred
+        } else {
+            TelemetryPrecision::Estimated
+        };
+        data.context_history.push(data.context_tokens.unwrap());
+        if let Some((input, output, cache_read, cache_write)) = self.entries[&branch[index]]
+            .usage
+            .as_ref()
+            .and_then(|u| u.components)
+        {
+            data.token_history.push(
+                input
+                    .saturating_add(output)
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_write),
+            );
+        }
+        data
+    }
+}
+
+fn append_reason(reason: &mut Option<String>, addition: &str) {
+    match reason {
+        Some(reason) if !reason.contains(addition) => {
+            reason.push_str("; ");
+            reason.push_str(addition);
+        }
+        None => *reason = Some(addition.to_string()),
+        _ => {}
+    }
+}
+
+fn bounded_string(value: Option<&Value>, max: usize) -> Option<String> {
+    let value = value?.as_str()?;
+    (!value.is_empty() && value.len() <= max).then(|| value.to_string())
+}
+
+fn valid_baseline(usage: Option<&PiUsage>) -> bool {
+    context_baseline(usage).is_some_and(|n| n > 0)
+}
+
+fn context_baseline(usage: Option<&PiUsage>) -> Option<u64> {
+    let usage = usage?;
+    match usage.total_tokens {
+        Some(total) if total > 0 => Some(total),
+        _ => usage.components.and_then(|(input, output, read, write)| {
+            input
+                .checked_add(output)?
+                .checked_add(read)?
+                .checked_add(write)
+        }),
+    }
+}
+
+fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
+    let kind = match value.get("type").and_then(Value::as_str) {
+        Some("compaction") => PiEntryKind::Compaction,
+        Some("branch_summary") => PiEntryKind::BranchSummary,
+        Some("message") => match value.pointer("/message/role").and_then(Value::as_str) {
+            Some("assistant") => PiEntryKind::Assistant,
+            Some("toolResult") => PiEntryKind::ToolResult,
+            _ => PiEntryKind::Other,
+        },
+        _ => PiEntryKind::Other,
+    };
+    let parent_id = match value.get("parentId") {
+        Some(Value::Null) => None,
+        Some(v) => Some(bounded_string(Some(v), MAX_SEMANTIC_PARENT_BYTES)?),
+        None => return None,
+    };
+    let message = value.get("message");
+    let usage_value = if matches!(kind, PiEntryKind::Assistant | PiEntryKind::ToolResult) {
+        value.pointer("/message/usage")
+    } else {
+        value.get("usage")
+    };
+    let usage = match usage_value {
+        Some(value) => Some(parse_usage(value)?),
+        None => None,
+    };
+    let provider_value = message
+        .and_then(|m| m.get("provider"))
+        .or_else(|| value.get("provider"));
+    let model_value = message
+        .and_then(|m| m.get("model"))
+        .or_else(|| value.get("modelId"));
+    let effort_value = value.get("thinkingLevel");
+    let provider = match provider_value {
+        Some(value) => Some(bounded_string(Some(value), MAX_SEMANTIC_METADATA_BYTES)?),
+        None => None,
+    };
+    let model = match model_value {
+        Some(value) => Some(bounded_string(Some(value), MAX_SEMANTIC_METADATA_BYTES)?),
+        None => None,
+    };
+    let effort = match effort_value {
+        Some(value) => Some(bounded_string(Some(value), MAX_SEMANTIC_METADATA_BYTES)?),
+        None => None,
+    };
+    let context_chars = context_entry_chars(value, message);
+    Some(PiEntry {
+        parent_id,
+        kind,
+        usage,
+        context_chars,
+        provider,
+        model,
+        effort,
+        valid_baseline: !matches!(
+            message
+                .and_then(|m| m.get("stopReason"))
+                .and_then(Value::as_str),
+            Some("aborted") | Some("error")
+        ),
+    })
+}
+
+fn parse_usage(v: &Value) -> Option<PiUsage> {
+    if !v.is_object() {
+        return None;
+    }
+    let number = |name| v.get(name).and_then(Value::as_u64);
+    let components = match (
+        number("input"),
+        number("output"),
+        number("cacheRead"),
+        number("cacheWrite"),
+    ) {
+        (Some(input), Some(output), Some(read), Some(write)) => Some((input, output, read, write)),
+        _ => None,
+    };
+    let total_tokens = v.get("totalTokens").and_then(Value::as_u64);
+    let cost_value = v.pointer("/cost/total");
+    let cost = cost_value
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    Some(PiUsage {
+        components,
+        total_tokens,
+        cost,
+        invalid_cost: cost_value.is_some() && cost.is_none(),
+    })
+}
+
+fn context_entry_chars(value: &Value, message: Option<&Value>) -> u64 {
+    if value.get("type").and_then(Value::as_str) == Some("custom_message") {
+        return content_chars(value.get("content"));
+    }
+    let Some(message) = message else {
+        return match value.get("type").and_then(Value::as_str) {
+            Some("compaction") | Some("branch_summary") => utf16_len(
+                value
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            _ => 0,
+        };
+    };
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") | Some("toolResult") | Some("custom") => content_chars(message.get("content")),
+        Some("assistant") => message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| match item.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            utf16_len(item.get("text").and_then(Value::as_str).unwrap_or_default())
+                        }
+                        Some("thinking") => utf16_len(
+                            item.get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
+                        Some("toolCall") => {
+                            utf16_len(item.get("name").and_then(Value::as_str).unwrap_or_default())
+                                .saturating_add(utf16_len(
+                                    &item
+                                        .get("arguments")
+                                        .map(Value::to_string)
+                                        .unwrap_or_default(),
+                                ))
+                        }
+                        _ => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0),
+        Some("bashExecution")
+            if message.get("excludeFromContext").and_then(Value::as_bool) == Some(true) =>
+        {
+            0
+        }
+        Some("bashExecution") => utf16_len(
+            message
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .saturating_add(utf16_len(
+            message
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )),
+        _ => 0,
+    }
+}
+
+fn utf16_len(s: &str) -> u64 {
+    s.encode_utf16().count() as u64
+}
+fn content_chars(content: Option<&Value>) -> u64 {
+    match content {
+        Some(Value::String(s)) => utf16_len(s),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    utf16_len(item.get("text").and_then(Value::as_str).unwrap_or_default())
+                }
+                Some("image") => 4800,
+                _ => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn pi_agent_root(session_path: &Path) -> Option<PathBuf> {
+    let sessions = session_path
+        .ancestors()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("sessions"))?;
+    sessions.parent().map(Path::to_path_buf)
+}
+
+fn catalog_revision(path: &Path) -> Option<CatalogRevision> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(CatalogRevision {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        identity: file_identity_from_metadata(&metadata),
+    })
+}
+
+/// Read no more than the accepted limit, even if the path grows after metadata inspection.
+fn load_catalog(path: &Path) -> Result<Option<Value>, ()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let mut bytes = Vec::with_capacity((MAX_MODEL_CATALOG_BYTES as usize).min(64 * 1024));
+    file.take(MAX_MODEL_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_MODEL_CATALOG_BYTES {
+        return Err(());
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| ())
+}
+
+fn normalize_model_id(value: &Value) -> Option<String> {
+    bounded_string(value.get("id"), MAX_SEMANTIC_METADATA_BYTES)
+}
+
+fn insert_window(
+    windows: &mut HashMap<(String, String), u64>,
+    provider: &str,
+    model: String,
+    window: u64,
+) {
+    if window == 0 || provider.len() > MAX_SEMANTIC_METADATA_BYTES {
+        return;
+    }
+    let key = (provider.to_string(), model);
+    if windows.contains_key(&key) || windows.len() < MAX_MODEL_CATALOG_ENTRIES {
+        windows.insert(key, window);
+    }
+}
+
+fn refresh_model_catalog(cache: &mut ModelCatalogCache, root: &Path) {
+    let store_path = root.join("models-store.json");
+    let config_path = root.join("models.json");
+    let store_revision = catalog_revision(&store_path);
+    let config_revision = catalog_revision(&config_path);
+    if cache.store_revision == store_revision && cache.config_revision == config_revision {
+        return;
+    }
+    cache.store_revision = store_revision;
+    cache.config_revision = config_revision;
+    cache.windows.clear();
+    cache.unavailable = false;
+    let store = match load_catalog(&store_path) {
+        Ok(value) => value,
+        Err(()) => {
+            cache.unavailable = true;
+            return;
+        }
+    };
+    let config = match load_catalog(&config_path) {
+        Ok(value) => value,
+        Err(()) => {
+            cache.unavailable = true;
+            return;
+        }
+    };
+
+    // Store values are the only base models. Do not retain the raw catalog.
+    if let Some(store) = store.as_ref().and_then(Value::as_object) {
+        for (provider, entry) in store {
+            if provider.len() > MAX_SEMANTIC_METADATA_BYTES {
+                continue;
+            }
+            for model in entry
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let (Some(id), Some(window)) = (
+                    normalize_model_id(model),
+                    model.get("contextWindow").and_then(Value::as_u64),
+                ) {
+                    insert_window(&mut cache.windows, provider, id, window);
+                }
+            }
+        }
+    }
+
+    // Config is applied transiently: overrides require a base; custom models replace/create.
+    if let Some(providers) = config
+        .as_ref()
+        .and_then(|config| config.get("providers"))
+        .and_then(Value::as_object)
+    {
+        for (provider, entry) in providers {
+            if provider.len() > MAX_SEMANTIC_METADATA_BYTES {
+                continue;
+            }
+            if let Some(overrides) = entry.get("modelOverrides").and_then(Value::as_object) {
+                for (model, override_) in overrides {
+                    let key = (provider.clone(), model.clone());
+                    if let (Some(existing), Some(window)) = (
+                        cache.windows.get_mut(&key),
+                        override_.get("contextWindow").and_then(Value::as_u64),
+                    ) {
+                        if window > 0 {
+                            *existing = window;
+                        }
+                    }
+                }
+            }
+            for custom in entry
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = normalize_model_id(custom) {
+                    let window = custom
+                        .get("contextWindow")
+                        .and_then(Value::as_u64)
+                        .filter(|window| *window > 0)
+                        .unwrap_or(128_000);
+                    insert_window(&mut cache.windows, provider, id, window);
+                }
+            }
+        }
+    }
+}
+
+fn model_window_from_catalog(
+    cache: &ModelCatalogCache,
+    provider: &str,
+    model: &str,
+) -> Option<u64> {
+    cache
+        .windows
+        .get(&(provider.to_string(), model.to_string()))
+        .copied()
+}
+
 fn consume_tail_bytes(tail: &mut PiTail, bytes: &[u8], offset: u64) -> (u64, usize) {
     // `bytes` is invocation-local. PiTail retains only framing offsets and hashes.
     let mut committed = 0usize;
@@ -863,12 +1714,21 @@ fn consume_tail_bytes(tail: &mut PiTail, bytes: &[u8], offset: u64) -> (u64, usi
             tail.parse_limited = true;
             tail.error = Some("JSONL line exceeds 1 MiB limit".to_string());
         } else if !bytes[cursor..end].is_empty() {
-            if serde_json::from_slice::<Value>(&bytes[cursor..end]).is_ok() {
-                valid += 1;
-                tail.error = None;
-            } else {
-                tail.parse_limited = true;
-                tail.error = Some("malformed JSONL line ignored".to_string());
+            match serde_json::from_slice::<Value>(&bytes[cursor..end]) {
+                Ok(value) => {
+                    valid += 1;
+                    if !tail.semantic.add(&value) {
+                        // Semantic loss makes telemetry partial, but the JSONL framing itself
+                        // remains healthy and must not poison later append recovery.
+                        tail.parse_limited = true;
+                    } else {
+                        tail.error = None;
+                    }
+                }
+                Err(_) => {
+                    tail.parse_limited = true;
+                    tail.error = Some("malformed JSONL line ignored".to_string());
+                }
             }
         }
         cursor = end + 1;
@@ -1865,6 +2725,7 @@ mod tests {
                 last_successful_parse_at_ms: None,
                 complete: false,
                 error: None,
+                semantic: PiSemantic::default(),
             },
         );
         let process_state = shared(vec![proc(10, 1, "pi"), proc(20, 1, "pi")]);
@@ -2166,5 +3027,247 @@ mod tests {
                 .last_successful_parse_at_ms,
             first
         );
+    }
+
+    #[test]
+    fn semantic_usage_deduplicates_branches_and_context_uses_active_leaf() {
+        let mut semantic = PiSemantic::default();
+        for line in [
+            r#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}"#,
+            r#"{"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18},"content":[]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":7},"content":[]}}"#,
+            r#"{"type":"message","id":"other","parentId":"a","message":{"role":"toolResult","usage":{"input":2,"output":0,"cacheRead":0,"cacheWrite":0},"content":"nested"}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","usage":{"input":999},"content":[]}}"#,
+        ] {
+            assert!(semantic.add(&serde_json::from_str(line).unwrap()));
+        }
+        let data = semantic.session_data(true);
+        assert_eq!(
+            (data.input, data.output, data.cache_read, data.cache_write),
+            (15, 9, 2, 1)
+        );
+        assert_eq!(data.context_tokens, Some(20));
+        assert_eq!(data.active_leaf_id.as_deref(), Some("other"));
+        assert_eq!(data.context_precision, TelemetryPrecision::Estimated);
+    }
+
+    #[test]
+    fn semantic_context_rejects_missing_parent_and_requires_post_compaction_baseline() {
+        let mut semantic = PiSemantic::default();
+        semantic.add(&serde_json::from_str(r#"{"type":"message","id":"a","parentId":"missing","message":{"role":"assistant","usage":{"totalTokens":10},"content":[]}}"#).unwrap());
+        assert!(semantic.session_data(true).context_tokens.is_none());
+        let mut semantic = PiSemantic::default();
+        for line in [
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"totalTokens":10},"content":[]}}"#,
+            r#"{"type":"compaction","id":"c","parentId":"a","usage":{"input":1},"summary":"summary"}"#,
+        ] {
+            semantic.add(&serde_json::from_str(line).unwrap());
+        }
+        assert!(semantic.session_data(true).context_tokens.is_none());
+    }
+
+    #[test]
+    fn semantic_uses_component_fallback_and_excludes_failed_baselines() {
+        let mut semantic = PiSemantic::default();
+        for line in [
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","stopReason":"error","usage":{"totalTokens":99},"content":[]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5},"content":[]}}"#,
+        ] {
+            semantic.add(&serde_json::from_str(line).unwrap());
+        }
+        let data = semantic.session_data(true);
+        assert_eq!(data.baseline_tokens, Some(14));
+    }
+
+    #[test]
+    fn header_only_semantics_are_complete_known_zero_without_a_leaf() {
+        let semantic = PiSemantic::default();
+        let data = semantic.session_data(true);
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Complete);
+        assert_eq!(
+            (data.input, data.output, data.cache_read, data.cache_write),
+            (0, 0, 0, 0)
+        );
+        assert!(data.active_leaf_id.is_none());
+        assert!(data.context_tokens.is_none());
+    }
+
+    #[test]
+    fn incomplete_or_invalid_semantics_hide_context_but_keep_partial_usage() {
+        let mut semantic = PiSemantic::default();
+        semantic.add(&serde_json::from_str(r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5,"totalTokens":14},"content":[]}}"#).unwrap());
+        semantic.invalid = true;
+        let data = semantic.session_data(false);
+        assert_eq!(
+            data.input + data.output + data.cache_read + data.cache_write,
+            14
+        );
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(data.context_tokens.is_none());
+        assert!(data.active_leaf_id.is_none());
+    }
+
+    #[test]
+    fn context_estimation_handles_custom_messages_utf16_and_excluded_bash() {
+        let mut semantic = PiSemantic::default();
+        for line in [
+            r#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"😀"}}"#,
+            r#"{"type":"custom_message","id":"c","parentId":"u","content":"😀"}"#,
+            r#"{"type":"message","id":"b","parentId":"c","message":{"role":"bashExecution","command":"four","output":"four","excludeFromContext":true}}"#,
+        ] {
+            assert!(semantic.add(&serde_json::from_str(line).unwrap()));
+        }
+        let data = semantic.session_data(true);
+        // Pi rounds each context-visible message independently: ceil(2/4) + ceil(2/4).
+        assert_eq!(data.context_tokens, Some(2));
+        assert_eq!(data.context_precision, TelemetryPrecision::Estimated);
+    }
+
+    #[test]
+    fn malformed_usage_never_becomes_a_baseline_or_complete_total() {
+        let mut semantic = PiSemantic::default();
+        semantic.add(&serde_json::from_str(r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"input":2,"output":3,"cacheRead":"bad","cacheWrite":5},"content":[]}}"#).unwrap());
+        let data = semantic.session_data(true);
+        assert_eq!(
+            data.input + data.output + data.cache_read + data.cache_write,
+            0
+        );
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(data.baseline_tokens.is_none());
+    }
+
+    #[test]
+    fn model_catalog_is_provider_scoped_and_applies_overrides_custom_defaults_and_agent_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("alternate-agent");
+        fs::create_dir_all(root.join("sessions/project")).unwrap();
+        fs::write(root.join("models-store.json"), r#"{"one":{"models":[{"id":"same","contextWindow":10}]},"two":{"models":[{"id":"same","contextWindow":20}]}}"#).unwrap();
+        fs::write(root.join("models.json"), r#"{"providers":{"one":{"modelOverrides":{"same":{"contextWindow":15}},"models":[{"id":"custom"}]}}}"#).unwrap();
+        let mut cache = ModelCatalogCache::default();
+        refresh_model_catalog(&mut cache, &root);
+        assert_eq!(model_window_from_catalog(&cache, "one", "same"), Some(15));
+        assert_eq!(model_window_from_catalog(&cache, "two", "same"), Some(20));
+        assert_eq!(
+            model_window_from_catalog(&cache, "one", "custom"),
+            Some(128_000)
+        );
+        assert_eq!(model_window_from_catalog(&cache, "two", "custom"), None);
+        assert_eq!(
+            pi_agent_root(&root.join("sessions/project/session.jsonl")),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn missing_parent_id_is_malformed_not_a_root() {
+        let mut semantic = PiSemantic::default();
+        assert!(!semantic.add(&serde_json::from_str(
+            r#"{"type":"message","id":"a","message":{"role":"assistant","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"content":[]}}"#,
+        ).unwrap()));
+        assert!(semantic.invalid);
+        assert_eq!(
+            semantic.session_data(false).context_completeness,
+            TelemetryCompleteness::Partial
+        );
+    }
+
+    #[test]
+    fn catalog_override_cannot_create_a_model_and_cache_retains_only_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("models-store.json"),
+            r#"{"one":{"models":[{"id":"base","contextWindow":10}]}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("models.json"), r#"{"providers":{"one":{"modelOverrides":{"base":{"contextWindow":15},"missing":{"contextWindow":999}},"models":[{"id":"custom"}]}}}"#).unwrap();
+        let mut cache = ModelCatalogCache::default();
+        refresh_model_catalog(&mut cache, &root);
+        assert_eq!(model_window_from_catalog(&cache, "one", "base"), Some(15));
+        assert_eq!(model_window_from_catalog(&cache, "one", "missing"), None);
+        assert_eq!(
+            model_window_from_catalog(&cache, "one", "custom"),
+            Some(128_000)
+        );
+        assert_eq!(cache.windows.len(), 2);
+        // ModelCatalogCache has no serde_json::Value fields: secrets in source files are dropped.
+        assert!(!format!("{cache:?}").contains("apiKey"));
+    }
+
+    #[test]
+    fn catalog_same_length_replacement_refreshes_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("models-store.json");
+        let first = r#"{"one":{"models":[{"id":"same","contextWindow":10}]}}"#;
+        let second = r#"{"one":{"models":[{"id":"same","contextWindow":20}]}}"#;
+        assert_eq!(first.len(), second.len());
+        fs::write(&path, first).unwrap();
+        fs::write(root.join("models.json"), "{}").unwrap();
+        let mut cache = ModelCatalogCache::default();
+        refresh_model_catalog(&mut cache, &root);
+        assert_eq!(model_window_from_catalog(&cache, "one", "same"), Some(10));
+        let replacement = root.join("replacement.json");
+        fs::write(&replacement, second).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        refresh_model_catalog(&mut cache, &root);
+        assert_eq!(model_window_from_catalog(&cache, "one", "same"), Some(20));
+    }
+
+    #[test]
+    fn overflow_or_invalid_cost_makes_usage_partial() {
+        let mut semantic = PiSemantic::default();
+        for line in [
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"input":18446744073709551615,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"total":1}},"content":[]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1,"cost":{"total":-1}},"content":[]}}"#,
+        ] {
+            assert!(semantic.add(&serde_json::from_str(line).unwrap()));
+        }
+        let data = semantic.session_data(true);
+        assert!(!data.usage_available);
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(data.cost.is_none());
+
+        let mut cross_component = PiSemantic::default();
+        assert!(cross_component.add(&serde_json::from_str(
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"input":18446744073709551615,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":1},"content":[]}}"#,
+        ).unwrap()));
+        let data = cross_component.session_data(true);
+        assert!(!data.usage_available);
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(data
+            .usage_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("combined usage total overflowed")));
+    }
+
+    #[test]
+    fn oversized_catalog_is_unavailable_without_retaining_raw_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("models-store.json"),
+            vec![b'x'; MAX_MODEL_CATALOG_BYTES as usize + 1],
+        )
+        .unwrap();
+        let mut cache = ModelCatalogCache::default();
+        refresh_model_catalog(&mut cache, &root);
+        assert!(cache.unavailable);
+        assert!(cache.windows.is_empty());
+    }
+
+    #[test]
+    fn collector_evicts_catalogs_without_owned_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        let mut collector = PiCollector::new();
+        collector
+            .model_catalogs
+            .insert(root, ModelCatalogCache::default());
+        collector.collect_sessions(&shared(Vec::new()));
+        assert!(collector.model_catalogs.is_empty());
     }
 }

@@ -90,10 +90,15 @@ pub(crate) fn draw_tokens_panel_active(
     let bar_w = (area.width as usize).saturating_sub(20).clamp(5, 15);
 
     let total_label = t("tokens.total");
+    let partial_suffix = if selected.is_some_and(|session| session.usage_is_partial()) {
+        "+"
+    } else {
+        ""
+    };
     let total_line = vec![
         styled_label(format!(" {}: ", total_label).as_str(), theme.graph_text),
         Span::styled(
-            fmt_tokens(total),
+            format!("{}{}", fmt_tokens(total), partial_suffix),
             Style::default()
                 .fg(theme.title)
                 .add_modifier(Modifier::BOLD),

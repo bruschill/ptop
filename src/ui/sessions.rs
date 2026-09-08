@@ -243,9 +243,10 @@ pub(crate) fn draw_sessions_panel_active(
             let (tokens, color) = match session.total_tokens_value() {
                 Some(total) => (
                     format!(
-                        "{}{}",
+                        "{}{}{}",
                         session.usage_precision().prefix(),
-                        fmt_tokens(total)
+                        fmt_tokens(total),
+                        if session.usage_is_partial() { "+" } else { "" }
                     ),
                     theme.main_fg,
                 ),
@@ -980,6 +981,15 @@ fn draw_pi_metadata(f: &mut Frame, session: &AgentSession, area: Rect, theme: &T
     let context = session
         .context_value()
         .map(|percent| format!("{}{percent:.0}%", session.context_precision().prefix()))
+        .or_else(|| {
+            session.context_tokens_without_window().map(|tokens| {
+                format!(
+                    "{}{} tokens (window —)",
+                    session.context_precision().prefix(),
+                    fmt_tokens(tokens)
+                )
+            })
+        })
         .unwrap_or_else(|| "—".to_string());
     let tokens = session
         .total_tokens_value()
@@ -1019,12 +1029,44 @@ fn draw_pi_metadata(f: &mut Frame, session: &AgentSession, area: Rect, theme: &T
             ),
         ]),
         telemetry_metadata_line("Context", context, &telemetry.context, theme),
-        telemetry_metadata_line("Tokens", tokens, &telemetry.usage, theme),
+        telemetry_metadata_line(
+            "Tokens",
+            format!(
+                "{}{}",
+                tokens,
+                if session.usage_is_partial() { "+" } else { "" }
+            ),
+            &telemetry.usage,
+            theme,
+        ),
         Line::from(Span::styled(
             format!(" Identity {identity}"),
             Style::default().fg(theme.inactive_fg),
         )),
     ];
+
+    if let Some(provider) = &telemetry.context_details.provider {
+        lines.push(Line::from(Span::styled(
+            format!(" Provider/model: {}/{}", provider, session.model),
+            Style::default().fg(theme.inactive_fg),
+        )));
+    }
+
+    if let Some(reason) = &telemetry.context_details.reason {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Context note: {}",
+                truncate_str(reason, area.width as usize)
+            ),
+            Style::default().fg(theme.inactive_fg),
+        )));
+    }
+    if let Some(cost) = telemetry.usage_details.reported_cost {
+        lines.push(Line::from(Span::styled(
+            format!(" Reported cost: {cost:.4}"),
+            Style::default().fg(theme.inactive_fg),
+        )));
+    }
 
     if !session.children.is_empty() && lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled(

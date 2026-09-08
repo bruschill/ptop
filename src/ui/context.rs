@@ -192,6 +192,15 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
                 Style::default().fg(pct_color),
             ));
             Line::from(spans)
+        } else if let Some(tokens) = session.context_tokens_without_window() {
+            Line::from(Span::styled(
+                format!(
+                    " {}{} tokens",
+                    session.context_precision().prefix(),
+                    fmt_tokens(tokens)
+                ),
+                Style::default().fg(theme.inactive_fg),
+            ))
         } else {
             Line::from(Span::styled("—", Style::default().fg(theme.inactive_fg)))
         };
@@ -199,7 +208,13 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
         let ctx_info = match (session.context_window_value(), session.compaction_count) {
             (Some(window), 0) => fmt_tokens(window),
             (Some(window), n) => format!("{} C{}", fmt_tokens(window), n),
+            (None, 0) if session.context_tokens_without_window().is_some() => {
+                "window —".to_string()
+            }
             (None, 0) => "—".to_string(),
+            (None, n) if session.context_tokens_without_window().is_some() => {
+                format!("window — C{n}")
+            }
             (None, n) => format!("— C{n}"),
         };
 
@@ -287,6 +302,39 @@ mod tests {
         assert!(
             !text.contains("0%"),
             "unknown context rendered as zero\n{text}"
+        );
+    }
+
+    #[test]
+    fn inferred_context_tokens_without_window_show_no_meter() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.context_window = 0;
+        let mut telemetry = SessionTelemetry::process_only(1);
+        telemetry.context.precision = crate::model::TelemetryPrecision::Estimated;
+        telemetry.context_details.tokens = Some(12_000);
+        session.telemetry = Some(telemetry);
+
+        let backend = TestBackend::new(140, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_context_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("≈12k tokens"),
+            "missing token estimate\n{text}"
+        );
+        assert!(
+            text.contains("window —"),
+            "missing unavailable window\n{text}"
+        );
+        assert!(
+            !text.contains("■"),
+            "unknown window rendered a meter\n{text}"
         );
     }
 }

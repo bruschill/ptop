@@ -283,7 +283,7 @@ impl App {
     pub fn all_usage_known(&self) -> bool {
         self.sessions
             .iter()
-            .all(|session| session.total_tokens_value().is_some())
+            .all(|session| session.complete_total_tokens_value().is_some())
     }
 
     fn update_token_rate(&mut self) {
