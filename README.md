@@ -36,7 +36,7 @@ cargo install abtop
 
 ### Windows
 
-Native support — no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows Pi support is process-only; Pi terminal jump and kill controls are disabled until trusted identity checks are available. Windows has no load average, so LOAD is reported as 0. OpenCode discovery in legacy mode additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
+Native support, with no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows Pi support is process-only; Pi terminal jump and kill controls are disabled until trusted identity checks are available. Windows has no load average, so LOAD is reported as 0. OpenCode discovery in legacy mode additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
 
 ```powershell
 powershell -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
@@ -60,7 +60,7 @@ abtop --theme dracula    # Launch with a specific theme
 abtop --mouse            # Enable mouse click/scroll navigation
 ```
 
-Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
+Recommended terminal size: **120x40** or larger. The minimum is 80x24, and panels hide when space is limited. Pi run metadata stays in the selected-session detail at 80x24 and 100x24. At 140 columns or wider, available runs move to a dedicated Runs panel.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
 ### Terminal Jump
@@ -77,19 +77,21 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Pi          | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :---------: | :-------: | :------: |
-| Process Discovery |     ✅      |     ✅      |    ✅     |    ✅    |
-| Session Telemetry |     🚧      |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |      —      |     ✅      |    ✅     |    ✅    |
-| Context Window %  |      —      |     ✅      |    ✅     |    ❌    |
-| Status Detection  |      —      |     ✅      |    ✅     |    ✅    |
-| Current Task      |      —      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |      —      |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |     ✅      |    ✅     |    ✅    |
-| Subagents         |      —      |     ✅      |    ❌     |    ❌    |
-| Memory Status     |      —      |     ✅      |    ❌     |    ❌    |
+| Feature | Pi | Claude Code | Codex CLI | OpenCode |
+| --- | :---: | :---: | :---: | :---: |
+| Process discovery | ✅ | ✅ | ✅ | ✅ |
+| Owned session telemetry | macOS/Linux | ✅ | ✅ | ✅ |
+| Token tracking | Attached sessions | ✅ | ✅ | ✅ |
+| Context window | Attached sessions | ✅ | ✅ | ❌ |
+| Parent activity state | Unknown | ✅ | ✅ | ✅ |
+| Current task text | Hidden | ✅ | ✅ | ❌ |
+| Account rate limit | — | ✅ | ✅ | ❌ |
+| Git status | ✅ | ✅ | ✅ | ✅ |
+| Children / ports | ✅ | ✅ | ✅ | ✅ |
+| Subagent run metadata | `status.json` | ✅ | ❌ | ❌ |
+| Memory status | — | ✅ | ❌ | ❌ |
+
+Pi telemetry requires unambiguous ownership. Windows stays process-only. See [Pi Fleet support and release gates](docs/pi-fleet.md) for platform boundaries, privacy rules, parser limits, compatibility policy, and validation commands.
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
@@ -136,6 +138,14 @@ hidden_agents = ["codex"]
 claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
+# Panel visibility. Pi mode always suppresses quota and MCP panels.
+show_context = true
+show_quota = true
+show_tokens = true
+show_projects = true
+show_ports = true
+show_sessions = true
+show_mcp = true
 ```
 
 ### Supported Languages
@@ -145,7 +155,7 @@ language = "zh"
 | `en` | English (default)   |
 | `zh` | Simplified Chinese  |
 
-When `language` is unset, abtop auto-detects from `LANG` — any value starting with `zh` switches to Simplified Chinese, otherwise English.
+When `language` is unset, abtop auto-detects from `LANG`. Any value starting with `zh` switches to Simplified Chinese; other values use English.
 
 ## Key Bindings
 
@@ -156,7 +166,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `x`                | Kill selected session                |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |
-| `1`–`5`            | Toggle panel visibility              |
+| `1`-`7`            | Toggle panel visibility              |
 | `Esc`              | Open/close config page               |
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
@@ -164,7 +174,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 ## Library / JSON snapshot
 
 abtop is also a library crate, so local tools can reuse its data-collection
-layer in-process — no re-scanning, no subprocesses — and serialize the same
+layer in-process without rescanning or subprocesses and serialize the same
 state the TUI renders.
 
 ```bash
@@ -194,7 +204,7 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 ## Privacy
 
-abtop reads local files and local process/open-file metadata only. No API keys, no auth. Pi Fleet mode is metadata-only and does not generate summaries or make network calls. Legacy mode can generate session summaries through `claude --print`; that command may call the Claude API.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Pi Fleet mode is metadata-only and does not generate summaries or make network calls. It reads owned parent session JSONL for identity and numeric telemetry, but does not retain or publish prompt text, assistant text, tool arguments, or tool results. Its subagent adapter reads supported `status.json` files only, not child transcripts, prompt files, events, output logs, or tool-argument files. Legacy mode can generate session summaries through `claude --print`; that command may call the Claude API.
 
 The JSON snapshot includes `monitor_mode`, `token_rate_value`, and structured Pi `telemetry` fields. Process-only Pi rows use `null` for authoritative context, usage, and token-rate values; the legacy numeric fields remain compatibility placeholders. Pi output never includes child command arguments, prompts, task text, tool arguments, tool results, or transcript content. It reduces child commands to executable labels. Legacy snapshots can include `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Treat snapshots as local/private data. Do not write them to shared logs or expose them on a network without access controls.
 

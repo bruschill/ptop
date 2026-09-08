@@ -424,6 +424,36 @@ fn sanitize_output(s: &str) -> String {
         .collect()
 }
 
+fn format_context_value(session: &model::AgentSession) -> String {
+    session
+        .context_value()
+        .map(|percent| format!("{}{:>3.0}%", session.context_precision().prefix(), percent))
+        .or_else(|| {
+            session.context_tokens_without_window().map(|tokens| {
+                format!(
+                    "{}{} (window —)",
+                    session.context_precision().prefix(),
+                    fmt_tok(tokens)
+                )
+            })
+        })
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_token_value(session: &model::AgentSession) -> String {
+    session
+        .total_tokens_value()
+        .map(|total| {
+            format!(
+                "{}{}{}",
+                session.usage_precision().prefix(),
+                fmt_tok(total),
+                if session.usage_is_partial() { "+" } else { "" }
+            )
+        })
+        .unwrap_or_else(|| "—".to_string())
+}
+
 fn print_snapshot(app: &App) {
     if app.is_pi_mode() {
         println!("abtop Pi Fleet — {} processes\n", app.sessions.len());
@@ -481,30 +511,8 @@ fn print_snapshot(app: &App) {
         } else {
             session.model.replace("claude-", "")
         };
-        let context = session
-            .context_value()
-            .map(|percent| format!("{}{:>3.0}%", session.context_precision().prefix(), percent))
-            .or_else(|| {
-                session.context_tokens_without_window().map(|tokens| {
-                    format!(
-                        "{}{} (window —)",
-                        session.context_precision().prefix(),
-                        fmt_tok(tokens)
-                    )
-                })
-            })
-            .unwrap_or_else(|| "—".to_string());
-        let tokens = session
-            .total_tokens_value()
-            .map(|total| {
-                format!(
-                    "{}{}{}",
-                    session.usage_precision().prefix(),
-                    fmt_tok(total),
-                    if session.usage_is_partial() { "+" } else { "" }
-                )
-            })
-            .unwrap_or_else(|| "—".to_string());
+        let context = format_context_value(session);
+        let tokens = format_token_value(session);
         let age = if session.agent_cli == "pi" {
             format!("seen:{}", session.elapsed_display())
         } else {
@@ -717,6 +725,7 @@ fn fmt_tok(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{TelemetryCompleteness, TelemetryPrecision};
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
@@ -733,6 +742,53 @@ mod tests {
         let legacy = build_app(theme::Theme::default(), &cfg, true);
         assert!(pi.is_pi_mode());
         assert_eq!(legacy.monitor_mode, app::MonitorMode::Legacy);
+    }
+
+    #[test]
+    fn text_values_distinguish_unknown_exact_inferred_estimated_and_partial() {
+        let mut app = App::new_pi(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        demo::populate_demo(&mut app);
+        let session = app.sessions.first_mut().unwrap();
+        session.agent_cli = "pi";
+        session.context_percent = 0.0;
+        session.context_window = 0;
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        session.telemetry = Some(model::SessionTelemetry::process_only(1));
+
+        assert_eq!(format_context_value(session), "—");
+        assert_eq!(format_token_value(session), "—");
+
+        let telemetry = session.telemetry.as_mut().unwrap();
+        telemetry.context.precision = TelemetryPrecision::Exact;
+        telemetry.context.completeness = TelemetryCompleteness::Complete;
+        telemetry.context_details.tokens = Some(0);
+        telemetry.usage.precision = TelemetryPrecision::Exact;
+        telemetry.usage.completeness = TelemetryCompleteness::Complete;
+        session.context_window = 200_000;
+        assert_eq!(format_context_value(session).trim(), "0%");
+        assert_eq!(format_token_value(session), "0");
+
+        session.context_percent = 42.0;
+        session.total_input_tokens = 14;
+        let telemetry = session.telemetry.as_mut().unwrap();
+        telemetry.context.precision = TelemetryPrecision::Inferred;
+        telemetry.usage.precision = TelemetryPrecision::Inferred;
+        assert_eq!(format_context_value(session), "~ 42%");
+        assert_eq!(format_token_value(session), "~14");
+
+        let telemetry = session.telemetry.as_mut().unwrap();
+        telemetry.context.precision = TelemetryPrecision::Estimated;
+        telemetry.usage.precision = TelemetryPrecision::Estimated;
+        telemetry.usage.completeness = TelemetryCompleteness::Partial;
+        assert_eq!(format_context_value(session), "≈ 42%");
+        assert_eq!(format_token_value(session), "≈14+");
     }
 
     #[test]

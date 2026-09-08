@@ -4,15 +4,74 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref used as the changed-file formatting base
+        required: false
+        default: HEAD^
 
 jobs:
-  check:
+  format:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - name: Check changed Rust files
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          MANUAL_BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          base_sha="${PR_BASE_SHA:-${PUSH_BASE_SHA:-${MANUAL_BASE_REF:-HEAD^}}}"
+          if [[ "${base_sha}" =~ ^0+$ ]]; then base_sha=HEAD^; fi
+          scripts/check-rustfmt.sh "${base_sha}"
+
+  platform:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows process-only
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::uninlined-format-args
+      - run: cargo test --all-targets
       - run: cargo build --release
+
+  legacy-regression:
+    name: Legacy collector regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test collector::tests::with_hidden
+      - run: cargo test product_entry_uses_pi_collector_unless_legacy_is_requested
+      - run: cargo test snapshot::tests::to_snapshot_maps_fields_and_passes_interval_through
+
+  pi-parser-budget:
+    name: Pi parser budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release pi_parser_release_benchmark -- --ignored --nocapture

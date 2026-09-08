@@ -7,6 +7,7 @@ mod mcp;
 mod ports;
 mod projects;
 mod quota;
+mod runs;
 mod sessions;
 mod tokens;
 mod view_menu;
@@ -282,6 +283,7 @@ pub(crate) fn styled_label(text: &str, graph_text: Color) -> Span<'static> {
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 18;
 pub(crate) const DESKTOP_WIDTH: u16 = 100;
+const RUNS_PROMOTION_WIDTH: u16 = 140;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClickTarget {
@@ -292,10 +294,16 @@ pub(crate) enum ClickTarget {
     KillOrphanPorts,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopPanel {
+    Narrow(NarrowSection),
+    Runs,
+}
+
 struct DesktopLayout {
     header: Rect,
     context: Option<Rect>,
-    mid: Vec<(NarrowSection, Rect)>,
+    mid: Vec<(DesktopPanel, Rect)>,
     sessions: Option<Rect>,
     footer: Rect,
 }
@@ -391,19 +399,32 @@ pub fn draw(f: &mut Frame, app: &App) {
         context::draw_context_panel(f, app, area, theme);
     }
 
-    for (section, area) in layout.mid {
-        match section {
-            NarrowSection::Quota => quota::draw_quota_panel(f, app, area, theme),
-            NarrowSection::Tokens => tokens::draw_tokens_panel(f, app, area, theme),
-            NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
-            NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
-            NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
-            NarrowSection::Sessions | NarrowSection::Context => {}
+    let runs_promoted = layout
+        .mid
+        .iter()
+        .any(|(panel, _)| *panel == DesktopPanel::Runs);
+    for (panel, area) in &layout.mid {
+        match panel {
+            DesktopPanel::Narrow(NarrowSection::Quota) => {
+                quota::draw_quota_panel(f, app, *area, theme)
+            }
+            DesktopPanel::Narrow(NarrowSection::Tokens) => {
+                tokens::draw_tokens_panel(f, app, *area, theme)
+            }
+            DesktopPanel::Narrow(NarrowSection::Projects) => {
+                projects::draw_projects_panel(f, app, *area, theme)
+            }
+            DesktopPanel::Narrow(NarrowSection::Ports) => {
+                ports::draw_ports_panel(f, app, *area, theme)
+            }
+            DesktopPanel::Narrow(NarrowSection::Mcp) => mcp::draw_mcp_panel(f, app, *area, theme),
+            DesktopPanel::Runs => runs::draw_runs_panel(f, app, *area, theme),
+            DesktopPanel::Narrow(NarrowSection::Sessions | NarrowSection::Context) => {}
         }
     }
 
     if let Some(area) = layout.sessions {
-        sessions::draw_sessions_panel(f, app, area, theme);
+        sessions::draw_sessions_panel_with_promoted_runs(f, app, area, theme, runs_promoted);
     }
     footer::draw_footer(f, app, layout.footer, theme);
 
@@ -417,25 +438,37 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
 
     let mut mid_sections = Vec::new();
     if app.show_quota {
-        mid_sections.push(NarrowSection::Quota);
+        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Quota));
     }
     if app.show_tokens {
-        mid_sections.push(NarrowSection::Tokens);
+        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Tokens));
     }
     if app.show_projects {
-        mid_sections.push(NarrowSection::Projects);
+        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Projects));
     }
     if app.show_ports {
-        mid_sections.push(NarrowSection::Ports);
+        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Ports));
     }
     if app.show_mcp {
-        mid_sections.push(NarrowSection::Mcp);
+        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Mcp));
+    }
+    if app.is_pi_mode()
+        && app.show_sessions
+        && area.width >= RUNS_PROMOTION_WIDTH
+        && runs::selected_has_runs(app)
+    {
+        mid_sections.push(DesktopPanel::Runs);
     }
 
     let any_mid = !mid_sections.is_empty();
     let mid_h_ideal: u16 = 8;
     let sessions_ideal: u16 = if app.show_sessions {
-        (app.sessions.len() as u16 * 2 + 7).max(8)
+        let base = (app.sessions.len() as u16 * 2 + 7).max(8);
+        if app.is_pi_mode() && area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
+            base.saturating_add(7)
+        } else {
+            base
+        }
     } else {
         0
     };
@@ -720,8 +753,8 @@ pub(crate) fn click_target(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 return session_at(app, sessions_area, row).map(ClickTarget::Session);
             }
         }
-        for (section, section_area) in layout.mid {
-            if section == NarrowSection::Ports
+        for (panel, section_area) in layout.mid {
+            if panel == DesktopPanel::Narrow(NarrowSection::Ports)
                 && contains(section_area, column, row)
                 && ports_kill_at(app, section_area, row)
             {
@@ -1004,6 +1037,10 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::PanelVisibility;
+    use crate::model::{
+        FleetChild, FleetExecution, FleetIdentitySource, FleetRun, FleetRunMode, FleetRunState,
+        FleetTelemetry, FleetUsage, SourceHealth,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1310,7 +1347,7 @@ mod tests {
         let ports_area = layout
             .mid
             .iter()
-            .find(|(section, _)| *section == NarrowSection::Ports)
+            .find(|(panel, _)| *panel == DesktopPanel::Narrow(NarrowSection::Ports))
             .map(|(_, area)| *area)
             .unwrap();
         let kill_row = ports_area.y + 1 + 1 + app.orphan_ports.len() as u16;
@@ -1376,9 +1413,178 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pi_runs_promote_only_at_wide_desktop_width() {
+        for (width, height) in [(80, 24), (100, 24), (139, 40)] {
+            let text = render_pi_fleet(width, height);
+            assert!(
+                text.contains("run-wide"),
+                "missing selected-detail run at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("stale"),
+                "stale run warning is missing at {width}x{height}\n{text}"
+            );
+            assert!(
+                !text.contains("⁷runs"),
+                "runs panel promoted too early at {width}x{height}\n{text}"
+            );
+        }
+
+        for width in [140, 160] {
+            let text = render_pi_fleet(width, 40);
+            assert!(
+                text.contains("⁷runs"),
+                "wide layout did not promote runs at {width} columns\n{text}"
+            );
+            assert!(
+                text.contains("stale"),
+                "promoted stale warning is missing at {width} columns\n{text}"
+            );
+            assert_eq!(
+                text.matches("run-wide").count(),
+                1,
+                "promoted run should not be duplicated at {width} columns\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_click_targets_survive_narrow_and_promoted_runs_layouts() {
+        let mut narrow = pi_fleet_app();
+        narrow.toggle_narrow_section_zoom(NarrowSection::Sessions);
+        let narrow_area = Rect::new(0, 0, 80, 24);
+        let sessions_area =
+            narrow_section_areas(&narrow, NarrowTab::Work, narrow_chunks(narrow_area)[1])
+                .into_iter()
+                .find(|(section, _)| *section == NarrowSection::Sessions)
+                .map(|(_, area)| area)
+                .unwrap();
+        assert_eq!(
+            click_target(
+                &narrow,
+                narrow_area,
+                sessions_area.x + 2,
+                sessions_area.y + 2
+            ),
+            Some(ClickTarget::Session(0))
+        );
+        assert_eq!(
+            click_target(
+                &narrow,
+                narrow_area,
+                sessions_area.x + sessions_area.width - 3,
+                sessions_area.y
+            ),
+            Some(ClickTarget::NarrowZoom(NarrowSection::Sessions))
+        );
+
+        let mut desktop = pi_fleet_app();
+        desktop.sessions[0].children.clear();
+        assert!(!desktop.orphan_ports.is_empty());
+        for width in [100, 140, 160] {
+            let area = Rect::new(0, 0, width, 40);
+            let layout = desktop_layout(&desktop, area);
+            let sessions_area = layout.sessions.unwrap();
+            assert_eq!(
+                click_target(&desktop, area, sessions_area.x + 2, sessions_area.y + 2),
+                Some(ClickTarget::Session(0))
+            );
+            let ports_area = layout
+                .mid
+                .iter()
+                .find(|(panel, _)| *panel == DesktopPanel::Narrow(NarrowSection::Ports))
+                .map(|(_, area)| *area)
+                .unwrap();
+            let kill_row = ports_area.y + 2 + desktop.orphan_ports.len() as u16;
+            assert_eq!(
+                click_target(&desktop, area, ports_area.x + 2, kill_row),
+                Some(ClickTarget::KillOrphanPorts)
+            );
+            let runs_area = layout
+                .mid
+                .iter()
+                .find(|(panel, _)| *panel == DesktopPanel::Runs)
+                .map(|(_, area)| *area);
+            assert_eq!(runs_area.is_some(), width >= RUNS_PROMOTION_WIDTH);
+            if let Some(runs_area) = runs_area {
+                assert_eq!(
+                    click_target(&desktop, area, runs_area.x + 2, runs_area.y + 2),
+                    None
+                );
+            }
+        }
+    }
+
     fn render_demo(width: u16, height: u16) -> String {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    fn pi_fleet_app() -> App {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.agent_cli = "pi";
+        session.session_id = "parent-session-ＡＢ-with-a-very-long-identity".to_string();
+        session.project_name = "project-ＡＢ-with-a-very-long-name".to_string();
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
+        let telemetry = session.telemetry.as_mut().unwrap();
+        let mut fleet = FleetTelemetry::unavailable(123, "test");
+        fleet.source_health = SourceHealth::Healthy;
+        fleet.reason = None;
+        fleet.runs.push(FleetRun {
+            lifecycle_version: Some(3),
+            run_id: "run-wide-with-a-very-long-identity".to_string(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Workflow,
+            state: FleetRunState::Running,
+            execution: FleetExecution::Background,
+            runner_pid: None,
+            started_at_ms: Some(100),
+            updated_at_ms: Some(120),
+            ended_at_ms: None,
+            source_updated_at_ms: 120,
+            stale: true,
+            process_terminal: None,
+            usage: FleetUsage::separate_run_aggregate(),
+            children: (0..64)
+                .map(|index| FleetChild {
+                    id: format!("child-{index}"),
+                    run_id: None,
+                    identity_source: FleetIdentitySource::Index,
+                    name: format!("delegate-{index}-ＡＢ-long-name"),
+                    state: FleetRunState::Running,
+                    execution: FleetExecution::Background,
+                    model: None,
+                    current_tool: None,
+                    activity: None,
+                    started_at_ms: None,
+                    updated_at_ms: None,
+                    ended_at_ms: None,
+                    usage: FleetUsage::separate_run_aggregate(),
+                    children: Vec::new(),
+                })
+                .collect(),
+            omitted_children: 0,
+            reason: None,
+        });
+        telemetry.fleet = fleet;
+        app
+    }
+
+    fn render_pi_fleet(width: u16, height: u16) -> String {
+        let mut app = pi_fleet_app();
+        if width < DESKTOP_WIDTH {
+            app.toggle_narrow_section_zoom(NarrowSection::Sessions);
+        }
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();

@@ -2349,6 +2349,7 @@ mod tests {
     use crate::collector::process::ProcInfo;
     use crate::model::TelemetryPrecision;
     use std::io::Write;
+    use std::time::{Duration, Instant};
 
     fn proc(pid: u32, ppid: u32, command: &str) -> ProcInfo {
         ProcInfo {
@@ -2455,6 +2456,16 @@ mod tests {
             process_session_id(10, Some("stale-start"))
         );
         assert_ne!(sessions[0].started_at, 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_pi_telemetry_boundary_is_process_only() {
+        let mut budget = 4_096;
+        assert!(process_session_marker(42, &mut budget).is_none());
+        assert_eq!(process_open_jsonl_paths(42, 8, 128), (Vec::new(), 0, false));
+        assert!(process_cwd(42).is_none());
+        assert!(process_start_id(42).is_none());
     }
 
     #[test]
@@ -3309,5 +3320,100 @@ mod tests {
             .insert(root, ModelCatalogCache::default());
         collector.collect_sessions(&shared(Vec::new()));
         assert!(collector.model_catalogs.is_empty());
+    }
+
+    #[test]
+    fn documented_parser_limits_match_release_constants() {
+        let docs = include_str!("../../docs/pi-fleet.md");
+        let expected = [
+            format!(
+                "{} MiB of Pi session JSONL per collection tick",
+                MAX_TAIL_WORK_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "{} MiB per Pi session JSONL line",
+                MAX_TAIL_LINE_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "{} semantic tree entries per attached session",
+                MAX_SEMANTIC_ENTRIES
+            ),
+            format!(
+                "{} attachment candidates per collection tick",
+                MAX_ATTACHMENT_CANDIDATES_PER_COLLECT
+            ),
+            format!(
+                "{} Pi processes considered for attachment per collection tick",
+                MAX_PROCESSES_SCANNED_PER_COLLECT
+            ),
+            format!(
+                "{} open file descriptors per collection tick",
+                MAX_OPEN_FDS_SCANNED_PER_COLLECT
+            ),
+            format!(
+                "Model catalog files are capped at {} MiB and {} retained model entries",
+                MAX_MODEL_CATALOG_BYTES / (1024 * 1024) as u64,
+                MAX_MODEL_CATALOG_ENTRIES
+            ),
+        ];
+        for expected in expected {
+            assert!(
+                docs.contains(&expected),
+                "missing documented limit: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release benchmark; run with cargo test --release pi_parser_release_benchmark -- --ignored --nocapture"]
+    fn pi_parser_release_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut fixture =
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"benchmark\",\"cwd\":\"/tmp\"}\n"
+                .to_vec();
+        let padding = "x".repeat(96);
+        for index in 0..MAX_SEMANTIC_ENTRIES {
+            let parent = if index == 0 {
+                "null".to_string()
+            } else {
+                format!("\"entry-{}\"", index - 1)
+            };
+            let line = format!(
+                "{{\"type\":\"message\",\"id\":\"entry-{index}\",\"parentId\":{parent},\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":1,\"output\":1,\"cacheRead\":1,\"cacheWrite\":1,\"totalTokens\":4}},\"content\":[{{\"type\":\"text\",\"text\":\"{padding}\"}}]}}}}\n"
+            );
+            fixture.extend_from_slice(line.as_bytes());
+            if fixture.len() > MAX_TAIL_WORK_BYTES + MAX_TAIL_LINE_BYTES.min(line.len()) {
+                break;
+            }
+        }
+        assert!(fixture.len() > MAX_TAIL_WORK_BYTES);
+        fs::write(&path, &fixture).unwrap();
+
+        let started = Instant::now();
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let tail = collector
+            .tail_session_with_budget(&path, 1, &mut budget)
+            .unwrap();
+        let parsed = tail.semantic.session_data(tail.complete);
+        let offset = tail.offset;
+        let complete = tail.complete;
+        let entry_count = tail.semantic.entries.len();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            budget, 0,
+            "production tailer did not consume its tick budget"
+        );
+        assert!(!complete, "oversized fixture should require another tick");
+        assert!(offset > (MAX_TAIL_WORK_BYTES / 2) as u64);
+        assert!(offset <= MAX_TAIL_WORK_BYTES as u64);
+        assert_eq!(parsed.turns as usize, entry_count);
+        eprintln!("tailed {offset} JSONL bytes across {entry_count} entries in {elapsed:?}");
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "2 MiB parser gate exceeded one second: {elapsed:?}"
+        );
     }
 }
