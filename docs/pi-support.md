@@ -1,6 +1,6 @@
-# Pi Fleet support and release gates
+# Pi support and release gates
 
-Pi Fleet is the default `abtop` mode. It discovers local Pi processes first, then attaches telemetry only when the owning session file can be proved without ambiguity. Use `abtop --legacy` for the Claude Code, Codex CLI, and OpenCode collectors during stabilization.
+ptop discovers local Pi processes by default, then attaches telemetry only when it can prove ownership of the session file without ambiguity. Use `ptop --legacy` for the Claude Code, Codex CLI, and OpenCode collectors during stabilization.
 
 ## Platform contract
 
@@ -31,11 +31,11 @@ Runs remain in the selected-session detail at 80x24 and 100x24. At 140 columns o
 
 ## Privacy boundary
 
-Pi Fleet reads local process metadata, owned parent session JSONL files, model catalog metadata, and supported `pi-subagents` `status.json` files. It does not read child session transcripts, prompt files, `events.jsonl`, output logs, or tool-argument files from the subagent run directory.
+ptop reads local process metadata, owned parent session JSONL files, model catalog metadata, and supported `pi-subagents` `status.json` files. It does not read child session transcripts, prompt files, `events.jsonl`, output logs, or tool-argument files from the subagent run directory.
 
 The owned parent JSONL parser inspects records for identity, usage, model metadata, and context size. It does not retain or publish prompt text, assistant text, tool arguments, or tool results. Pi snapshots and TUI rows reduce child process commands to executable names.
 
-Pi Fleet does not generate summaries or call `claude --print`. `--once`, `--json`, the TUI, and library callers using `tick_no_summaries()` keep that behavior.
+ptop does not generate summaries or call `claude --print`. `--once`, `--json`, the TUI, and library callers using `tick_no_summaries()` keep that behavior.
 
 ## Parser and retention limits
 
@@ -79,14 +79,14 @@ The benchmark parses and reconstructs up to one full 2 MiB tick budget. The rele
 Run these checks before publishing:
 
 ```bash
-scripts/check-rustfmt.sh HEAD^
+scripts/check-rustfmt.sh "$(git merge-base HEAD origin/main)"
 cargo clippy --all-targets -- -D warnings -A clippy::uninlined-format-args
 cargo test --all-targets
 cargo build --release
 cargo test --release pi_parser_release_benchmark -- --ignored --nocapture
 ```
 
-CI runs the build, Clippy, and test suite on macOS, Linux, and Windows. It also runs explicit legacy-constructor regression tests and the parser benchmark on Linux. The rustfmt gate checks Rust files changed from the pull request base because the older codebase does not yet pass a whole-repository Rust 1.88 formatting check. The Clippy gate allows the existing `uninlined_format_args` style lint so unrelated formatting does not block the release; every other warning remains denied.
+CI runs the build, Clippy, and test suite on macOS, Linux, and Windows. It also runs explicit legacy-constructor regression tests and the parser benchmark on Linux. The rustfmt gate checks Rust files changed from the provided base, including committed, staged, and unstaged changes, because the older codebase does not yet pass a whole-repository Rust 1.88 formatting check. The Clippy gate allows the existing `uninlined_format_args` style lint so unrelated formatting does not block the release; every other warning remains denied.
 
 Before changing a support claim, verify:
 

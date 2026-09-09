@@ -109,7 +109,7 @@ fn draw_source_column(
 
     let Some(rl) = rl else {
         let hint = if source.eq_ignore_ascii_case("claude") {
-            t("quota.abtop_setup")
+            t("quota.ptop_setup")
         } else {
             t("quota.run_codex")
         };

@@ -3324,7 +3324,7 @@ mod tests {
 
     #[test]
     fn documented_parser_limits_match_release_constants() {
-        let docs = include_str!("../../docs/pi-fleet.md");
+        let docs = include_str!("../../docs/pi-support.md");
         let expected = [
             format!(
                 "{} MiB of Pi session JSONL per collection tick",

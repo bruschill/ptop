@@ -10,7 +10,7 @@ fi
 files=()
 while IFS= read -r file; do
   [[ -n "${file}" ]] && files+=("${file}")
-done < <(git diff --name-only --diff-filter=ACMRT "${base_ref}" HEAD -- '*.rs')
+done < <(git diff --name-only --diff-filter=ACMRT "${base_ref}" -- '*.rs')
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No changed Rust files to check."

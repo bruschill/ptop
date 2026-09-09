@@ -1646,7 +1646,7 @@ mod tests {
 
     #[test]
     fn documented_fleet_limits_match_release_constants() {
-        let docs = include_str!("../../docs/pi-fleet.md");
+        let docs = include_str!("../../docs/pi-support.md");
         let expected = [
             format!("{} KiB per status.json file", MAX_STATUS_BYTES / 1024),
             format!(

@@ -1,8 +1,8 @@
-# abtop
+# ptop
 
-AI agent monitor for your terminal. Like btop++, but for AI coding agents.
+Local terminal monitor for Pi coding-agent processes, sessions, and subagent runs.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
+The legacy mode supports Claude Code, Codex CLI, and OpenCode sessions.
 
 ## Language Policy
 
@@ -20,7 +20,7 @@ English is mandatory for all project-facing work and communication.
 src/
 ├── main.rs                 # Entry, terminal setup, event loop, --setup flag
 ├── app.rs                  # App state, tick logic, key handling, summary generation
-├── setup.rs                # StatusLine hook installation (abtop --setup)
+├── setup.rs                # StatusLine hook installation (ptop --setup)
 ├── ui/
 │   └── mod.rs              # All panels in single file: header, context, quota,
 │                           # tokens, projects, ports, sessions, footer
@@ -30,7 +30,7 @@ src/
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
-│   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
+│   └── rate_limit.rs       # Rate limit file reading (~/.claude/ptop-rate-limits.json)
 └── model/
     ├── mod.rs              # Re-exports
     └── session.rs          # AgentSession, SessionStatus, RateLimitInfo,
@@ -41,12 +41,12 @@ src/
 
 ```
 ┌─ ¹context (token rate sparkline + per-session context bars) ─────────┐
-│  ▁▃▅▇█▇▅▃▁▃▅▇██                       S1 abtop       ████████ 82%  │
+│  ▁▃▅▇█▇▅▃▁▃▅▇██                       S1 ptop       ████████ 82%  │
 │  token rate (200pt history)            S2 prediction  █████████91%⚠ │
 │                                        S3 api-server  ███      22%  │
 └──────────────────────────────────────────────────────────────────────┘
 ┌─ ²quota ─────┐┌─ ³tokens ───┐┌─ projects ───┐┌─ ⁴ports ──────────┐
-│ CLAUDE       ││ Total  1.2M ││ abtop        ││ PORT  SESSION  CMD │
+│ CLAUDE       ││ Total  1.2M ││ ptop        ││ PORT  SESSION  CMD │
 │ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││ :3000 api-srv node│
 │   resets 2h  ││ Output  89k ││              ││ :8080 predict crgo│
 │ 7d ██ 12%    ││ Cache  710k ││ prediction   ││                    │
@@ -56,10 +56,10 @@ src/
 │ 7d ██ 14%    ││             ││  main ✓clean ││                    │
 └──────────────┘└─────────────┘└──────────────┘└────────────────────┘
 ┌─ ⁵sessions ─────────────────────────────────────────────────────────┐
-│ ►*CC 7336 abtop  ● Work opus  82% 1.2M  48  Edit src/pay.rs       │
+│ ►*CC 7336 ptop  ● Work opus  82% 1.2M  48  Edit src/pay.rs       │
 │  >CD 8840 pred   ◌ Wait sonn  91% 340k  12  waiting                │
 │ ─────────────────────────────────────────────────────────────────── │
-│  SESSION 7336 · /Users/graykode/abtop                               │
+│  SESSION 7336 · /Users/bruschill/ptop                               │
 │  Stripe payment integration...                                      │
 │  └─ Edit src/pay.rs                                                 │
 │  CHILDREN: 7401 cargo build                                         │
@@ -95,15 +95,15 @@ Discovery strategy:
 4. Read `{config-root}/sessions/{PID}.json`, falling back to scanning session files for the matching embedded PID
 5. Parse `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
 
-Fallback config roots are still scanned: `~/.claude`, direct home profile roots matching `~/.claude-*` when they contain both `sessions/` and `projects/`, `claude_config_dirs` from `~/.config/abtop/config.toml`, abtop's own `CLAUDE_CONFIG_DIR`, and on Linux any `CLAUDE_CONFIG_DIR` read from `/proc/{pid}/environ`.
+Fallback config roots are still scanned: `~/.claude`, direct home profile roots matching `~/.claude-*` when they contain both `sessions/` and `projects/`, `claude_config_dirs` from `~/.config/ptop/config.toml`, ptop's own `CLAUDE_CONFIG_DIR`, and on Linux any `CLAUDE_CONFIG_DIR` read from `/proc/{pid}/environ`.
 
 Session file format:
 ```json
-{ "pid": 7336, "sessionId": "2f029acc-...", "cwd": "/Users/graykode/abtop", "startedAt": 1774715116826, "kind": "interactive", "entrypoint": "cli" }
+{ "pid": 7336, "sessionId": "2f029acc-...", "cwd": "/Users/bruschill/ptop", "startedAt": 1774715116826, "kind": "interactive", "entrypoint": "cli" }
 ```
 - ~170 bytes. Created on start, deleted on exit.
 - Verify PID alive with shared `ps` data containing a `claude` binary.
-- Skip sessions whose PID descends from abtop's own `claude --print` summary children without hiding user-spawned non-interactive sessions.
+- Skip sessions whose PID descends from ptop's own `claude --print` summary children without hiding user-spawned non-interactive sessions.
 
 ### 2. Claude Code transcript: `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
 Path encoding: `/Users/foo/bar` → `-Users-foo-bar`
@@ -198,9 +198,9 @@ git -C {cwd} status --porcelain     # added/modified file counts
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
-`abtop --setup` automates this: creates a script at `~/.claude/abtop-statusline.sh` that writes rate limit JSON to `~/.claude/abtop-rate-limits.json`, and registers it in `~/.claude/settings.json`.
+`ptop --setup` automates this: creates a script at `~/.claude/ptop-statusline.sh` that writes rate limit JSON to `~/.claude/ptop-rate-limits.json`, and registers it in `~/.claude/settings.json`.
 
-File format read by abtop:
+File format read by ptop:
 ```json
 {
   "source": "claude",
@@ -247,7 +247,7 @@ Current task (2nd line under each session):
 Each session gets a one-line summary title generated via `claude --print`:
 - Spawned as background process with 10s timeout
 - Rejects generic/empty output; falls back to sanitized first prompt (28 chars)
-- Cached to `~/.cache/abtop/summaries.json` (persists across runs)
+- Cached to `~/.cache/ptop/summaries.json` (persists across runs)
 - Max 3 concurrent summary jobs, max 2 retries per session
 
 ## Context Window Calculation
@@ -369,7 +369,7 @@ Order (most specific first), mutually exclusive by controlling tty:
 1. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` (a UUID cmux exports
    into every surface, inherited by the agent) from the process environment via
    `ps eww`, then `cmux select-workspace --workspace <uuid>`.
-2. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
+2. **tmux** (`jump/tmux.rs`) — only when ptop itself runs inside tmux (`$TMUX`).
    Maps PID → pane via `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'`
    + process-tree descent, then `switch-client` / `select-window` / `select-pane`.
    PID in no pane → `NotApplicable` (lets another backend try).
@@ -383,11 +383,11 @@ Parsing/registry logic is unit-tested in `jump/mod.rs`; the thin `ps`/`osascript
 
 ## Privacy
 
-abtop reads transcripts, prompts, tool inputs, and memory files. These may contain secrets.
+ptop reads transcripts, prompts, tool inputs, and memory files. These may contain secrets.
 - **`--once` output**: redact file contents from tool_use inputs. Show tool name + file path only, not content.
 - **TUI mode**: show tool name + first arg (file path), never show file contents or prompt text in session list.
-- **No network**: abtop never sends data anywhere. All local reads.
-- **Exception**: summary generation calls `claude --print` locally (no network by abtop itself, but claude may use its API).
+- **No network**: ptop never sends data anywhere. All local reads.
+- **Exception**: summary generation calls `claude --print` locally (no network by ptop itself, but claude may use its API).
 
 ## Gotchas
 
@@ -406,4 +406,4 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
 - **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
 - **Rate limit staleness**: reject rate limit data older than 10 minutes.
-- **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. abtop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.
+- **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. ptop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.

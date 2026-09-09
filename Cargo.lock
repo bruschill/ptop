@@ -3,23 +3,6 @@
 version = 4
 
 [[package]]
-name = "abtop"
-version = "0.5.3"
-dependencies = [
- "chrono",
- "crossterm",
- "dirs",
- "libc",
- "proc_pidinfo",
- "ratatui",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,6 +553,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29492a7b48a00ab80202528e235d2f80a04ccff3747540b4ec6881f2f2bc42d1"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "ptop"
+version = "0.5.3"
+dependencies = [
+ "chrono",
+ "crossterm",
+ "dirs",
+ "libc",
+ "proc_pidinfo",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

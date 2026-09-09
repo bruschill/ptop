@@ -1,13 +1,13 @@
 [package]
-name = "abtop"
+name = "ptop"
 version = "0.5.3"
 edition = "2021"
 rust-version = "1.88"
-description = "AI agent monitor for your terminal"
+description = "Local Pi coding-agent monitor for your terminal"
 license = "MIT"
-repository = "https://github.com/graykode/abtop"
-homepage = "https://github.com/graykode/abtop"
-keywords = ["tui", "monitor", "claude", "ai", "agent"]
+repository = "https://github.com/bruschill/ptop"
+homepage = "https://github.com/bruschill/ptop"
+keywords = ["tui", "monitor", "pi", "ai", "agent"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 authors = ["Tae Hwan Jung <nlkey2022@gmail.com>"]

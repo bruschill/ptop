@@ -1,4 +1,4 @@
-use super::{process, context_window_for_model};
+use super::{context_window_for_model, process};
 use crate::model::{AgentSession, ChildProcess, SessionStatus};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -71,9 +71,9 @@ impl OpenCodeCollector {
             if !self.warned_sqlite3_missing {
                 self.warned_sqlite3_missing = true;
                 eprintln!(
-                    "abtop: OpenCode database found at {} but the `sqlite3` CLI is not on PATH; \
+                    "ptop: OpenCode database found at {} but the `sqlite3` CLI is not on PATH; \
                      OpenCode sessions will not appear. Install it (e.g. `winget install SQLite.SQLite`) \
-                     and restart abtop.",
+                     and restart ptop.",
                     self.db_path.display()
                 );
             }

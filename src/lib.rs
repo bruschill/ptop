@@ -1,4 +1,4 @@
-//! abtop — AI agent monitor.
+//! ptop — AI agent monitor.
 //!
 //! This crate is both a binary (the TUI, entered via [`run`]) and a library.
 //! The library surface exists so a separate local tool (e.g. a web UI) can
@@ -32,8 +32,8 @@
 //! # Typical usage
 //!
 //! ```no_run
-//! use abtop::app::App;
-//! use abtop::{config, theme::Theme};
+//! use ptop::app::App;
+//! use ptop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
 //! let mut app = App::new_pi(Theme::default(), &cfg.hidden_agents, cfg.panels);
@@ -91,7 +91,7 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig, legacy_mode: bool) ->
 pub fn run() -> io::Result<()> {
     // --version / -V flag: print version and exit
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("abtop {}", env!("CARGO_PKG_VERSION"));
+        println!("ptop {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -456,10 +456,10 @@ fn format_token_value(session: &model::AgentSession) -> String {
 
 fn print_snapshot(app: &App) {
     if app.is_pi_mode() {
-        println!("abtop Pi Fleet — {} processes\n", app.sessions.len());
+        println!("ptop — {} Pi processes\n", app.sessions.len());
     } else {
         println!(
-            "abtop — {} sessions, {} mcp servers\n",
+            "ptop — {} sessions, {} mcp servers\n",
             app.sessions.len(),
             app.mcp_servers.len()
         );
@@ -653,12 +653,12 @@ fn print_snapshot(app: &App) {
 
 fn run_update() -> io::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    println!("abtop v{current} — checking for updates...\n");
+    println!("ptop v{current} — checking for updates...\n");
 
     // Download to a private temp file (O_EXCL + random suffix) so a local
     // attacker can't pre-place a symlink or swap the file mid-run.
     let tmp = tempfile::Builder::new()
-        .prefix("abtop-installer-")
+        .prefix("ptop-installer-")
         .suffix(".sh")
         .tempfile()?;
     let installer_path = tmp.path().to_path_buf();
@@ -669,7 +669,7 @@ fn run_update() -> io::Result<()> {
             "=https",
             "--tlsv1.2",
             "-LsSf",
-            "https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh",
+            "https://github.com/bruschill/ptop/releases/latest/download/ptop-installer.sh",
             "-o",
         ])
         .arg(&installer_path)
@@ -677,7 +677,7 @@ fn run_update() -> io::Result<()> {
 
     if !dl_status.success() {
         eprintln!("\nDownload failed. You can also update manually:");
-        eprintln!("  cargo install abtop --force");
+        eprintln!("  cargo install ptop --force");
         std::process::exit(1);
     }
 
@@ -705,7 +705,7 @@ fn run_update() -> io::Result<()> {
 
     if !status.success() {
         eprintln!("\nUpdate failed. You can also update manually:");
-        eprintln!("  cargo install abtop --force");
+        eprintln!("  cargo install ptop --force");
         std::process::exit(1);
     }
 
@@ -731,8 +731,8 @@ mod tests {
 
     #[test]
     fn mouse_capture_is_opt_in() {
-        assert!(!should_enable_mouse_capture(["abtop"]));
-        assert!(should_enable_mouse_capture(["abtop", "--mouse"]));
+        assert!(!should_enable_mouse_capture(["ptop"]));
+        assert!(should_enable_mouse_capture(["ptop", "--mouse"]));
     }
 
     #[test]

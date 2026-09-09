@@ -1,6 +1,6 @@
 //! tmux backend.
 //!
-//! Only applicable when abtop itself runs inside tmux (a `switch-client` needs
+//! Only applicable when ptop itself runs inside tmux (a `switch-client` needs
 //! a tmux context). Maps the agent PID to the owning pane by process descent,
 //! then switches client/window/pane. When the PID is in no tmux pane the
 //! attempt is `NotApplicable`, letting another backend try.
