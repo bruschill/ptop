@@ -133,21 +133,8 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         }
     }
 
-    // Peak hours warning: US business hours = PT 5am–11am = UTC 12:00–18:00
-    let peak_info = {
-        let now = chrono::Utc::now();
-        let hour = now.hour();
-        if (12..18).contains(&hour) {
-            let mins_left = (18 - hour) * 60 - now.minute();
-            let h = mins_left / 60;
-            let m = mins_left % 60;
-            let peak_label = t("footer.peak_hours");
-            let resets_in = t("footer.resets_in");
-            Some(format!("⚡{} ({} {}h{:02}m)", peak_label, resets_in, h, m))
-        } else {
-            None
-        }
-    };
+    let now = chrono::Utc::now();
+    let peak_info = peak_hours_warning(app.is_pi_mode(), now.hour(), now.minute());
     if let Some(ref peak) = peak_info.filter(|_| !compact) {
         spans.push(Span::styled(
             format!(" {peak} "),
@@ -180,12 +167,31 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+// US business hours = PT 5am–11am = UTC 12:00–18:00.
+fn peak_hours_warning(pi_mode: bool, hour: u32, minute: u32) -> Option<String> {
+    if pi_mode || !(12..18).contains(&hour) {
+        return None;
+    }
+    let mins_left = (18 - hour) * 60 - minute;
+    let h = mins_left / 60;
+    let m = mins_left % 60;
+    let peak_label = t("footer.peak_hours");
+    let resets_in = t("footer.resets_in");
+    Some(format!("⚡{} ({} {}h{:02}m)", peak_label, resets_in, h, m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PanelVisibility;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn pi_mode_suppresses_provider_peak_hours_warning() {
+        assert!(peak_hours_warning(true, 13, 0).is_none());
+        assert!(peak_hours_warning(false, 13, 0).is_some());
+    }
 
     #[test]
     fn footer_renders_concise_cmux_socket_failure() {

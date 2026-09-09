@@ -24,6 +24,33 @@ pub(crate) fn draw_tokens_panel_active(
     active: bool,
 ) {
     let selected = app.sessions.get(app.selected);
+    let panel_title = if let Some(session) = selected {
+        format!(
+            "tokens ({}/{})",
+            truncate_str(&session.project_name, 12),
+            truncate_str(&session.session_id, 8)
+        )
+    } else {
+        "tokens".to_string()
+    };
+    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
+
+    if selected.is_some_and(|session| session.total_tokens_value().is_none()) {
+        let lines = vec![
+            Line::from(vec![
+                styled_label(" Total: ", theme.graph_text),
+                Span::styled("—", Style::default().fg(theme.inactive_fg)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Session telemetry unavailable",
+                Style::default().fg(theme.inactive_fg),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
     let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
     let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
     let cache_read: u64 = selected.map(|s| s.total_cache_read).unwrap_or(0);
@@ -163,15 +190,44 @@ pub(crate) fn draw_tokens_panel_active(
         ]),
     ];
 
-    let panel_title = if let Some(s) = selected {
-        format!(
-            "tokens ({}/{})",
-            truncate_str(&s.project_name, 12),
-            truncate_str(&s.session_id, 8)
-        )
-    } else {
-        "tokens".to_string()
-    };
-    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelVisibility;
+    use crate::model::SessionTelemetry;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn process_only_usage_has_no_zero_totals_or_bars() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        session.telemetry = Some(SessionTelemetry::process_only(1));
+
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_tokens_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(text.contains("Total: —"), "missing unknown total\n{text}");
+        assert!(
+            text.contains("Session telemetry unavailable"),
+            "missing source state\n{text}"
+        );
+        assert!(
+            !text.contains('■'),
+            "unknown usage rendered as a bar\n{text}"
+        );
+    }
 }

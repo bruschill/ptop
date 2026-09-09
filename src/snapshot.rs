@@ -14,7 +14,8 @@ use crate::app::App;
 use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
-    ChatRole, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, MAX_CHAT_MESSAGES,
+    AttachmentConfidence, AttachmentState, ChatRole, ChildProcess, OrphanPort, RateLimitInfo,
+    SessionStatus, SourceHealth, TelemetryMetadata, MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,19 +23,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Top-level snapshot returned by [`App::to_snapshot`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    /// Active product collector mode.
+    pub monitor_mode: crate::app::MonitorMode,
     /// Unix-epoch milliseconds when this snapshot was built.
     pub generated_at_ms: u64,
     /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
     /// before the first valid sample.
     pub host: Option<HostMetrics>,
-    /// Aggregate metrics across all sessions.
+    /// Legacy aggregate metrics. In Pi process-only mode, token, context, and
+    /// active-count members are compatibility placeholders rather than zeros.
     pub aggregate: AgentAggregate,
     /// Most recent per-tick token rate: the delta of *active* tokens, where
     /// active = input + output + cache_create (cache_read is excluded to avoid
     /// inflated rates). It therefore will NOT equal successive `total_tokens`
     /// diffs (which include cache_read). `0.0` on the first tick of a fresh
-    /// process (no prior totals to diff against).
+    /// process (no prior totals to diff against). This field is a compatibility
+    /// placeholder when `token_rate_value` is `null`.
     pub token_rate: f64,
+    /// Authoritative per-tick token rate, or `null` when usage is unavailable.
+    pub token_rate_value: Option<f64>,
     /// Collector tick interval in milliseconds. Divide `token_rate` by
     /// `interval_ms / 1000` for a per-second rate.
     pub interval_ms: u64,
@@ -81,13 +88,45 @@ pub struct SubAgentView {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextTelemetryView {
+    pub percent: Option<f64>,
+    pub window_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub metadata: TelemetryMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageTelemetryView {
+    pub total_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_create_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub metadata: TelemetryMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTelemetryView {
+    pub attachment: AttachmentState,
+    pub attachment_confidence: AttachmentConfidence,
+    pub source_health: SourceHealth,
+    pub error: Option<String>,
+    pub context: ContextTelemetryView,
+    pub usage: UsageTelemetryView,
+}
+
 /// A single session, flattened and curated for JSON consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionView {
-    /// Owning CLI: "claude", "codex", "opencode".
+    /// Owning CLI: "pi", "claude", "codex", or "opencode".
     pub agent_cli: &'static str,
     /// OS process id of the agent CLI for this session.
     pub pid: u32,
+    /// Opaque process-start identity, or `null` when PID reuse cannot be
+    /// guarded with a platform start identity.
+    pub process_start_id: Option<String>,
     /// Agent-assigned session identifier (stable for the life of the session).
     pub session_id: String,
     /// Project / workspace name (usually the basename of `cwd`).
@@ -104,11 +143,14 @@ pub struct SessionView {
     pub effort: String,
     /// Agent CLI version string, if known.
     pub version: String,
-    /// Context-window fill, 0.0–100.0 percent.
+    /// Legacy context-window fill. For Pi records this is a compatibility
+    /// placeholder; use `telemetry.context.percent` as the authoritative value.
     pub context_percent: f64,
-    /// Total context-window size in tokens (e.g. 200000).
+    /// Legacy context-window size. Pi-aware consumers must use
+    /// `telemetry.context.window_tokens`.
     pub context_window: u64,
-    /// All token classes summed: input + output + cache read + cache write.
+    /// Legacy token total. Pi-aware consumers must use
+    /// `telemetry.usage.total_tokens`.
     pub total_tokens: u64,
     /// Cumulative input (prompt) tokens for the session.
     pub input_tokens: u64,
@@ -128,12 +170,14 @@ pub struct SessionView {
     pub git_added: u32,
     /// Files modified in the working tree (git status), not session-scoped.
     pub git_modified: u32,
-    /// Session start, Unix-epoch milliseconds.
+    /// Session start for legacy records. Process-only Pi records use the first
+    /// collector observation, in Unix-epoch milliseconds.
     pub started_at_ms: u64,
     /// Wall-clock seconds since `started_at_ms`.
     pub elapsed_secs: u64,
-    /// Display summary: cached LLM title if present, else a safe raw-prompt
-    /// fallback. Never triggers summary generation.
+    /// Display summary. Pi records use a metadata-only state label; legacy
+    /// records may use cached titles or sanitized prompt fallbacks. Reading a
+    /// snapshot never triggers summary generation.
     pub summary: String,
     /// Most recent current-task line, if any.
     pub current_task: Option<String>,
@@ -152,6 +196,10 @@ pub struct SessionView {
     pub tool_calls: Vec<ToolCallView>,
     /// Recent chat transcript tail (user/assistant only).
     pub chat_messages: Vec<ChatMsgView>,
+    /// Authoritative telemetry state for collectors that must distinguish
+    /// unknown values from numeric compatibility placeholders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<SessionTelemetryView>,
 }
 
 /// A detected MCP server, with the internal `SystemTime` mtime resolved to a
@@ -203,6 +251,7 @@ impl App {
             .map(|s| SessionView {
                 agent_cli: s.agent_cli,
                 pid: s.pid,
+                process_start_id: s.process_start_id.clone(),
                 session_id: s.session_id.clone(),
                 project_name: s.project_name.clone(),
                 cwd: s.cwd.clone(),
@@ -227,7 +276,19 @@ impl App {
                 elapsed_secs: s.elapsed().as_secs(),
                 summary: self.session_summary(s),
                 current_task: s.current_tasks.last().cloned(),
-                children: s.children.clone(),
+                children: if s.agent_cli == "pi" {
+                    s.children
+                        .iter()
+                        .map(|child| ChildProcess {
+                            pid: child.pid,
+                            command: crate::model::safe_process_label(&child.command),
+                            mem_kb: child.mem_kb,
+                            port: child.port,
+                        })
+                        .collect()
+                } else {
+                    s.children.clone()
+                },
                 compaction_count: s.compaction_count,
                 token_history: tail(&s.token_history, 64),
                 subagents: tail(&s.subagents, 16)
@@ -256,32 +317,77 @@ impl App {
                         text: m.text.clone(),
                     })
                     .collect(),
+                telemetry: s.telemetry.as_ref().map(|telemetry| {
+                    let usage_known = s.total_tokens_value().is_some();
+                    SessionTelemetryView {
+                        attachment: telemetry.attachment,
+                        attachment_confidence: telemetry.attachment_confidence,
+                        source_health: telemetry.source_health,
+                        error: telemetry.error.clone(),
+                        context: ContextTelemetryView {
+                            percent: s.context_value(),
+                            window_tokens: s.context_window_value(),
+                            metadata: telemetry.context.clone(),
+                        },
+                        usage: UsageTelemetryView {
+                            total_tokens: s.total_tokens_value(),
+                            input_tokens: usage_known.then_some(s.total_input_tokens),
+                            output_tokens: usage_known.then_some(s.total_output_tokens),
+                            cache_read_tokens: usage_known.then_some(s.total_cache_read),
+                            cache_create_tokens: usage_known.then_some(s.total_cache_create),
+                            metadata: telemetry.usage.clone(),
+                        },
+                    }
+                }),
             })
             .collect();
 
-        let mcp_servers = self
-            .mcp_servers
-            .iter()
-            .map(|m| McpServerView {
-                pid: m.pid,
-                parent_cli: m.parent_cli,
-                profile: m.profile.clone(),
-                mem_kb: m.mem_kb,
-                active_count: m.active_count(now, ACTIVE_MTIME_SECS),
-                rollout_count: m.rollouts.len(),
-                last_activity_ms: m.latest_mtime().and_then(epoch_ms),
-            })
-            .collect();
+        let mcp_servers = if self.is_pi_mode() {
+            Vec::new()
+        } else {
+            self.mcp_servers
+                .iter()
+                .map(|m| McpServerView {
+                    pid: m.pid,
+                    parent_cli: m.parent_cli,
+                    profile: m.profile.clone(),
+                    mem_kb: m.mem_kb,
+                    active_count: m.active_count(now, ACTIVE_MTIME_SECS),
+                    rollout_count: m.rollouts.len(),
+                    last_activity_ms: m.latest_mtime().and_then(epoch_ms),
+                })
+                .collect()
+        };
 
         Snapshot {
+            monitor_mode: self.monitor_mode,
             generated_at_ms: epoch_ms(now).unwrap_or(0),
             host: self.host_metrics,
             aggregate: self.agent_aggregate,
             token_rate: self.token_rates.back().copied().unwrap_or(0.0),
+            token_rate_value: self
+                .token_rate_known
+                .then(|| self.token_rates.back().copied().unwrap_or(0.0)),
             interval_ms,
             sessions,
-            rate_limits: self.rate_limits.clone(),
-            orphan_ports: self.orphan_ports.clone(),
+            rate_limits: if self.is_pi_mode() {
+                Vec::new()
+            } else {
+                self.rate_limits.clone()
+            },
+            orphan_ports: if self.is_pi_mode() {
+                self.orphan_ports
+                    .iter()
+                    .map(|orphan| OrphanPort {
+                        port: orphan.port,
+                        pid: orphan.pid,
+                        command: crate::model::safe_process_label(&orphan.command),
+                        project_name: orphan.project_name.clone(),
+                    })
+                    .collect()
+            } else {
+                self.orphan_ports.clone()
+            },
             mcp_servers,
         }
     }
@@ -368,6 +474,52 @@ mod tests {
                 assert!(m.role == "user" || m.role == "assistant");
             }
         }
+    }
+
+    #[test]
+    fn pi_snapshot_uses_structured_unknowns_instead_of_numeric_placeholders() {
+        let mut app = demo_app();
+        app.monitor_mode = crate::app::MonitorMode::Pi;
+        app.token_rate_known = false;
+        let session = app.sessions.first_mut().unwrap();
+        session.agent_cli = "pi";
+        session.context_percent = 0.0;
+        session.context_window = 0;
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
+        session.process_start_id = Some("test:1".to_string());
+        session.children = vec![ChildProcess {
+            pid: 99,
+            command: "node --task private-prompt".to_string(),
+            mem_kb: 1,
+            port: None,
+        }];
+        app.orphan_ports = vec![OrphanPort {
+            port: 3000,
+            pid: 100,
+            command: "bun --prompt private-orphan".to_string(),
+            project_name: "project".to_string(),
+        }];
+
+        let snap = app.to_snapshot(2_000);
+        let pi = &snap.sessions[0];
+        assert!(snap.rate_limits.is_empty());
+        assert!(snap.mcp_servers.is_empty());
+        assert_eq!(snap.token_rate_value, None);
+        let telemetry = pi.telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.context.percent, None);
+        assert_eq!(telemetry.context.window_tokens, None);
+        assert_eq!(telemetry.usage.total_tokens, None);
+        assert_eq!(pi.process_start_id.as_deref(), Some("test:1"));
+        assert_eq!(pi.children[0].command, "node");
+        assert_eq!(snap.orphan_ports[0].command, "bun");
+
+        let json = serde_json::to_value(&snap).unwrap();
+        assert!(json["sessions"][0]["telemetry"]["context"]["percent"].is_null());
+        assert!(!json.to_string().contains("private-"));
     }
 
     #[test]

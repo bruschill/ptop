@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{btop_block_active, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str};
+use super::{
+    btop_block_active, fmt_age, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str,
+};
 
 pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_sessions_panel_active(f, app, area, theme, false);
@@ -137,6 +139,7 @@ pub(crate) fn draw_sessions_panel_active(
             "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
             "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
             "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
+            "pi" => ("πPI", Color::Rgb(192, 132, 252)),    // #C084FC violet
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
@@ -157,7 +160,14 @@ pub(crate) fn draw_sessions_panel_active(
 
         let is_1m = session.context_window >= 1_000_000 || session.model.contains("[1m]");
         let model_short = shorten_model(&session.model, is_1m);
-        let ctx_color = grad_at(&proc_grad, session.context_percent);
+        let (ctx_text, ctx_color) = if let Some(percent) = session.context_value() {
+            (
+                format!("{}{:.0}%", session.context_precision().prefix(), percent),
+                grad_at(&proc_grad, percent),
+            )
+        } else {
+            ("—".to_string(), theme.inactive_fg)
+        };
 
         let is_done = matches!(session.status, crate::model::SessionStatus::Done);
         let row_style = if selected {
@@ -226,14 +236,22 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
         cells.push(Cell::from(Span::styled(
-            format!("{:.0}%", session.context_percent),
+            ctx_text,
             Style::default().fg(ctx_color),
         )));
         if show_tokens {
-            cells.push(Cell::from(Span::styled(
-                fmt_tokens(session.total_tokens()),
-                Style::default().fg(theme.main_fg),
-            )));
+            let (tokens, color) = match session.total_tokens_value() {
+                Some(total) => (
+                    format!(
+                        "{}{}",
+                        session.usage_precision().prefix(),
+                        fmt_tokens(total)
+                    ),
+                    theme.main_fg,
+                ),
+                None => ("—".to_string(), theme.inactive_fg),
+            };
+            cells.push(Cell::from(Span::styled(tokens, Style::default().fg(color))));
         }
         if show_memory {
             cells.push(Cell::from(Span::styled(
@@ -531,7 +549,8 @@ pub(crate) fn draw_sessions_panel_active(
         let has_subagents = !session.subagents.is_empty();
         let has_tool_calls = !session.tool_calls.is_empty();
         let has_chat = !session.chat_messages.is_empty();
-        let has_left_detail = has_children || has_subagents;
+        let has_metadata = session.telemetry.is_some();
+        let has_left_detail = has_children || has_subagents || has_metadata;
         let has_file_audit = app.show_file_audit && !session.file_accesses.is_empty();
         // Focus mode: file audit (F) takes priority over timeline (L) when both
         // are toggled on. Only one "full lower" mode is active at a time.
@@ -563,7 +582,8 @@ pub(crate) fn draw_sessions_panel_active(
             }
             h
         };
-        let has_lower = file_audit_focused
+        let has_lower = has_metadata
+            || file_audit_focused
             || timeline_focused
             || chat_full_width
             || chat_side_by_side
@@ -627,7 +647,9 @@ pub(crate) fn draw_sessions_panel_active(
         //   - wide terminal with only tool calls: full-width timeline
         //   - otherwise: children/subagents only (or nothing)
         if let Some(lower) = lower_area {
-            if file_audit_focused {
+            if session.agent_cli == "pi" && session.telemetry.is_some() {
+                draw_pi_metadata(f, session, lower, theme);
+            } else if file_audit_focused {
                 draw_file_audit(f, session, lower, theme);
             } else if timeline_focused || timeline_full_width {
                 draw_timeline(f, session, lower, theme, app.timeline_scroll);
@@ -836,6 +858,27 @@ pub(crate) fn draw_sessions_panel_active(
                 theme.graph_text
             };
             let mut footer_lines = vec![Line::from("")];
+            if let Some(telemetry) = &session.telemetry {
+                footer_lines.push(Line::from(Span::styled(
+                    format!(
+                        " {} · source {} · context — · tokens —",
+                        telemetry.attachment.label(),
+                        telemetry.source_health.label()
+                    ),
+                    Style::default().fg(theme.graph_text),
+                )));
+                footer_lines.push(Line::from(Span::styled(
+                    format!(
+                        " PID {} · {}M · seen {}",
+                        session.pid,
+                        session.mem_mb,
+                        session.elapsed_display()
+                    ),
+                    Style::default().fg(theme.inactive_fg),
+                )));
+                f.render_widget(Paragraph::new(footer_lines), detail_footer);
+                return;
+            }
             // MEM line only for Claude Code sessions (Codex has no memory system)
             if session.agent_cli == "claude" {
                 footer_lines.push(Line::from(Span::styled(
@@ -894,6 +937,122 @@ pub(crate) fn draw_sessions_panel_active(
             f.render_widget(Paragraph::new(footer_lines), detail_footer);
         }
     }
+}
+
+fn telemetry_observed_age(observed_at_ms: u64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    fmt_age(now_ms.saturating_sub(observed_at_ms) / 1_000)
+}
+
+fn telemetry_metadata_line(
+    label: &str,
+    value: String,
+    metadata: &crate::model::TelemetryMetadata,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label} "), Style::default().fg(theme.graph_text)),
+        Span::styled(value, Style::default().fg(theme.inactive_fg)),
+        Span::styled(
+            format!(
+                " · {}/{} · {}",
+                metadata.precision.label(),
+                metadata.completeness.label(),
+                metadata.provenance
+            ),
+            Style::default().fg(theme.inactive_fg),
+        ),
+    ])
+}
+
+fn draw_pi_metadata(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Theme) {
+    let Some(telemetry) = &session.telemetry else {
+        return;
+    };
+    let identity = if session.process_start_id.is_some() {
+        "PID + process start"
+    } else {
+        "PID only · reuse not guarded"
+    };
+    let context = session
+        .context_value()
+        .map(|percent| format!("{}{percent:.0}%", session.context_precision().prefix()))
+        .unwrap_or_else(|| "—".to_string());
+    let tokens = session
+        .total_tokens_value()
+        .map(|total| {
+            format!(
+                "{}{}",
+                session.usage_precision().prefix(),
+                fmt_tokens(total)
+            )
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" Attachment ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                telemetry.attachment.label(),
+                Style::default().fg(theme.main_fg),
+            ),
+            Span::styled(" · confidence ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                telemetry.attachment_confidence.label(),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Source ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                telemetry.source_health.label(),
+                Style::default().fg(theme.inactive_fg),
+            ),
+            Span::styled(
+                format!(
+                    " · observed {}",
+                    telemetry_observed_age(telemetry.context.observed_at_ms)
+                ),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]),
+        telemetry_metadata_line("Context", context, &telemetry.context, theme),
+        telemetry_metadata_line("Tokens", tokens, &telemetry.usage, theme),
+        Line::from(Span::styled(
+            format!(" Identity {identity}"),
+            Style::default().fg(theme.inactive_fg),
+        )),
+    ];
+
+    if !session.children.is_empty() && lines.len() < area.height as usize {
+        lines.push(Line::from(Span::styled(
+            " Children",
+            Style::default()
+                .fg(theme.title)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for child in session
+            .children
+            .iter()
+            .take((area.height as usize).saturating_sub(lines.len()))
+        {
+            let command = crate::model::safe_process_label(&child.command);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<6}", child.pid),
+                    Style::default().fg(theme.main_fg),
+                ),
+                Span::styled(
+                    truncate_str(&command, (area.width as usize).saturating_sub(16)),
+                    Style::default().fg(theme.graph_text),
+                ),
+            ]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Render the recent user/assistant chat tail for the selected session.
@@ -1312,6 +1471,8 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            telemetry: None,
+            process_start_id: None,
         });
 
         let backend = TestBackend::new(120, 20);
@@ -1425,6 +1586,58 @@ mod tests {
         assert_eq!(buffer[(1, 4)].symbol(), "►");
     }
 
+    #[test]
+    fn process_only_pi_session_renders_unknown_context_and_tokens() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("process-42", "project");
+        session.agent_cli = "pi";
+        session.pid = 42;
+        session.context_percent = 0.0;
+        session.context_window = 0;
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
+        session.children = vec![crate::model::ChildProcess {
+            pid: 99,
+            command: "node --task private-prompt".to_string(),
+            mem_kb: 1,
+            port: None,
+        }];
+        app.sessions.push(session);
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            !text.contains("0%"),
+            "unknown context rendered as zero\n{text}"
+        );
+        assert!(
+            text.contains("process only"),
+            "missing attachment state\n{text}"
+        );
+        assert!(
+            text.contains("Context —"),
+            "missing unknown context\n{text}"
+        );
+        assert!(text.contains("Tokens —"), "missing unknown usage\n{text}");
+        assert!(
+            text.contains("unknown/unknown · process"),
+            "missing precision, completeness, or provenance\n{text}"
+        );
+        assert!(text.contains("node"), "missing safe child label\n{text}");
+        assert!(
+            !text.contains("private-prompt"),
+            "child arguments leaked\n{text}"
+        );
+    }
+
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
@@ -1464,6 +1677,8 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: "~/.claude".into(),
+            telemetry: None,
+            process_start_id: None,
         }
     }
 }

@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod mcp;
 pub mod opencode;
+pub mod pi;
 pub mod process;
 pub mod rate_limit;
 
@@ -9,6 +10,7 @@ pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
+pub use pi::PiCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Abbreviate a filesystem path by replacing the home directory prefix with `~`.
@@ -286,6 +288,7 @@ impl Drop for DesktopRolloutScanner {
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
     codex_enabled: bool,
+    mcp_enabled: bool,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from last port scan — invalidate cache when PIDs change.
@@ -336,9 +339,30 @@ impl MultiCollector {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
         let codex_enabled = !is_hidden("codex");
+        Self::from_collectors(collectors, codex_enabled, true)
+    }
+
+    /// Build the Pi product collector. Legacy multi-agent construction remains
+    /// available through `with_hidden_and_claude_config_dirs` during rollout.
+    pub fn pi_only(hidden: &[String]) -> Self {
+        let pi_hidden = hidden.iter().any(|name| name.eq_ignore_ascii_case("pi"));
+        let collectors: Vec<Box<dyn AgentCollector>> = if pi_hidden {
+            Vec::new()
+        } else {
+            vec![Box::new(PiCollector::new())]
+        };
+        Self::from_collectors(collectors, false, false)
+    }
+
+    fn from_collectors(
+        collectors: Vec<Box<dyn AgentCollector>>,
+        codex_enabled: bool,
+        mcp_enabled: bool,
+    ) -> Self {
         Self {
             collectors,
             codex_enabled,
+            mcp_enabled,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
@@ -393,14 +417,18 @@ impl MultiCollector {
             fresh_process
         };
 
-        // Detect MCP servers and stash the suppression sets in `shared`
-        // so CodexCollector can avoid double-counting their rollouts.
-        let detection = mcp::detect(&shared.process_info);
-        self.mcp_servers = detection.servers;
+        // Detect MCP servers only for the legacy multi-agent product. Pi mode
+        // has no Codex MCP panel and must not perform unrelated discovery.
         shared.mcp_suppress = self.mcp_suppress;
-        if self.mcp_suppress {
-            shared.mcp_server_pids = detection.server_pids;
-            shared.mcp_owned_rollouts = detection.owned_rollouts;
+        if self.mcp_enabled {
+            let detection = mcp::detect(&shared.process_info);
+            self.mcp_servers = detection.servers;
+            if self.mcp_suppress {
+                shared.mcp_server_pids = detection.server_pids;
+                shared.mcp_owned_rollouts = detection.owned_rollouts;
+            }
+        } else {
+            self.mcp_servers.clear();
         }
 
         if self.codex_enabled {
@@ -503,6 +531,20 @@ impl MultiCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_only_starts_one_collector_and_disables_legacy_discovery() {
+        let mc = MultiCollector::pi_only(&[]);
+        assert_eq!(mc.collectors.len(), 1);
+        assert!(!mc.codex_enabled);
+        assert!(!mc.mcp_enabled);
+    }
+
+    #[test]
+    fn pi_only_honors_hidden_pi() {
+        let mc = MultiCollector::pi_only(&["PI".to_string()]);
+        assert!(mc.collectors.is_empty());
+    }
 
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {

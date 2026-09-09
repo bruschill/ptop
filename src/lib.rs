@@ -36,12 +36,7 @@
 //! use abtop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_with_config_and_claude_dirs(
-//!     Theme::default(),
-//!     &cfg.hidden_agents,
-//!     cfg.panels,
-//!     &cfg.claude_config_dirs,
-//! );
+//! let mut app = App::new_pi(Theme::default(), &cfg.hidden_agents, cfg.panels);
 //! loop {
 //!     app.tick_no_summaries();                // refresh without spawning `claude --print`
 //!     let snap = app.to_snapshot(2_000);      // pure read → JSON-friendly DTO
@@ -78,14 +73,19 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 /// Construct a headless `App` from loaded config + theme. Shared by the
-/// `--json` and `--once` entry points.
-fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
-    App::new_with_config_and_claude_dirs(
-        theme,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    )
+/// `--json` and `--once` entry points. The product path is Pi-only; `--legacy`
+/// retains the previous multi-agent collector during stabilization.
+fn build_app(theme: theme::Theme, cfg: &config::AppConfig, legacy_mode: bool) -> App {
+    if legacy_mode {
+        App::new_with_config_and_claude_dirs(
+            theme,
+            &cfg.hidden_agents,
+            cfg.panels,
+            &cfg.claude_config_dirs,
+        )
+    } else {
+        App::new_pi(theme, &cfg.hidden_agents, cfg.panels)
+    }
 }
 
 pub fn run() -> io::Result<()> {
@@ -141,6 +141,7 @@ pub fn run() -> io::Result<()> {
         .or_else(|| theme::Theme::by_name(&cfg.theme));
 
     let demo_mode = std::env::args().any(|a| a == "--demo");
+    let legacy_mode = demo_mode || std::env::args().any(|a| a == "--legacy");
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
     let mouse_capture = should_enable_mouse_capture(std::env::args());
 
@@ -149,7 +150,7 @@ pub fn run() -> io::Result<()> {
     // manual check of the web snapshot API; the web tool uses the library
     // `App::to_snapshot` directly rather than shelling out to this.
     if std::env::args().any(|a| a == "--json") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, legacy_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -169,19 +170,21 @@ pub fn run() -> io::Result<()> {
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, legacy_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
             app.tick();
-            // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while std::time::Instant::now() < deadline {
-                app.drain_and_retry_summaries();
-                if !app.has_pending_summaries() && !app.has_retryable_summaries() {
-                    break;
+            if app.summaries_enabled() {
+                // Retry-aware budget: two 10s attempts plus slack.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    app.drain_and_retry_summaries();
+                    if !app.has_pending_summaries() && !app.has_retryable_summaries() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
                 }
-                std::thread::sleep(Duration::from_millis(500));
             }
         }
         print_snapshot(&app);
@@ -236,12 +239,13 @@ fn run_app(
     panels: config::PanelVisibility,
     claude_config_dirs: &[std::path::PathBuf],
 ) -> io::Result<()> {
-    let mut app = App::new_with_config_and_claude_dirs(
-        initial_theme.unwrap_or_default(),
-        hidden_agents,
-        panels,
-        claude_config_dirs,
-    );
+    let legacy_mode = demo_mode || std::env::args().any(|arg| arg == "--legacy");
+    let theme = initial_theme.unwrap_or_default();
+    let mut app = if legacy_mode {
+        App::new_with_config_and_claude_dirs(theme, hidden_agents, panels, claude_config_dirs)
+    } else {
+        App::new_pi(theme, hidden_agents, panels)
+    };
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -421,11 +425,15 @@ fn sanitize_output(s: &str) -> String {
 }
 
 fn print_snapshot(app: &App) {
-    println!(
-        "abtop — {} sessions, {} mcp servers\n",
-        app.sessions.len(),
-        app.mcp_servers.len()
-    );
+    if app.is_pi_mode() {
+        println!("abtop Pi Fleet — {} processes\n", app.sessions.len());
+    } else {
+        println!(
+            "abtop — {} sessions, {} mcp servers\n",
+            app.sessions.len(),
+            app.mcp_servers.len()
+        );
+    }
     if !app.mcp_servers.is_empty() {
         let now = std::time::SystemTime::now();
         for server in &app.mcp_servers {
@@ -468,34 +476,87 @@ fn print_snapshot(app: &App) {
         };
         let project_label = format!("{}({})", session.project_name, sid_short);
         let summary = sanitize_output(&app.session_summary(session));
+        let model = if session.model.is_empty() {
+            "—".to_string()
+        } else {
+            session.model.replace("claude-", "")
+        };
+        let context = session
+            .context_value()
+            .map(|percent| format!("{}{:>3.0}%", session.context_precision().prefix(), percent))
+            .unwrap_or_else(|| "—".to_string());
+        let tokens = session
+            .total_tokens_value()
+            .map(|total| format!("{}{}", session.usage_precision().prefix(), fmt_tok(total)))
+            .unwrap_or_else(|| "—".to_string());
+        let age = if session.agent_cli == "pi" {
+            format!("seen:{}", session.elapsed_display())
+        } else {
+            session.elapsed_display()
+        };
         println!(
-            "  {} {:<20} {} {} {:<10} CTX:{:>3.0}% Tok:{} Mem:{}M {}",
+            "  {} {:<20} {} {} {:<10} CTX:{} Tok:{} Mem:{}M {}",
             session.pid,
             sanitize_output(&project_label),
             summary,
             status,
-            session.model.replace("claude-", ""),
-            session.context_percent,
-            fmt_tok(session.total_tokens()),
+            model,
+            context,
+            tokens,
             session.mem_mb,
-            session.elapsed_display(),
+            age,
         );
         if let Some(task) = session.current_tasks.last() {
             println!("       └─ {}", sanitize_output(task));
         }
+        if let Some(telemetry) = &session.telemetry {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let observed_age =
+                ui::fmt_age(now_ms.saturating_sub(telemetry.context.observed_at_ms) / 1_000);
+            println!(
+                "       telemetry: {} ({}) · source {} · observed {}",
+                telemetry.attachment.label(),
+                telemetry.attachment_confidence.label(),
+                telemetry.source_health.label(),
+                observed_age
+            );
+            println!(
+                "       context: {} · {}/{} · {}",
+                context.trim(),
+                telemetry.context.precision.label(),
+                telemetry.context.completeness.label(),
+                sanitize_output(&telemetry.context.provenance)
+            );
+            println!(
+                "       tokens: {} · {}/{} · {}",
+                tokens,
+                telemetry.usage.precision.label(),
+                telemetry.usage.completeness.label(),
+                sanitize_output(&telemetry.usage.provenance)
+            );
+        }
+        if session.agent_cli == "pi" && session.process_start_id.is_none() {
+            println!("       identity: PID only (reuse not guarded)");
+        }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
+            let command = if session.agent_cli == "pi" {
+                model::safe_process_label(&child.command)
+            } else {
+                child
+                    .command
+                    .split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             println!(
                 "       {} {} {}K {}",
                 child.pid,
-                sanitize_output(
-                    &child
-                        .command
-                        .split_whitespace()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ),
+                sanitize_output(&command),
                 child.mem_kb / 1024,
                 port,
             );
@@ -584,6 +645,15 @@ mod tests {
     fn mouse_capture_is_opt_in() {
         assert!(!should_enable_mouse_capture(["abtop"]));
         assert!(should_enable_mouse_capture(["abtop", "--mouse"]));
+    }
+
+    #[test]
+    fn product_entry_uses_pi_collector_unless_legacy_is_requested() {
+        let cfg = config::AppConfig::default();
+        let pi = build_app(theme::Theme::default(), &cfg, false);
+        let legacy = build_app(theme::Theme::default(), &cfg, true);
+        assert!(pi.is_pi_mode());
+        assert_eq!(legacy.monitor_mode, app::MonitorMode::Legacy);
     }
 
     #[test]

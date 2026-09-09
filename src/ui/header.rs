@@ -9,16 +9,24 @@ use ratatui::Frame;
 
 pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let session_count = app.sessions.len();
-    let active = app.agent_aggregate.active_count;
+    let active = if app.is_pi_mode() {
+        "—".to_string()
+    } else {
+        app.agent_aggregate.active_count.to_string()
+    };
 
     let now = chrono::Local::now().format("%H:%M").to_string();
     let version = env!("CARGO_PKG_VERSION");
 
-    let title = format!(" abtop v{version} ");
+    let title = if app.is_pi_mode() {
+        format!(" abtop Pi Fleet v{version} ")
+    } else {
+        format!(" abtop v{version} ")
+    };
     let right = format!(" {now}  {active}↑ {session_count}● ");
 
     let host_str = app.host_metrics.as_ref().map(fmt_host);
-    let agent_str = fmt_agent(&app.agent_aggregate);
+    let agent_str = fmt_agent(app);
 
     // Width budget: prefer host + agents; fall back to agents-only; then to nothing.
     let width = area.width as usize;
@@ -88,18 +96,26 @@ fn fmt_host(h: &crate::host_info::HostMetrics) -> String {
     )
 }
 
-fn fmt_agent(a: &crate::host_info::AgentAggregate) -> String {
-    let mem = if a.mem_mb >= 1024 {
-        format!("{:.1}G", a.mem_mb as f64 / 1024.0)
+fn fmt_agent(app: &App) -> String {
+    let aggregate = &app.agent_aggregate;
+    let mem = if aggregate.mem_mb >= 1024 {
+        format!("{:.1}G", aggregate.mem_mb as f64 / 1024.0)
     } else {
-        format!("{}M", a.mem_mb)
+        format!("{}M", aggregate.mem_mb)
+    };
+    let context = if !app.sessions.is_empty()
+        && app
+            .sessions
+            .iter()
+            .all(|session| session.context_value().is_some())
+    {
+        format!("{:.0}%", aggregate.avg_ctx_pct)
+    } else {
+        "—".to_string()
     };
     let agents_label = t("header.agents");
     let ctx_label = t("header.ctx");
-    format!(
-        "{} Σ{} {}%{:.0}%",
-        agents_label, mem, ctx_label, a.avg_ctx_pct
-    )
+    format!("{agents_label} Σ{mem} {ctx_label}%{context}")
 }
 
 /// Decide which metrics to render given available width. Drops host first, then
