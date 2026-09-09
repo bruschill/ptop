@@ -15,7 +15,7 @@ use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
     AttachmentConfidence, AttachmentState, ChatRole, ChildProcess, ContextTelemetryDetails,
-    OrphanPort, RateLimitInfo, SessionStatus, SourceHealth, TelemetryMetadata,
+    FleetTelemetry, OrphanPort, RateLimitInfo, SessionStatus, SourceHealth, TelemetryMetadata,
     UsageTelemetryDetails, MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
@@ -120,6 +120,9 @@ pub struct SessionTelemetryView {
     pub error: Option<String>,
     pub context: ContextTelemetryView,
     pub usage: UsageTelemetryView,
+    /// Local pi-subagents lifecycle metadata. Run aggregates remain separate
+    /// from parent transcript totals to avoid adapter double counting.
+    pub fleet: FleetTelemetry,
 }
 
 /// A single session, flattened and curated for JSON consumers.
@@ -344,6 +347,7 @@ impl App {
                             cache_create_tokens: usage_known.then_some(s.total_cache_create),
                             metadata: telemetry.usage.clone(),
                         },
+                        fleet: telemetry.fleet.clone(),
                     }
                 }),
             })
@@ -406,7 +410,10 @@ mod tests {
     use crate::app::App;
     use crate::config::PanelVisibility;
     use crate::demo::populate_demo;
-    use crate::model::SessionStatus;
+    use crate::model::{
+        FleetExecution, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
+        SessionStatus, SourceHealth,
+    };
     use crate::theme::Theme;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -499,6 +506,32 @@ mod tests {
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
         let telemetry = session.telemetry.as_mut().unwrap();
         telemetry.context_details.provider = Some("test-provider".to_string());
+        let mut fleet = FleetTelemetry::unavailable(123, "test");
+        fleet.source_health = SourceHealth::Healthy;
+        fleet.reason = None;
+        let mut run_usage = FleetUsage::separate_run_aggregate();
+        run_usage.total_tokens = Some(42);
+        fleet.runs.push(FleetRun {
+            lifecycle_version: Some(3),
+            run_id: "run-1".to_string(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Workflow,
+            state: FleetRunState::Running,
+            execution: FleetExecution::Background,
+            runner_pid: None,
+            started_at_ms: Some(100),
+            updated_at_ms: Some(120),
+            ended_at_ms: None,
+            source_updated_at_ms: 120,
+            stale: false,
+            process_terminal: None,
+            usage: run_usage,
+            children: Vec::new(),
+            omitted_children: 0,
+            reason: None,
+        });
+        telemetry.fleet = fleet;
         session.process_start_id = Some("test:1".to_string());
         session.children = vec![ChildProcess {
             pid: 99,
@@ -522,6 +555,7 @@ mod tests {
         assert_eq!(telemetry.context.percent, None);
         assert_eq!(telemetry.context.window_tokens, None);
         assert_eq!(telemetry.usage.total_tokens, None);
+        assert_eq!(telemetry.fleet.runs[0].usage.total_tokens, Some(42));
         assert_eq!(
             telemetry.context.details.provider.as_deref(),
             Some("test-provider")
@@ -529,9 +563,15 @@ mod tests {
         assert_eq!(pi.process_start_id.as_deref(), Some("test:1"));
         assert_eq!(pi.children[0].command, "node");
         assert_eq!(snap.orphan_ports[0].command, "bun");
+        assert_eq!(telemetry.fleet.runs[0].run_id, "run-1");
+        assert_eq!(telemetry.fleet.runs[0].state, FleetRunState::Running);
 
         let json = serde_json::to_value(&snap).unwrap();
         assert!(json["sessions"][0]["telemetry"]["context"]["percent"].is_null());
+        assert_eq!(
+            json["sessions"][0]["telemetry"]["fleet"]["runs"][0]["usage"]["accounting"],
+            "separate_run_aggregate"
+        );
         assert!(!json.to_string().contains("private-"));
     }
 

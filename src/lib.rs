@@ -566,6 +566,56 @@ fn print_snapshot(app: &App) {
             if let Some(cost) = telemetry.usage_details.reported_cost {
                 println!("       reported cost: {cost:.4}");
             }
+            let fleet = &telemetry.fleet;
+            println!(
+                "       fleet: {} · background {} · foreground {} · {} run{} · status.json · {}d retention",
+                fleet.source_health.label(),
+                fleet.background_visibility.label(),
+                fleet.foreground_visibility.label(),
+                fleet.runs.len(),
+                if fleet.runs.len() == 1 { "" } else { "s" },
+                fleet.retention_days
+            );
+            if let Some(reason) = &fleet.reason {
+                println!("       fleet note: {}", sanitize_output(reason));
+            }
+            for run in &fleet.runs {
+                let run_tokens = run
+                    .usage
+                    .total_tokens
+                    .map(|tokens| format!(" · {} tok", fmt_tok(tokens)))
+                    .unwrap_or_default();
+                let terminal = run
+                    .process_terminal
+                    .as_ref()
+                    .map(|proof| format!(" · exit {}", proof.state.label()))
+                    .unwrap_or_default();
+                let stale = if run.stale { " · stale" } else { "" };
+                println!(
+                    "       run {} · {} · {} · {}{}{}{}",
+                    sanitize_output(&run.run_id),
+                    run.execution.label(),
+                    run.mode.label(),
+                    run.state.label(),
+                    run_tokens,
+                    terminal,
+                    stale
+                );
+                for child in &run.children {
+                    let child_tokens = child
+                        .usage
+                        .total_tokens
+                        .map(|tokens| format!(" · {} tok", fmt_tok(tokens)))
+                        .unwrap_or_default();
+                    println!(
+                        "         child {} · {} · {}{}",
+                        sanitize_output(&child.name),
+                        child.execution.label(),
+                        child.state.label(),
+                        child_tokens
+                    );
+                }
+            }
         }
         if session.agent_cli == "pi" && session.process_start_id.is_none() {
             println!("       identity: PID only (reuse not guarded)");

@@ -1068,6 +1068,93 @@ fn draw_pi_metadata(f: &mut Frame, session: &AgentSession, area: Rect, theme: &T
         )));
     }
 
+    if lines.len() < area.height as usize {
+        let fleet = &telemetry.fleet;
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Fleet ",
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} · bg {} · fg {} · {} run{} · {}d retention",
+                    fleet.source_health.label(),
+                    fleet.background_visibility.label(),
+                    fleet.foreground_visibility.label(),
+                    fleet.runs.len(),
+                    if fleet.runs.len() == 1 { "" } else { "s" },
+                    fleet.retention_days
+                ),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]));
+        for run in fleet
+            .runs
+            .iter()
+            .take((area.height as usize).saturating_sub(lines.len()))
+        {
+            let (icon, color) = fleet_state_style(run.state, theme);
+            let token_label = run
+                .usage
+                .total_tokens
+                .map(|tokens| format!(" · {} tok", fmt_tokens(tokens)))
+                .unwrap_or_default();
+            let terminal_label = run
+                .process_terminal
+                .as_ref()
+                .map(|proof| format!(" · exit {}", proof.state.label()))
+                .unwrap_or_default();
+            let stale_label = if run.stale { " · stale" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {icon} "), Style::default().fg(color)),
+                Span::styled(
+                    truncate_str(&run.run_id, 12),
+                    Style::default().fg(theme.main_fg),
+                ),
+                Span::styled(
+                    format!(
+                        " · {} · {} · {}{}{}{}",
+                        run.execution.label(),
+                        run.mode.label(),
+                        run.state.label(),
+                        token_label,
+                        terminal_label,
+                        stale_label
+                    ),
+                    Style::default().fg(theme.inactive_fg),
+                ),
+            ]));
+            for child in run
+                .children
+                .iter()
+                .take((area.height as usize).saturating_sub(lines.len()))
+            {
+                let (child_icon, child_color) = fleet_state_style(child.state, theme);
+                let child_tokens = child
+                    .usage
+                    .total_tokens
+                    .map(|tokens| format!(" · {} tok", fmt_tokens(tokens)))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {child_icon} "),
+                        Style::default().fg(child_color),
+                    ),
+                    Span::styled(
+                        truncate_str(&child.name, (area.width as usize).saturating_sub(28).max(8)),
+                        Style::default().fg(theme.graph_text),
+                    ),
+                    Span::styled(
+                        format!(" · {}{}", child.state.label(), child_tokens),
+                        Style::default().fg(theme.inactive_fg),
+                    ),
+                ]));
+            }
+        }
+    }
+
     if !session.children.is_empty() && lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled(
             " Children",
@@ -1095,6 +1182,21 @@ fn draw_pi_metadata(f: &mut Frame, session: &AgentSession, area: Rect, theme: &T
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn fleet_state_style(state: crate::model::FleetRunState, theme: &Theme) -> (&'static str, Color) {
+    match state {
+        crate::model::FleetRunState::Running => ("●", theme.main_fg),
+        crate::model::FleetRunState::Queued | crate::model::FleetRunState::Paused => {
+            ("◌", theme.graph_text)
+        }
+        crate::model::FleetRunState::Complete => ("✓", theme.proc_misc),
+        crate::model::FleetRunState::Failed
+        | crate::model::FleetRunState::Partial
+        | crate::model::FleetRunState::Rejected => ("✗", theme.hi_fg),
+        crate::model::FleetRunState::Stopped => ("■", theme.graph_text),
+        crate::model::FleetRunState::Unknown => ("?", theme.inactive_fg),
+    }
 }
 
 /// Render the recent user/assistant chat tail for the selected session.
@@ -1452,7 +1554,10 @@ fn draw_timeline(
 mod tests {
     use super::*;
     use crate::config::PanelVisibility;
-    use crate::model::SessionStatus;
+    use crate::model::{
+        FleetExecution, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
+        SessionStatus, SourceHealth,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1677,6 +1782,61 @@ mod tests {
         assert!(
             !text.contains("private-prompt"),
             "child arguments leaked\n{text}"
+        );
+    }
+
+    #[test]
+    fn pi_fleet_runs_render_in_selected_session_detail_at_narrow_width() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("parent-session", "project");
+        session.agent_cli = "pi";
+        session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
+        let telemetry = session.telemetry.as_mut().unwrap();
+        let mut fleet = FleetTelemetry::unavailable(123, "test");
+        fleet.source_health = SourceHealth::Healthy;
+        fleet.reason = None;
+        let mut usage = FleetUsage::separate_run_aggregate();
+        usage.total_tokens = Some(42);
+        fleet.runs.push(FleetRun {
+            lifecycle_version: Some(3),
+            run_id: "run-1".to_string(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Workflow,
+            state: FleetRunState::Running,
+            execution: FleetExecution::Background,
+            runner_pid: None,
+            started_at_ms: Some(100),
+            updated_at_ms: Some(120),
+            ended_at_ms: None,
+            source_updated_at_ms: 120,
+            stale: false,
+            process_terminal: None,
+            usage,
+            children: Vec::new(),
+            omitted_children: 0,
+            reason: None,
+        });
+        telemetry.fleet = fleet;
+        app.sessions.push(session);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("Fleet healthy · bg supported · fg unavailable · 1 run"),
+            "{text}"
+        );
+        assert!(text.contains("run-1"), "{text}");
+        assert!(text.contains("background · workflow · running"), "{text}");
+        assert_eq!(
+            app.sessions.len(),
+            1,
+            "fleet metadata must not add process rows"
         );
     }
 
