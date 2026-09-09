@@ -67,6 +67,10 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
     #[cfg(not(unix))]
     modified_ms: Option<u64>,
 }
@@ -767,7 +771,7 @@ impl PiCollector {
         if !metadata.is_file() || path_metadata.file_type().is_symlink() {
             return Err("session file is no longer a regular non-symlink file".to_string());
         }
-        let identity = file_identity_from_metadata(&metadata);
+        let identity = file_identity_from_file(&file, &metadata);
         if expected_identity.is_some_and(|expected| *expected != identity) {
             self.tails.remove(path);
             return Err("session file identity changed after ownership validation".to_string());
@@ -993,7 +997,7 @@ fn validate_candidate_with_budget(
     if !metadata.is_file() {
         return Err("session path is not a regular file".to_string());
     }
-    let identity = file_identity_from_metadata(&metadata);
+    let identity = file_identity_from_file(&file, &metadata);
     let header = read_header_from(&mut file, read_budget)?;
     if !expected_cwd.is_empty() && header.cwd != expected_cwd {
         return Err("session header cwd conflicts with process cwd".to_string());
@@ -1020,12 +1024,7 @@ fn canonical_regular_jsonl(path: &Path) -> Result<PathBuf, String> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("session file must be a regular non-symlink file".to_string());
     }
-    let canonical =
-        fs::canonicalize(path).map_err(|_| "session file cannot be canonicalized".to_string())?;
-    if canonical != path {
-        return Err("session file path must not traverse a symlink".to_string());
-    }
-    Ok(canonical)
+    fs::canonicalize(path).map_err(|_| "session file cannot be canonicalized".to_string())
 }
 
 #[cfg(test)]
@@ -1578,11 +1577,12 @@ fn pi_agent_root(session_path: &Path) -> Option<PathBuf> {
 }
 
 fn catalog_revision(path: &Path) -> Option<CatalogRevision> {
-    let metadata = fs::metadata(path).ok()?;
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
     Some(CatalogRevision {
         length: metadata.len(),
         modified: metadata.modified().ok(),
-        identity: file_identity_from_metadata(&metadata),
+        identity: file_identity_from_file(&file, &metadata),
     })
 }
 
@@ -1811,21 +1811,46 @@ fn file_modified_ms(path: &Path) -> Option<u64> {
 }
 
 fn file_identity(path: &Path) -> Option<FileIdentity> {
-    let metadata = fs::metadata(path).ok()?;
-    Some(file_identity_from_metadata(&metadata))
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    Some(file_identity_from_file(&file, &metadata))
 }
 
-fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
+fn file_identity_from_file(file: &File, metadata: &fs::Metadata) -> FileIdentity {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = file;
         FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        let (volume_serial_number, file_index, modified_ms) =
+            if let Some((volume, index)) = windows_file_identity(file) {
+                (Some(volume), Some(index), None)
+            } else {
+                (
+                    None,
+                    None,
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis() as u64),
+                )
+            };
+        FileIdentity {
+            volume_serial_number,
+            file_index,
+            modified_ms,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
         FileIdentity {
             modified_ms: metadata
                 .modified()
@@ -1834,6 +1859,28 @@ fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
                 .map(|duration| duration.as_millis() as u64),
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` owns a valid handle for this call, and `info` points to writable storage.
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) };
+    if result == 0 {
+        return None;
+    }
+    // SAFETY: a successful call initialized the full structure.
+    let info = unsafe { info.assume_init() };
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, file_index))
 }
 
 /// Match only executable-position Pi commands. This accepts the `pi` wrapper
@@ -2506,7 +2553,10 @@ mod tests {
             path: path.clone(),
             expected_session_id: Some("session-a".to_string()),
         };
-        assert_eq!(validate_candidate(&candidate, &cwd).unwrap().0, path);
+        assert_eq!(
+            validate_candidate(&candidate, &cwd).unwrap().0,
+            fs::canonicalize(&path).unwrap()
+        );
         assert!(validate_candidate(&candidate, "/another/project").is_err());
         let conflicting = AttachmentCandidate {
             path,
@@ -2594,6 +2644,24 @@ mod tests {
         assert!(limited);
         assert!(candidates.len() <= 2);
         assert_eq!(budget.process_slots, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_beneath_symlinked_parent_is_canonicalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        let linked_dir = dir.path().join("linked");
+        fs::create_dir(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+        let real_path = real_dir.join("session.jsonl");
+        let linked_path = linked_dir.join("session.jsonl");
+        fs::write(&real_path, "{}\n").unwrap();
+
+        assert_eq!(
+            canonical_regular_jsonl(&linked_path).unwrap(),
+            fs::canonicalize(real_path).unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -3244,6 +3312,26 @@ mod tests {
         assert_eq!(cache.windows.len(), 2);
         // ModelCatalogCache has no serde_json::Value fields: secrets in source files are dropped.
         assert!(!format!("{cache:?}").contains("apiKey"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_survives_in_place_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.jsonl");
+        fs::write(&path, "first\n").unwrap();
+        let identity = file_identity(&path).unwrap();
+        assert!(identity.volume_serial_number.is_some());
+        assert!(identity.file_index.is_some());
+        assert!(identity.modified_ms.is_none());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        assert_eq!(file_identity(&path), Some(identity));
     }
 
     #[test]

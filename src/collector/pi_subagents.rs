@@ -1614,7 +1614,10 @@ mod tests {
 
         let scan = status_candidates(&root).unwrap();
         assert_eq!(scan.candidates.len(), 1);
-        assert_eq!(scan.candidates[0].path, run_dir.join("status.json"));
+        assert_eq!(
+            scan.candidates[0].path,
+            fs::canonicalize(run_dir.join("status.json")).unwrap()
+        );
         let fleet = collect_one(&root, 2_000);
         assert_eq!(fleet.runs.len(), 1);
         assert!(!serde_json::to_string(&fleet)
