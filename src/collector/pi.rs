@@ -2534,14 +2534,26 @@ mod tests {
         }));
     }
 
+    fn session_header(id: &str, cwd: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "session", "version": 3, "id": id, "cwd": cwd})
+        )
+    }
+
     fn session_file(dir: &tempfile::TempDir, id: &str, cwd: &str) -> PathBuf {
         let path = dir.path().join("session.jsonl");
-        fs::write(
-            &path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&path, session_header(id, cwd)).unwrap();
         path
+    }
+
+    #[test]
+    fn session_fixture_escapes_windows_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = r"C:\Users\runneradmin\project";
+        let path = session_file(&dir, "windows-path", cwd);
+
+        assert_eq!(read_header(&path).unwrap().cwd, cwd);
     }
 
     #[test]
@@ -2713,22 +2725,14 @@ mod tests {
         let path = session_file(&dir, "first", &cwd);
         let mut collector = PiCollector::new();
         collector.tail_session(&path, 1).unwrap();
-        fs::write(
-            &path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"second\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&path, session_header("second", &cwd)).unwrap();
         assert_eq!(read_header(&path).unwrap().session_id, "second");
         assert_eq!(
             collector.tail_session(&path, 2).unwrap().offset,
             fs::metadata(&path).unwrap().len()
         );
         let replacement = dir.path().join("replacement.jsonl");
-        fs::write(
-            &replacement,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"third\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&replacement, session_header("third", &cwd)).unwrap();
         fs::rename(replacement, &path).unwrap();
         assert_eq!(read_header(&path).unwrap().session_id, "third");
         assert_eq!(
@@ -2772,9 +2776,7 @@ mod tests {
         // only the ownership header.
         fs::write(
             &path,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"owned-b\",\"cwd\":\"{cwd}\"}}\n{suffix}"
-            ),
+            format!("{}{suffix}", session_header("owned-b", &cwd)),
         )
         .unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
@@ -2798,11 +2800,7 @@ mod tests {
             identity: file_identity(&path).unwrap(),
         };
         let replacement = dir.path().join("replacement.jsonl");
-        fs::write(
-            &replacement,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"owned\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&replacement, session_header("owned", &cwd)).unwrap();
         fs::rename(replacement, &path).unwrap();
 
         let mut collector = PiCollector::new();
@@ -2862,11 +2860,7 @@ mod tests {
         let cwd = dir.path().to_string_lossy().to_string();
         let unique = session_file(&dir, "unique", &cwd);
         let shared_path = dir.path().join("shared.jsonl");
-        fs::write(
-            &shared_path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"shared\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&shared_path, session_header("shared", &cwd)).unwrap();
         let _open_shared = File::open(&shared_path).unwrap();
         let unique_identity = file_identity(&unique).unwrap();
         let shared_identity = file_identity(&shared_path).unwrap();
@@ -3028,13 +3022,7 @@ mod tests {
         let cwd = dir.path().to_string_lossy();
         let a = session_file(&dir, "budget-a", &cwd);
         let b = dir.path().join("b.jsonl");
-        fs::write(
-            &b,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"budget-b\",\"cwd\":\"{cwd}\"}}\n"
-            ),
-        )
-        .unwrap();
+        fs::write(&b, session_header("budget-b", &cwd)).unwrap();
         let mut collector = PiCollector::new();
         let a_offset = collector.tail_session(&a, 1).unwrap().offset;
         let b_offset = collector.tail_session(&b, 1).unwrap().offset;
@@ -3085,7 +3073,14 @@ mod tests {
         let old_offset = old.offset;
 
         let replacement = format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"regrow\",\"cwd\":\"{cwd}\",\"replaced\":true}}\n{{}}\n{{}}\n{{}}\n"
+            "{}\n{{}}\n{{}}\n{{}}\n",
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "regrow",
+                "cwd": cwd,
+                "replaced": true
+            })
         );
         fs::write(&path, replacement).unwrap();
         assert!(fs::metadata(&path).unwrap().len() >= old_offset);
