@@ -484,10 +484,26 @@ fn print_snapshot(app: &App) {
         let context = session
             .context_value()
             .map(|percent| format!("{}{:>3.0}%", session.context_precision().prefix(), percent))
+            .or_else(|| {
+                session.context_tokens_without_window().map(|tokens| {
+                    format!(
+                        "{}{} (window —)",
+                        session.context_precision().prefix(),
+                        fmt_tok(tokens)
+                    )
+                })
+            })
             .unwrap_or_else(|| "—".to_string());
         let tokens = session
             .total_tokens_value()
-            .map(|total| format!("{}{}", session.usage_precision().prefix(), fmt_tok(total)))
+            .map(|total| {
+                format!(
+                    "{}{}{}",
+                    session.usage_precision().prefix(),
+                    fmt_tok(total),
+                    if session.usage_is_partial() { "+" } else { "" }
+                )
+            })
             .unwrap_or_else(|| "—".to_string());
         let age = if session.agent_cli == "pi" {
             format!("seen:{}", session.elapsed_display())
@@ -523,6 +539,13 @@ fn print_snapshot(app: &App) {
                 telemetry.source_health.label(),
                 observed_age
             );
+            if let Some(provider) = &telemetry.context_details.provider {
+                println!(
+                    "       provider/model: {}/{}",
+                    sanitize_output(provider),
+                    sanitize_output(&session.model)
+                );
+            }
             println!(
                 "       context: {} · {}/{} · {}",
                 context.trim(),
@@ -537,6 +560,12 @@ fn print_snapshot(app: &App) {
                 telemetry.usage.completeness.label(),
                 sanitize_output(&telemetry.usage.provenance)
             );
+            if let Some(reason) = &telemetry.context_details.reason {
+                println!("       context note: {}", sanitize_output(reason));
+            }
+            if let Some(cost) = telemetry.usage_details.reported_cost {
+                println!("       reported cost: {cost:.4}");
+            }
         }
         if session.agent_cli == "pi" && session.process_start_id.is_none() {
             println!("       identity: PID only (reuse not guarded)");

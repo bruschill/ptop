@@ -14,8 +14,9 @@ use crate::app::App;
 use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
-    AttachmentConfidence, AttachmentState, ChatRole, ChildProcess, OrphanPort, RateLimitInfo,
-    SessionStatus, SourceHealth, TelemetryMetadata, MAX_CHAT_MESSAGES,
+    AttachmentConfidence, AttachmentState, ChatRole, ChildProcess, ContextTelemetryDetails,
+    OrphanPort, RateLimitInfo, SessionStatus, SourceHealth, TelemetryMetadata,
+    UsageTelemetryDetails, MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,6 +92,8 @@ pub struct SubAgentView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextTelemetryView {
     pub percent: Option<f64>,
+    #[serde(flatten)]
+    pub details: ContextTelemetryDetails,
     pub window_tokens: Option<u64>,
     #[serde(flatten)]
     pub metadata: TelemetryMetadata,
@@ -99,6 +102,8 @@ pub struct ContextTelemetryView {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageTelemetryView {
     pub total_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub details: UsageTelemetryDetails,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -327,10 +332,12 @@ impl App {
                         context: ContextTelemetryView {
                             percent: s.context_value(),
                             window_tokens: s.context_window_value(),
+                            details: telemetry.context_details.clone(),
                             metadata: telemetry.context.clone(),
                         },
                         usage: UsageTelemetryView {
                             total_tokens: s.total_tokens_value(),
+                            details: telemetry.usage_details.clone(),
                             input_tokens: usage_known.then_some(s.total_input_tokens),
                             output_tokens: usage_known.then_some(s.total_output_tokens),
                             cache_read_tokens: usage_known.then_some(s.total_cache_read),
@@ -490,6 +497,8 @@ mod tests {
         session.total_cache_read = 0;
         session.total_cache_create = 0;
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
+        let telemetry = session.telemetry.as_mut().unwrap();
+        telemetry.context_details.provider = Some("test-provider".to_string());
         session.process_start_id = Some("test:1".to_string());
         session.children = vec![ChildProcess {
             pid: 99,
@@ -513,6 +522,10 @@ mod tests {
         assert_eq!(telemetry.context.percent, None);
         assert_eq!(telemetry.context.window_tokens, None);
         assert_eq!(telemetry.usage.total_tokens, None);
+        assert_eq!(
+            telemetry.context.details.provider.as_deref(),
+            Some("test-provider")
+        );
         assert_eq!(pi.process_start_id.as_deref(), Some("test:1"));
         assert_eq!(pi.children[0].command, "node");
         assert_eq!(snap.orphan_ports[0].command, "bun");

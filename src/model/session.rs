@@ -207,6 +207,22 @@ impl TelemetryMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextTelemetryDetails {
+    pub tokens: Option<u64>,
+    pub provider: Option<String>,
+    pub baseline_tokens: Option<u64>,
+    pub trailing_tokens: Option<u64>,
+    pub active_leaf_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageTelemetryDetails {
+    pub reported_cost: Option<f64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionTelemetry {
     pub attachment: AttachmentState,
     pub attachment_confidence: AttachmentConfidence,
@@ -214,6 +230,8 @@ pub struct SessionTelemetry {
     pub error: Option<String>,
     pub context: TelemetryMetadata,
     pub usage: TelemetryMetadata,
+    pub context_details: ContextTelemetryDetails,
+    pub usage_details: UsageTelemetryDetails,
 }
 
 impl SessionTelemetry {
@@ -225,6 +243,18 @@ impl SessionTelemetry {
             error: None,
             context: TelemetryMetadata::unknown("process", observed_at_ms),
             usage: TelemetryMetadata::unknown("process", observed_at_ms),
+            context_details: ContextTelemetryDetails {
+                tokens: None,
+                provider: None,
+                baseline_tokens: None,
+                trailing_tokens: None,
+                active_leaf_id: None,
+                reason: Some("no owned Pi session JSONL".to_string()),
+            },
+            usage_details: UsageTelemetryDetails {
+                reported_cost: None,
+                reason: Some("no owned Pi session JSONL".to_string()),
+            },
         }
     }
 }
@@ -370,15 +400,17 @@ pub struct AgentSession {
 impl AgentSession {
     pub fn total_tokens(&self) -> u64 {
         self.total_input_tokens
-            + self.total_output_tokens
-            + self.total_cache_read
-            + self.total_cache_create
+            .saturating_add(self.total_output_tokens)
+            .saturating_add(self.total_cache_read)
+            .saturating_add(self.total_cache_create)
     }
 
     /// Tokens that represent new work (input + output), excluding cache hits.
     /// Used for rate calculation to avoid inflated numbers from cache_read.
     pub fn active_tokens(&self) -> u64 {
-        self.total_input_tokens + self.total_output_tokens + self.total_cache_create
+        self.total_input_tokens
+            .saturating_add(self.total_output_tokens)
+            .saturating_add(self.total_cache_create)
     }
 
     pub fn context_precision(&self) -> TelemetryPrecision {
@@ -395,17 +427,46 @@ impl AgentSession {
             .unwrap_or(TelemetryPrecision::Exact)
     }
 
+    /// Percentage requires both context tokens and a resolved context window.
     pub fn context_value(&self) -> Option<f64> {
-        (self.context_precision() != TelemetryPrecision::Unknown).then_some(self.context_percent)
+        (self.telemetry.is_none()
+            || (self.context_precision() != TelemetryPrecision::Unknown && self.context_window > 0))
+            .then_some(self.context_percent)
     }
 
     pub fn context_window_value(&self) -> Option<u64> {
-        (self.context_precision() != TelemetryPrecision::Unknown && self.context_window > 0)
-            .then_some(self.context_window)
+        (self.context_window > 0).then_some(self.context_window)
     }
 
+    /// Context tokens remain meaningful when the model window cannot be resolved.
+    pub fn context_tokens_value(&self) -> Option<u64> {
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.context_details.tokens)
+    }
+
+    pub fn context_tokens_without_window(&self) -> Option<u64> {
+        (self.context_window_value().is_none())
+            .then(|| self.context_tokens_value())
+            .flatten()
+    }
+
+    /// A partial passive total is useful to display, but must not drive aggregates or rates.
     pub fn total_tokens_value(&self) -> Option<u64> {
         (self.usage_precision() != TelemetryPrecision::Unknown).then(|| self.total_tokens())
+    }
+
+    pub fn complete_total_tokens_value(&self) -> Option<u64> {
+        let complete = self.telemetry.as_ref().is_none_or(|telemetry| {
+            telemetry.usage.completeness == TelemetryCompleteness::Complete
+        });
+        complete.then(|| self.total_tokens_value()).flatten()
+    }
+
+    pub fn usage_is_partial(&self) -> bool {
+        self.telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry.usage.completeness == TelemetryCompleteness::Partial)
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -519,12 +580,14 @@ mod tests {
     fn test_total_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.total_tokens(), 380); // 100 + 50 + 200 + 30
+        assert_eq!(make_session(u64::MAX, 1, 0, 0).total_tokens(), u64::MAX);
     }
 
     #[test]
     fn test_active_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+        assert_eq!(make_session(u64::MAX, 1, 0, 0).active_tokens(), u64::MAX);
     }
 
     #[test]
@@ -537,5 +600,24 @@ mod tests {
         assert_eq!(session.context_value(), None);
         assert_eq!(session.context_window_value(), None);
         assert_eq!(session.total_tokens_value(), None);
+    }
+
+    #[test]
+    fn partial_usage_is_displayable_but_not_aggregateable_and_context_needs_a_window() {
+        let mut session = make_session(2, 3, 4, 5);
+        let mut telemetry = SessionTelemetry::process_only(1);
+        telemetry.usage.precision = TelemetryPrecision::Exact;
+        telemetry.usage.completeness = TelemetryCompleteness::Partial;
+        telemetry.context.precision = TelemetryPrecision::Estimated;
+        telemetry.context_details.tokens = Some(14);
+        session.telemetry = Some(telemetry);
+        session.context_percent = 7.0;
+        assert_eq!(session.total_tokens_value(), Some(14));
+        assert_eq!(session.complete_total_tokens_value(), None);
+        assert!(session.usage_is_partial());
+        assert_eq!(session.context_value(), None);
+        assert_eq!(session.context_tokens_without_window(), Some(14));
+        session.context_window = 200;
+        assert_eq!(session.context_value(), Some(7.0));
     }
 }
