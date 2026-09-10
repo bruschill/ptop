@@ -1,0 +1,33 @@
+format = 1
+name = "high-contrast"
+
+[colors]
+main_bg = "#000000"
+main_fg = "#FFFFFF"
+title = "#FFFFFF"
+hi_fg = "#FFFF00"
+selected_bg = "#FFFF00"
+selected_fg = "#000000"
+inactive_fg = "#808080"
+graph_text = "#C0C0C0"
+meter_bg = "#404040"
+proc_misc = "#00FFFF"
+div_line = "#606060"
+session_id = "#FFFF00"
+status_fg = "#FFFF00"
+warning_fg = "#FFFF00"
+cpu_box = "#FFFFFF"
+mem_box = "#FFFFFF"
+net_box = "#FFFFFF"
+proc_box = "#FFFFFF"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#00FFFF", "#FFFFFF", "#FFFF00"]
+process = ["#00FFFF", "#FFFFFF", "#FFFF00"]
+used = ["#202020", "#C0C0C0", "#FFFF00"]
+free = ["#202020", "#C0C0C0", "#00FFFF"]
+cached = ["#202020", "#8080FF", "#FFFFFF"]

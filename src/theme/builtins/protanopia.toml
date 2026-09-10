@@ -1,0 +1,33 @@
+format = 1
+name = "protanopia"
+
+[colors]
+main_bg = "#141420"
+main_fg = "#DCDCDC"
+title = "#FFFFFF"
+hi_fg = "#FE6100"
+selected_bg = "#28283C"
+selected_fg = "#FFFFFF"
+inactive_fg = "#606070"
+graph_text = "#8C8CA0"
+meter_bg = "#303040"
+proc_misc = "#648FFF"
+div_line = "#303040"
+session_id = "#FFB000"
+status_fg = "#FE6100"
+warning_fg = "#FFB000"
+cpu_box = "#648FFF"
+mem_box = "#785EF0"
+net_box = "#DC267F"
+proc_box = "#FE6100"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#648FFF", "#FFB000", "#FE6100"]
+process = ["#648FFF", "#FFB000", "#FE6100"]
+used = ["#28283C", "#DC267F", "#FE6100"]
+free = ["#141428", "#648FFF", "#FFB000"]
+cached = ["#141428", "#785EF0", "#648FFF"]

@@ -1,0 +1,33 @@
+format = 1
+name = "catppuccin"
+
+[colors]
+main_bg = "#1E1E2E"
+main_fg = "#CDD6F4"
+title = "#CDD6F4"
+hi_fg = "#F38BA8"
+selected_bg = "#313244"
+selected_fg = "#CDD6F4"
+inactive_fg = "#6C7086"
+graph_text = "#9399B2"
+meter_bg = "#313244"
+proc_misc = "#A6E3A1"
+div_line = "#45475A"
+session_id = "#F9E2AF"
+status_fg = "#F38BA8"
+warning_fg = "#F9E2AF"
+cpu_box = "#89B4FA"
+mem_box = "#CBA6F7"
+net_box = "#F5C2E7"
+proc_box = "#F2CDCD"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#A6E3A1", "#F9E2AF", "#F38BA8"]
+process = ["#94E2D5", "#F9E2AF", "#F38BA8"]
+used = ["#313244", "#F5C2E7", "#F38BA8"]
+free = ["#1E1E2E", "#A6E3A1", "#94E2D5"]
+cached = ["#1E1E2E", "#89B4FA", "#CBA6F7"]

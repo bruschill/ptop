@@ -37,6 +37,22 @@ pub(crate) fn draw_sessions_panel_active(
     draw_sessions_panel_impl(f, app, area, theme, active, false);
 }
 
+fn agent_label_and_color<'a>(agent_cli: &'a str, theme: &Theme) -> (&'a str, Color) {
+    match agent_cli {
+        "claude" => ("*CC", theme.claude_agent),
+        "codex" => (">CD", theme.codex_agent),
+        "opencode" => ("#OC", theme.opencode_agent),
+        "pi" => ("πPI", theme.pi_agent),
+        other => {
+            let fallback = other.chars().take(3).collect::<String>().to_uppercase();
+            (
+                Box::leak(fallback.into_boxed_str()) as &str,
+                theme.inactive_fg,
+            )
+        }
+    }
+}
+
 fn draw_sessions_panel_impl(
     f: &mut Frame,
     app: &App,
@@ -157,19 +173,7 @@ fn draw_sessions_panel_impl(
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
-        let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
-            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
-            "pi" => ("πPI", Color::Rgb(192, 132, 252)),    // #C084FC violet
-            other => {
-                let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
-                (
-                    Box::leak(fallback.into_boxed_str()) as &str,
-                    theme.inactive_fg,
-                )
-            }
-        };
+        let (agent_label, agent_color) = agent_label_and_color(session.agent_cli, theme);
 
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
@@ -1536,6 +1540,28 @@ mod tests {
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn agent_labels_use_theme_colors() {
+        let theme = Theme {
+            claude_agent: Color::Rgb(1, 2, 3),
+            codex_agent: Color::Rgb(4, 5, 6),
+            opencode_agent: Color::Rgb(7, 8, 9),
+            pi_agent: Color::Rgb(10, 11, 12),
+            ..Theme::default()
+        };
+
+        assert_eq!(
+            agent_label_and_color("claude", &theme).1,
+            theme.claude_agent
+        );
+        assert_eq!(agent_label_and_color("codex", &theme).1, theme.codex_agent);
+        assert_eq!(
+            agent_label_and_color("opencode", &theme).1,
+            theme.opencode_agent
+        );
+        assert_eq!(agent_label_and_color("pi", &theme).1, theme.pi_agent);
+    }
 
     #[test]
     fn codex_exec_command_uses_bash_color() {

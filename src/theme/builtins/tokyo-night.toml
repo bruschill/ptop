@@ -1,0 +1,33 @@
+format = 1
+name = "tokyo-night"
+
+[colors]
+main_bg = "#1A1B26"
+main_fg = "#A9B1D6"
+title = "#C0CAF5"
+hi_fg = "#F7768E"
+selected_bg = "#292E42"
+selected_fg = "#C0CAF5"
+inactive_fg = "#414868"
+graph_text = "#565F89"
+meter_bg = "#3B4261"
+proc_misc = "#9ECE6A"
+div_line = "#1A1B26"
+session_id = "#E0AF68"
+status_fg = "#F7768E"
+warning_fg = "#E0AF68"
+cpu_box = "#7DCFFF"
+mem_box = "#BB9AF7"
+net_box = "#F7768E"
+proc_box = "#FF9E64"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#9ECE6A", "#E0AF68", "#F7768E"]
+process = ["#73DACA", "#E0AF68", "#F7768E"]
+used = ["#292E42", "#FF9E64", "#F7768E"]
+free = ["#1A1B26", "#9ECE6A", "#73DACA"]
+cached = ["#1A1B26", "#7DCFFF", "#BB9AF7"]

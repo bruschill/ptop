@@ -1,0 +1,33 @@
+format = 1
+name = "dracula"
+
+[colors]
+main_bg = "#282A36"
+main_fg = "#F8F8F2"
+title = "#F8F8F2"
+hi_fg = "#FF79C6"
+selected_bg = "#44475A"
+selected_fg = "#F8F8F2"
+inactive_fg = "#6272A4"
+graph_text = "#6272A4"
+meter_bg = "#44475A"
+proc_misc = "#50FA7B"
+div_line = "#44475A"
+session_id = "#F1FA8C"
+status_fg = "#FF5555"
+warning_fg = "#F1FA8C"
+cpu_box = "#8BE9FD"
+mem_box = "#BD93F9"
+net_box = "#FF79C6"
+proc_box = "#FF5555"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#50FA7B", "#F1FA8C", "#FF5555"]
+process = ["#50FA7B", "#F1FA8C", "#FF5555"]
+used = ["#44475A", "#FF79C6", "#FF5555"]
+free = ["#282A36", "#50FA7B", "#8BE9FD"]
+cached = ["#282A36", "#8BE9FD", "#BD93F9"]

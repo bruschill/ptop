@@ -1,0 +1,33 @@
+format = 1
+name = "light"
+
+[colors]
+main_bg = "#FDF6E3"
+main_fg = "#586E75"
+title = "#073642"
+hi_fg = "#CB4B16"
+selected_bg = "#EEE8D5"
+selected_fg = "#073642"
+inactive_fg = "#93A1A1"
+graph_text = "#839496"
+meter_bg = "#EEE8D5"
+proc_misc = "#859900"
+div_line = "#EEE8D5"
+session_id = "#B58900"
+status_fg = "#DC322F"
+warning_fg = "#CB4B16"
+cpu_box = "#268BD2"
+mem_box = "#6C71C4"
+net_box = "#2AA198"
+proc_box = "#DC322F"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#859900", "#B58900", "#DC322F"]
+process = ["#2AA198", "#B58900", "#DC322F"]
+used = ["#EEE8D5", "#CB4B16", "#DC322F"]
+free = ["#FDF6E3", "#859900", "#2AA198"]
+cached = ["#FDF6E3", "#268BD2", "#6C71C4"]

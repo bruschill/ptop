@@ -1,0 +1,33 @@
+format = 1
+name = "nord"
+
+[colors]
+main_bg = "#2E3440"
+main_fg = "#D8DEE9"
+title = "#ECEFF4"
+hi_fg = "#BF616A"
+selected_bg = "#434C5E"
+selected_fg = "#ECEFF4"
+inactive_fg = "#4C566A"
+graph_text = "#4C566A"
+meter_bg = "#3B4252"
+proc_misc = "#A3BE8C"
+div_line = "#2E3440"
+session_id = "#EBCB8B"
+status_fg = "#BF616A"
+warning_fg = "#EBCB8B"
+cpu_box = "#88C0D0"
+mem_box = "#B48EAD"
+net_box = "#D08770"
+proc_box = "#BF616A"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#A3BE8C", "#EBCB8B", "#BF616A"]
+process = ["#8FBCBB", "#EBCB8B", "#BF616A"]
+used = ["#3B4252", "#D08770", "#BF616A"]
+free = ["#2E3440", "#A3BE8C", "#8FBCBB"]
+cached = ["#2E3440", "#88C0D0", "#B48EAD"]
