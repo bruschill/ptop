@@ -1,0 +1,33 @@
+format = 1
+name = "deuteranopia"
+
+[colors]
+main_bg = "#121828"
+main_fg = "#DEDEE6"
+title = "#FFFFFF"
+hi_fg = "#FFC20A"
+selected_bg = "#1E2846"
+selected_fg = "#FFFFFF"
+inactive_fg = "#646C82"
+graph_text = "#949CB2"
+meter_bg = "#2A3452"
+proc_misc = "#1A85FF"
+div_line = "#2A3452"
+session_id = "#FFC20A"
+status_fg = "#FF6600"
+warning_fg = "#FFC20A"
+cpu_box = "#1A85FF"
+mem_box = "#9C6ADE"
+net_box = "#FFC20A"
+proc_box = "#FF6600"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#1A85FF", "#FFC20A", "#FF6600"]
+process = ["#1A85FF", "#FFC20A", "#FF6600"]
+used = ["#1E2846", "#FFC20A", "#FF6600"]
+free = ["#121830", "#1A85FF", "#B4D2FF"]
+cached = ["#121830", "#9C6ADE", "#1A85FF"]

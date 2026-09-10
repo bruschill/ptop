@@ -56,7 +56,8 @@ ptop --once             # Print a ptop snapshot and exit
 ptop --json             # Print one ptop JSON snapshot and exit
 ptop --legacy           # Use Claude/Codex/OpenCode collection
 ptop --setup            # Install the legacy Claude rate-limit hook
-ptop --theme dracula    # Launch with a specific theme
+ptop --theme dracula    # Launch with a packaged theme
+ptop --theme-file ./my-theme.toml  # Launch with a user theme
 ptop --mouse            # Enable mouse click/scroll navigation
 ```
 
@@ -99,7 +100,7 @@ OpenCode support reads the local SQLite database at `~/.local/share/opencode/ope
 
 ## Themes
 
-12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/ptop/config.toml`.
+12 packaged themes are included, with 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle packaged themes, launch one with `--theme <name>`, or load a Theme Format v1 TOML file with `--theme-file <path>`. Packaged and user themes use the same loader. See [Theme files](docs/themes.md).
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
@@ -127,10 +128,12 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ## Configuration
 
-`~/.config/ptop/config.toml` supports:
+The `ptop/config.toml` file under your platform config directory supports:
 
 ```toml
+# Choose either a packaged theme or a Theme Format v1 file.
 theme = "btop"
+# theme_file = "themes/low-glare.toml"
 # Hide agent CLIs from the TUI (case-insensitive).
 # Use "pi" in the default mode, or legacy CLI names with --legacy.
 hidden_agents = ["codex"]

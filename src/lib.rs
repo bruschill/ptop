@@ -69,7 +69,9 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, stdout};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Construct a headless `App` from loaded config + theme. Shared by the
@@ -88,69 +90,159 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig, legacy_mode: bool) ->
     }
 }
 
+fn has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|argument| argument == OsStr::new(flag))
+}
+
+fn theme_request_from_args(args: &[OsString]) -> Result<Option<theme::ThemeRequest>, String> {
+    let mut built_in = None;
+    let mut file = None;
+    let mut index = 1;
+
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == OsStr::new("--theme") {
+            if built_in.is_some() {
+                return Err("--theme may be specified only once".to_string());
+            }
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.to_string_lossy().starts_with('-'))
+                .ok_or("--theme requires a built-in theme name")?;
+            let name = value.to_str().ok_or("--theme names must be valid UTF-8")?;
+            built_in = Some(name.to_string());
+            index += 2;
+            continue;
+        }
+        if argument == OsStr::new("--theme-file") {
+            if file.is_some() {
+                return Err("--theme-file may be specified only once".to_string());
+            }
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.to_string_lossy().starts_with('-'))
+                .ok_or("--theme-file requires a path")?;
+            file = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+
+    match (built_in, file) {
+        (Some(_), Some(_)) => Err("--theme and --theme-file are mutually exclusive".to_string()),
+        (Some(name), None) => Ok(Some(theme::ThemeRequest::BuiltIn(name))),
+        (None, Some(path)) => Ok(Some(theme::ThemeRequest::File(path))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_initial_theme(
+    explicit: Option<theme::ThemeRequest>,
+    config: &config::AppConfig,
+    startup_directory: &Path,
+    config_file: Option<&Path>,
+    home_directory: Option<&Path>,
+) -> Result<theme::Theme, String> {
+    let is_cli_request = explicit.is_some();
+    let mut request = explicit.unwrap_or_else(|| {
+        config
+            .theme_file
+            .clone()
+            .map(theme::ThemeRequest::File)
+            .unwrap_or_else(|| theme::ThemeRequest::BuiltIn(config.theme.clone()))
+    });
+
+    if let theme::ThemeRequest::File(path) = &mut request {
+        let base = if is_cli_request {
+            startup_directory
+        } else {
+            config_file.and_then(Path::parent).ok_or(
+                "cannot resolve a relative configured theme path without a config directory",
+            )?
+        };
+        *path = resolve_theme_path(path, base, home_directory)?;
+    }
+
+    theme::ThemeCatalog::packaged()
+        .load(&request)
+        .map_err(|error| error.to_string())
+}
+
+fn resolve_theme_path(path: &Path, base: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let mut components = path.components();
+    let expanded = if matches!(
+        components.next(),
+        Some(Component::Normal(first)) if first == OsStr::new("~")
+    ) {
+        let home = home.ok_or("cannot expand '~' because no home directory is available")?;
+        home.join(components.collect::<PathBuf>())
+    } else {
+        path.to_path_buf()
+    };
+
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(base.join(expanded))
+    }
+}
+
+fn exit_with_message(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1)
+}
+
 pub fn run() -> io::Result<()> {
-    // --version / -V flag: print version and exit
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    // Keep theme-independent commands ahead of config and theme resolution.
+    if has_flag(&args, "--version") || has_flag(&args, "-V") {
         println!("ptop {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-
-    // --update flag: self-update via GitHub releases installer
-    if std::env::args().any(|a| a == "--update") {
+    if has_flag(&args, "--update") {
         return run_update();
     }
-
-    // --setup flag: configure StatusLine hook and exit
-    if std::env::args().any(|a| a == "--setup") {
+    if has_flag(&args, "--setup") {
         setup::run_setup();
         return Ok(());
     }
 
-    // Load config once; it drives both the default theme and the hidden-agents list.
-    let cfg = config::load_config();
+    let explicit_theme = match theme_request_from_args(&args) {
+        Ok(request) => request,
+        Err(message) => exit_with_message(&message),
+    };
+    let cfg = match config::load_config_for_startup(explicit_theme.is_some()) {
+        Ok(config) => config,
+        Err(message) => exit_with_message(&message),
+    };
+    let startup_directory = match std::env::current_dir() {
+        Ok(directory) => directory,
+        Err(error) => exit_with_message(&format!("cannot determine startup directory: {error}")),
+    };
+    let initial_theme = match resolve_initial_theme(
+        explicit_theme,
+        &cfg,
+        &startup_directory,
+        config::config_path().as_deref(),
+        dirs::home_dir().as_deref(),
+    ) {
+        Ok(theme) => theme,
+        Err(message) => exit_with_message(&message),
+    };
 
-    // --theme flag > config file > default
-    let initial_theme = std::env::args()
-        .position(|a| a == "--theme")
-        .map(|pos| {
-            let val = std::env::args().nth(pos + 1);
-            match val {
-                Some(name) if !name.starts_with('-') => name,
-                Some(name) => {
-                    eprintln!("--theme requires a theme name, got '{}'", name);
-                    eprintln!("available: {}", theme::THEME_NAMES.join(", "));
-                    std::process::exit(1);
-                }
-                None => {
-                    eprintln!("--theme requires a theme name");
-                    eprintln!("available: {}", theme::THEME_NAMES.join(", "));
-                    std::process::exit(1);
-                }
-            }
-        })
-        .map(|name| {
-            theme::Theme::by_name(&name).unwrap_or_else(|| {
-                eprintln!(
-                    "unknown theme '{}'. available: {}",
-                    name,
-                    theme::THEME_NAMES.join(", ")
-                );
-                std::process::exit(1);
-            })
-        })
-        .or_else(|| theme::Theme::by_name(&cfg.theme));
-
-    let demo_mode = std::env::args().any(|a| a == "--demo");
-    let legacy_mode = demo_mode || std::env::args().any(|a| a == "--legacy");
-    let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
-    let mouse_capture = should_enable_mouse_capture(std::env::args());
+    let demo_mode = has_flag(&args, "--demo");
+    let legacy_mode = demo_mode || has_flag(&args, "--legacy");
+    let exit_on_jump = has_flag(&args, "--exit-on-jump");
+    let mouse_capture = should_enable_mouse_capture(&args);
 
     // --json flag: print a machine-readable JSON snapshot and exit.
     // Single tick, no summary subprocesses. Useful for scripting and as a
     // manual check of the web snapshot API; the web tool uses the library
     // `App::to_snapshot` directly rather than shelling out to this.
-    if std::env::args().any(|a| a == "--json") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, legacy_mode);
+    if has_flag(&args, "--json") {
+        let mut app = build_app(initial_theme, &cfg, legacy_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -169,8 +261,8 @@ pub fn run() -> io::Result<()> {
     }
 
     // --once flag: print snapshot and exit
-    if std::env::args().any(|a| a == "--once") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, legacy_mode);
+    if has_flag(&args, "--once") {
+        let mut app = build_app(initial_theme, &cfg, legacy_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -191,7 +283,7 @@ pub fn run() -> io::Result<()> {
         return Ok(());
     }
 
-    // Setup terminal
+    // Resolve the theme before terminal setup so failures cannot corrupt the terminal.
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     if mouse_capture {
@@ -202,11 +294,10 @@ pub fn run() -> io::Result<()> {
     let app_result = run_app(
         &mut terminal,
         demo_mode,
+        legacy_mode,
         initial_theme,
         exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
+        &cfg,
     );
 
     // Always attempt both cleanup steps regardless of app result
@@ -225,26 +316,29 @@ pub fn run() -> io::Result<()> {
 fn should_enable_mouse_capture<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<OsStr>,
 {
-    args.into_iter().any(|a| a.as_ref() == "--mouse")
+    args.into_iter()
+        .any(|argument| argument.as_ref() == OsStr::new("--mouse"))
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     demo_mode: bool,
-    initial_theme: Option<theme::Theme>,
+    legacy_mode: bool,
+    theme: theme::Theme,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    config: &config::AppConfig,
 ) -> io::Result<()> {
-    let legacy_mode = demo_mode || std::env::args().any(|arg| arg == "--legacy");
-    let theme = initial_theme.unwrap_or_default();
     let mut app = if legacy_mode {
-        App::new_with_config_and_claude_dirs(theme, hidden_agents, panels, claude_config_dirs)
+        App::new_with_config_and_claude_dirs(
+            theme,
+            &config.hidden_agents,
+            config.panels,
+            &config.claude_config_dirs,
+        )
     } else {
-        App::new_pi(theme, hidden_agents, panels)
+        App::new_pi(theme, &config.hidden_agents, config.panels)
     };
     if demo_mode {
         demo::populate_demo(&mut app);
@@ -733,6 +827,124 @@ mod tests {
     fn mouse_capture_is_opt_in() {
         assert!(!should_enable_mouse_capture(["ptop"]));
         assert!(should_enable_mouse_capture(["ptop", "--mouse"]));
+    }
+
+    #[test]
+    fn theme_flags_are_parsed_once_and_are_mutually_exclusive() {
+        assert_eq!(
+            theme_request_from_args(&[
+                OsString::from("ptop"),
+                OsString::from("--theme"),
+                OsString::from("nord"),
+            ])
+            .unwrap(),
+            Some(theme::ThemeRequest::BuiltIn("nord".to_string()))
+        );
+        assert_eq!(
+            theme_request_from_args(&[
+                OsString::from("ptop"),
+                OsString::from("--theme-file"),
+                OsString::from("custom.toml"),
+            ])
+            .unwrap(),
+            Some(theme::ThemeRequest::File(PathBuf::from("custom.toml")))
+        );
+        assert!(theme_request_from_args(&[
+            OsString::from("ptop"),
+            OsString::from("--theme"),
+            OsString::from("nord"),
+            OsString::from("--theme-file"),
+            OsString::from("custom.toml"),
+        ])
+        .is_err());
+        assert!(theme_request_from_args(
+            &[OsString::from("ptop"), OsString::from("--theme-file"),]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cli_theme_overrides_a_broken_configured_theme_file() {
+        let config = config::AppConfig {
+            theme_file: Some(PathBuf::from("missing.toml")),
+            ..config::AppConfig::default()
+        };
+        let theme = resolve_initial_theme(
+            Some(theme::ThemeRequest::BuiltIn("nord".to_string())),
+            &config,
+            Path::new("/startup"),
+            Some(Path::new("/config/ptop/config.toml")),
+            Some(Path::new("/home/user")),
+        )
+        .unwrap();
+        assert_eq!(theme.source, theme::ThemeSource::Packaged { id: "nord" });
+    }
+
+    #[test]
+    fn configured_theme_files_resolve_relative_to_the_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_directory = directory.path().join("config/ptop");
+        std::fs::create_dir_all(&config_directory).unwrap();
+        let theme_path = config_directory.join("custom.toml");
+        std::fs::write(
+            &theme_path,
+            include_str!("theme/builtins/btop.toml")
+                .replace("name = \"btop\"", "name = \"Custom\""),
+        )
+        .unwrap();
+
+        let config = config::AppConfig {
+            theme_file: Some(PathBuf::from("custom.toml")),
+            ..config::AppConfig::default()
+        };
+        let loaded = resolve_initial_theme(
+            None,
+            &config,
+            Path::new("/different/startup"),
+            Some(&config_directory.join("config.toml")),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.name, "Custom");
+        assert_eq!(loaded.source, theme::ThemeSource::File { path: theme_path });
+    }
+
+    #[test]
+    fn tilde_theme_paths_require_an_available_home_directory() {
+        let error = resolve_theme_path(
+            Path::new("~/themes/custom.toml"),
+            Path::new("/startup"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("no home directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cli_theme_file_names_do_not_panic() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let filename = OsString::from_vec(vec![b't', 0xff, b'.', b't']);
+        let path = directory.path().join(&filename);
+        std::fs::write(&path, include_str!("theme/builtins/btop.toml")).unwrap();
+        let request = theme_request_from_args(&[
+            OsString::from("ptop"),
+            OsString::from("--theme-file"),
+            filename,
+        ])
+        .unwrap();
+        let loaded = resolve_initial_theme(
+            request,
+            &config::AppConfig::default(),
+            directory.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.source, theme::ThemeSource::File { path });
     }
 
     #[test]

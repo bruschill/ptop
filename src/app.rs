@@ -14,6 +14,18 @@ const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
 
+fn next_packaged_theme_name(theme: &Theme) -> &'static str {
+    let names = crate::theme::THEME_NAMES;
+    match &theme.source {
+        crate::theme::ThemeSource::Packaged { id } => names
+            .iter()
+            .position(|name| name == id)
+            .map(|index| names[(index + 1) % names.len()])
+            .unwrap_or(names[0]),
+        crate::theme::ThemeSource::File { .. } => names[0],
+    }
+}
+
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
     prompt
@@ -586,17 +598,19 @@ impl App {
     }
 
     pub fn cycle_theme(&mut self) {
-        let names = crate::theme::THEME_NAMES;
-        let current = names
-            .iter()
-            .position(|&n| n == self.theme.name)
-            .unwrap_or(0);
-        let next = (current + 1) % names.len();
-        self.theme = Theme::by_name(names[next]).unwrap_or_default();
-        if let Err(e) = crate::config::save_theme(names[next]) {
-            self.set_status(format!("theme: {} (save failed: {})", names[next], e));
+        let catalog = crate::theme::ThemeCatalog::packaged();
+        let name = next_packaged_theme_name(&self.theme);
+        match catalog.load(&crate::theme::ThemeRequest::BuiltIn(name.to_string())) {
+            Ok(theme) => self.theme = theme,
+            Err(error) => {
+                self.set_status(format!("theme: {name} (load failed: {error})"));
+                return;
+            }
+        }
+        if let Err(error) = crate::config::save_theme(name) {
+            self.set_status(format!("theme: {name} (save failed: {error})"));
         } else {
-            self.set_status(format!("theme: {}", names[next]));
+            self.set_status(format!("theme: {name}"));
         }
     }
 
@@ -1188,6 +1202,20 @@ fn is_killable_agent_command(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_theme_cycle_starts_at_btop_for_file_themes() {
+        let file_theme = Theme {
+            source: crate::theme::ThemeSource::File {
+                path: PathBuf::from("custom.toml"),
+            },
+            ..Theme::default()
+        };
+        assert_eq!(next_packaged_theme_name(&file_theme), "btop");
+
+        let btop = Theme::default();
+        assert_eq!(next_packaged_theme_name(&btop), "dracula");
+    }
 
     fn waiting_session(cli: &'static str) -> AgentSession {
         AgentSession {

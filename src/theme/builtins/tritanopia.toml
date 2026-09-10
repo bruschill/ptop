@@ -1,0 +1,33 @@
+format = 1
+name = "tritanopia"
+
+[colors]
+main_bg = "#181416"
+main_fg = "#E0E0E0"
+title = "#FFFFFF"
+hi_fg = "#DC322F"
+selected_bg = "#402028"
+selected_fg = "#FFFFFF"
+inactive_fg = "#78686C"
+graph_text = "#A8989C"
+meter_bg = "#3C2830"
+proc_misc = "#40C4D0"
+div_line = "#302026"
+session_id = "#FF8C90"
+status_fg = "#DC322F"
+warning_fg = "#FF8C90"
+cpu_box = "#40C4D0"
+mem_box = "#C678DD"
+net_box = "#DC322F"
+proc_box = "#FF8C90"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#40C4D0", "#FF8C90", "#DC322F"]
+process = ["#40C4D0", "#FF8C90", "#DC322F"]
+used = ["#28181C", "#FF8C90", "#DC322F"]
+free = ["#141C20", "#40C4D0", "#B4E8F0"]
+cached = ["#141C20", "#C678DD", "#40C4D0"]

@@ -338,9 +338,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::styled(
                     w.to_string(),
                     Style::default().fg(if w < MIN_WIDTH {
-                        Color::Red
+                        theme.status_fg
                     } else {
-                        Color::Green
+                        theme.proc_misc
                     }),
                 ),
                 Span::styled(
@@ -350,9 +350,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::styled(
                     h.to_string(),
                     Style::default().fg(if h < MIN_HEIGHT {
-                        Color::Red
+                        theme.status_fg
                     } else {
-                        Color::Green
+                        theme.proc_misc
                     }),
                 ),
             ]),
@@ -1061,6 +1061,51 @@ mod tests {
     #[test]
     fn truncate_str_respects_terminal_display_width() {
         assert_eq!(truncate_str("ＡＢ123", 6), "ＡＢ1…");
+    }
+
+    #[test]
+    fn undersized_terminal_status_uses_theme_colors() {
+        let theme = Theme {
+            status_fg: Color::Rgb(1, 2, 3),
+            proc_misc: Color::Rgb(4, 5, 6),
+            ..Theme::default()
+        };
+        let app = App::new_with_config(theme, &[], PanelVisibility::default());
+        let backend = TestBackend::new(MIN_WIDTH, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut width_color = None;
+        let mut height_color = None;
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect();
+            if width_color.is_none() {
+                if let Some(index) = row.find("Width 60") {
+                    width_color = Some(
+                        buffer
+                            .cell(((index + "Width ".len()) as u16, y))
+                            .unwrap()
+                            .fg,
+                    );
+                }
+            }
+            if height_color.is_none() {
+                if let Some(index) = row.find("Height 10") {
+                    height_color = Some(
+                        buffer
+                            .cell(((index + "Height ".len()) as u16, y))
+                            .unwrap()
+                            .fg,
+                    );
+                }
+            }
+        }
+
+        assert_eq!(width_color, Some(app.theme.proc_misc));
+        assert_eq!(height_color, Some(app.theme.status_fg));
     }
 
     #[test]

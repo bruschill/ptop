@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PanelVisibility {
     pub context: bool,
     pub quota: bool,
@@ -25,8 +26,10 @@ impl Default for PanelVisibility {
     }
 }
 
+#[derive(Debug)]
 pub struct AppConfig {
     pub theme: String,
+    pub theme_file: Option<PathBuf>,
     /// Agent CLI names to exclude (e.g. ["pi"] in the default mode or ["codex"] in legacy mode).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
@@ -43,6 +46,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: "btop".to_string(),
+            theme_file: None,
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
@@ -51,64 +55,219 @@ impl Default for AppConfig {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("ptop").join("config.toml"))
+pub(crate) fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("ptop").join("config.toml"))
 }
 
+/// Compatibility loader for library callers that rely on an infallible result.
 pub fn load_config() -> AppConfig {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return AppConfig::default(),
-    };
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return AppConfig::default(),
-    };
-
-    parse_config_body(&content)
+    try_load_config().unwrap_or_default()
 }
 
+/// Load configuration and report read, encoding, or selected-theme syntax errors.
+pub fn try_load_config() -> Result<AppConfig, String> {
+    load_config_for_startup(false)
+}
+
+pub(crate) fn load_config_for_startup(
+    ignore_theme_selection_errors: bool,
+) -> Result<AppConfig, String> {
+    let Some(path) = config_path() else {
+        return Ok(AppConfig::default());
+    };
+    load_config_from_path(&path, ignore_theme_selection_errors)
+}
+
+fn load_config_from_path(
+    path: &Path,
+    ignore_theme_selection_errors: bool,
+) -> Result<AppConfig, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppConfig::default())
+        }
+        Err(error) => return Err(format!("cannot read config '{}': {error}", path.display())),
+    };
+    let content = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("config '{}' is not valid UTF-8", path.display()))?;
+    parse_config_body_checked(content, path, ignore_theme_selection_errors)
+}
+
+#[cfg(test)]
 fn parse_config_body(content: &str) -> AppConfig {
+    parse_config_body_checked(content, Path::new("config.toml"), true).unwrap_or_default()
+}
+
+fn parse_config_body_checked(
+    content: &str,
+    path: &Path,
+    ignore_theme_selection_errors: bool,
+) -> Result<AppConfig, String> {
     let mut config = AppConfig::default();
-    for line in content.lines() {
-        let line = line.trim();
+    let mut in_table = false;
+    let mut seen_theme = false;
+    let mut seen_theme_file = false;
+    let mut theme_error = None;
+    let mut theme_file_error = None;
+
+    for (index, original_line) in content.lines().enumerate() {
+        let line = original_line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        if let Some((key, val)) = line.split_once('=') {
-            let key = key.trim();
-            // Strip quotes (double or single) and inline comments
-            let val = val.trim();
-            let val = if let Some(comment_pos) = val.find('#') {
-                val[..comment_pos].trim()
+        if line.starts_with('[') {
+            in_table = true;
+            continue;
+        }
+        if in_table {
+            continue;
+        }
+
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let line_number = index + 1;
+
+        if key == "theme" || key == "theme_file" {
+            let seen = if key == "theme" {
+                &mut seen_theme
             } else {
-                val
+                &mut seen_theme_file
             };
-            if key == "hidden_agents" {
-                config.hidden_agents = parse_string_array(val);
-                continue;
+            if *seen && !ignore_theme_selection_errors {
+                return Err(format!(
+                    "config '{}':{line_number}: duplicate top-level '{key}'",
+                    path.display()
+                ));
             }
-            if key == "claude_config_dirs" {
-                config.claude_config_dirs = parse_path_array(val);
-                continue;
+            *seen = true;
+
+            let parsed = if key == "theme" {
+                parse_theme_name(raw_value)
+            } else {
+                parse_toml_string(raw_value)
+            };
+            let value = match parsed {
+                Ok(value) => value,
+                Err(_) if ignore_theme_selection_errors => continue,
+                Err(message) => {
+                    let error = format!(
+                        "config '{}':{line_number}: invalid {key}: {message}",
+                        path.display()
+                    );
+                    if key == "theme" {
+                        theme_error = Some(error);
+                    } else {
+                        theme_file_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if key == "theme" {
+                config.theme = value;
+            } else if value.is_empty() {
+                if !ignore_theme_selection_errors {
+                    theme_file_error = Some(format!(
+                        "config '{}':{line_number}: theme_file must not be empty",
+                        path.display()
+                    ));
+                }
+            } else {
+                config.theme_file = Some(PathBuf::from(value));
             }
-            let val = val.trim_matches('"').trim_matches('\'');
-            match key {
-                "theme" => config.theme = val.to_string(),
-                "language" => config.language = val.to_string(),
-                "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
-                "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
-                "show_tokens" => config.panels.tokens = parse_bool(val).unwrap_or(true),
-                "show_projects" => config.panels.projects = parse_bool(val).unwrap_or(true),
-                "show_ports" => config.panels.ports = parse_bool(val).unwrap_or(true),
-                "show_sessions" => config.panels.sessions = parse_bool(val).unwrap_or(true),
-                "show_mcp" => config.panels.mcp = parse_bool(val).unwrap_or(true),
-                _ => {}
+            continue;
+        }
+
+        let value = strip_inline_comment(raw_value).trim();
+        if key == "hidden_agents" {
+            config.hidden_agents = parse_string_array(value);
+            continue;
+        }
+        if key == "claude_config_dirs" {
+            config.claude_config_dirs = parse_path_array(value);
+            continue;
+        }
+        match key {
+            "language" => {
+                config.language = parse_toml_string(raw_value)
+                    .unwrap_or_else(|_| value.trim_matches('"').trim_matches('\'').to_string())
             }
+            "show_context" => config.panels.context = parse_bool(value).unwrap_or(true),
+            "show_quota" => config.panels.quota = parse_bool(value).unwrap_or(true),
+            "show_tokens" => config.panels.tokens = parse_bool(value).unwrap_or(true),
+            "show_projects" => config.panels.projects = parse_bool(value).unwrap_or(true),
+            "show_ports" => config.panels.ports = parse_bool(value).unwrap_or(true),
+            "show_sessions" => config.panels.sessions = parse_bool(value).unwrap_or(true),
+            "show_mcp" => config.panels.mcp = parse_bool(value).unwrap_or(true),
+            _ => {}
         }
     }
-    config
+
+    if !ignore_theme_selection_errors {
+        if seen_theme_file {
+            if let Some(error) = theme_file_error {
+                return Err(error);
+            }
+        } else if let Some(error) = theme_error {
+            return Err(error);
+        }
+    }
+    Ok(config)
+}
+
+fn parse_theme_name(raw: &str) -> Result<String, String> {
+    parse_toml_string(raw).or_else(|_| {
+        let legacy = strip_inline_comment(raw).trim();
+        if !legacy.is_empty()
+            && legacy
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            Ok(legacy.to_string())
+        } else {
+            Err("expected a quoted string or an unquoted built-in name".to_string())
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct StringValue {
+    value: String,
+}
+
+fn parse_toml_string(raw: &str) -> Result<String, String> {
+    toml::from_str::<StringValue>(&format!("value = {raw}"))
+        .map(|parsed| parsed.value)
+        .map_err(|error| error.to_string())
+}
+
+fn strip_inline_comment(raw: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote == Some('"') {
+            escaped = true;
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if character == '#' && quote.is_none() {
+            return &raw[..index];
+        }
+    }
+    raw
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -119,24 +278,23 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
+#[derive(Deserialize)]
+struct StringArrayValue {
+    value: Vec<String>,
+}
+
 /// Parse a simple one-line TOML string array like `["a", "b"]`.
-/// Returns an empty Vec for malformed input to keep config loading infallible.
+/// Returns an empty Vec for malformed input to keep compatibility loading infallible.
 fn parse_string_array(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim();
-    let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
-        return Vec::new();
-    };
-    inner
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    toml::from_str::<StringArrayValue>(&format!("value = {raw}"))
+        .map(|parsed| parsed.value)
+        .unwrap_or_default()
 }
 
 fn parse_path_array(raw: &str) -> Vec<PathBuf> {
     parse_string_array(raw)
         .into_iter()
-        .map(|s| expand_home_path(&s))
+        .map(|value| expand_home_path(&value))
         .collect()
 }
 
@@ -151,11 +309,30 @@ fn expand_home_path(raw: &str) -> PathBuf {
             return home.join(rest);
         }
     }
+    #[cfg(windows)]
+    if let Some(rest) = raw.strip_prefix("~\\") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
     PathBuf::from(raw)
 }
 
 pub fn save_theme(name: &str) -> Result<(), String> {
-    write_with_updates(&[("theme", format!("\"{}\"", name))])
+    write_with_edits(&[
+        ("theme", Some(quote_toml_string(name))),
+        ("theme_file", None),
+    ])
+}
+
+pub fn save_theme_file(path: &Path) -> Result<(), String> {
+    let value = path
+        .to_str()
+        .ok_or("theme file paths saved in config must be valid UTF-8")?;
+    write_with_edits(&[
+        ("theme", None),
+        ("theme_file", Some(quote_toml_string(value))),
+    ])
 }
 
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
@@ -170,49 +347,112 @@ pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
     ])
 }
 
-/// Read the config, replace or append each (key, value) pair, write it back.
-/// Lines that don't match any key are preserved verbatim so unknown keys and
-/// comments survive saves driven by unrelated parts of the UI.
-fn write_with_updates(updates: &[(&str, String)]) -> Result<(), String> {
-    let path = config_path().ok_or("no config directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn quote_toml_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => {
+                quoted.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => quoted.push(character),
+        }
     }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.to_string()),
-    };
-    let new_content = rewrite_kv_lines(&content, updates);
-    std::fs::write(&path, new_content).map_err(|e| e.to_string())
+    quoted.push('"');
+    quoted
 }
 
-/// Rewrite (or append) the listed `key = value` lines in a config body.
-/// Every other line is preserved verbatim so keys set by the user or by a
-/// different save_* helper survive.
+fn write_with_updates(updates: &[(&str, String)]) -> Result<(), String> {
+    let edits: Vec<(&str, Option<String>)> = updates
+        .iter()
+        .map(|(key, value)| (*key, Some(value.clone())))
+        .collect();
+    write_with_edits(&edits)
+}
+
+/// Read the config, safely update top-level scalar keys, and preserve other lines.
+fn write_with_edits(edits: &[(&str, Option<String>)]) -> Result<(), String> {
+    let path = config_path().ok_or("no config directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let new_content = rewrite_config_lines(&content, edits)?;
+    std::fs::write(&path, new_content).map_err(|error| error.to_string())
+}
+
+/// Compatibility helper used by existing tests for update-only rewrites.
+#[cfg(test)]
 fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
-    let mut found = vec![false; updates.len()];
-    let mut out: Vec<String> = Vec::new();
+    let edits: Vec<(&str, Option<String>)> = updates
+        .iter()
+        .map(|(key, value)| (*key, Some(value.clone())))
+        .collect();
+    rewrite_config_lines(content, &edits).expect("test config must use supported syntax")
+}
+
+fn rewrite_config_lines(content: &str, edits: &[(&str, Option<String>)]) -> Result<String, String> {
+    if content.contains("\"\"\"") || content.contains("'''") {
+        return Err("cannot safely rewrite config containing multiline strings".to_string());
+    }
+
+    let mut found = vec![false; edits.len()];
+    let mut output = Vec::new();
+    let mut in_table = false;
+    let mut first_table_index = None;
+
     for line in content.lines() {
-        let line_key = line.split_once('=').map(|(k, _)| k.trim().to_string());
-        let mut replaced = false;
-        if let Some(key) = line_key {
-            if let Some(idx) = updates.iter().position(|(k, _)| *k == key) {
-                out.push(format!("{} = {}", updates[idx].0, updates[idx].1));
-                found[idx] = true;
-                replaced = true;
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if first_table_index.is_none() {
+                first_table_index = Some(output.len());
+            }
+            in_table = true;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if !in_table {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if let Some(index) = edits.iter().position(|(candidate, _)| *candidate == key) {
+                    if found[index] {
+                        return Err(format!("cannot safely rewrite duplicate top-level '{key}'"));
+                    }
+                    found[index] = true;
+                    if let Some(value) = &edits[index].1 {
+                        output.push(format!("{} = {value}", edits[index].0));
+                    }
+                    continue;
+                }
             }
         }
-        if !replaced {
-            out.push(line.to_string());
-        }
+        output.push(line.to_string());
     }
-    for (idx, (k, v)) in updates.iter().enumerate() {
-        if !found[idx] {
-            out.push(format!("{} = {}", k, v));
-        }
-    }
-    out.join("\n") + "\n"
+
+    let additions: Vec<String> = edits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, value))| {
+            if found[index] {
+                None
+            } else {
+                value.as_ref().map(|value| format!("{key} = {value}"))
+            }
+        })
+        .collect();
+    let insertion_index = first_table_index.unwrap_or(output.len());
+    output.splice(insertion_index..insertion_index, additions);
+    Ok(output.join("\n") + "\n")
 }
 
 #[cfg(test)]
@@ -323,5 +563,107 @@ mod tests {
         assert!(after.contains("language = \"zh\""));
         assert!(!after.contains("language = \"en\""));
         assert!(after.contains("theme = \"btop\""));
+    }
+
+    #[test]
+    fn parses_theme_file_with_spaces_hashes_and_backslashes() {
+        let body = r#"theme_file = 'themes/low glare#1\custom.toml' # selected theme"#;
+        let config = parse_config_body_checked(body, Path::new("config.toml"), false).unwrap();
+        assert_eq!(
+            config.theme_file,
+            Some(PathBuf::from(r"themes/low glare#1\custom.toml"))
+        );
+    }
+
+    #[test]
+    fn duplicate_theme_selection_is_rejected_unless_cli_overrides_it() {
+        let body = "theme_file = 42\ntheme_file = false\nhidden_agents = [\"codex\"]\n";
+        assert!(parse_config_body_checked(body, Path::new("config.toml"), false).is_err());
+
+        let config = parse_config_body_checked(body, Path::new("config.toml"), true).unwrap();
+        assert_eq!(config.theme_file, None);
+        assert_eq!(config.hidden_agents, vec!["codex"]);
+    }
+
+    #[test]
+    fn only_the_winning_configured_theme_selection_must_be_valid() {
+        let config = parse_config_body_checked(
+            "theme_file = \"custom.toml\"\ntheme = []\n",
+            Path::new("config.toml"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.theme_file, Some(PathBuf::from("custom.toml")));
+
+        let error = parse_config_body_checked(
+            "theme_file = []\ntheme = \"nord\"\n",
+            Path::new("config.toml"),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid theme_file"));
+    }
+
+    #[test]
+    fn switching_from_file_to_builtin_removes_file_selection_before_tables() {
+        let body = "theme_file = \"custom.toml\"\n[future]\ntheme_file = \"nested.toml\"\n";
+        let edits = [
+            ("theme", Some(quote_toml_string("nord"))),
+            ("theme_file", None),
+        ];
+        let rewritten = rewrite_config_lines(body, &edits).unwrap();
+        let config =
+            parse_config_body_checked(&rewritten, Path::new("config.toml"), false).unwrap();
+
+        assert_eq!(config.theme, "nord");
+        assert_eq!(config.theme_file, None);
+        assert!(rewritten.contains("[future]\ntheme_file = \"nested.toml\""));
+        assert!(rewritten.find("theme = \"nord\"").unwrap() < rewritten.find("[future]").unwrap());
+    }
+
+    #[test]
+    fn panel_rewrites_preserve_a_quoted_theme_path() {
+        let body = "theme_file = \"themes/low glare#1.toml\"\nshow_quota = true\n";
+        let rewritten =
+            rewrite_config_lines(body, &[("show_quota", Some("false".to_string()))]).unwrap();
+        let config =
+            parse_config_body_checked(&rewritten, Path::new("config.toml"), false).unwrap();
+
+        assert_eq!(
+            config.theme_file,
+            Some(PathBuf::from("themes/low glare#1.toml"))
+        );
+        assert!(!config.panels.quota);
+    }
+
+    #[test]
+    fn unsafe_rewrites_fail_instead_of_corrupting_config() {
+        assert!(rewrite_config_lines(
+            "theme = \"btop\"\ntheme = \"nord\"\n",
+            &[("theme", Some(quote_toml_string("dracula")))],
+        )
+        .is_err());
+        assert!(rewrite_config_lines(
+            "message = \"\"\"multi\nline\"\"\"\n",
+            &[("theme", Some(quote_toml_string("dracula")))],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fallible_loader_reports_invalid_utf8() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let error = load_config_from_path(&path, false).unwrap_err();
+        assert!(error.contains("not valid UTF-8"));
+        assert!(error.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn quoted_theme_paths_round_trip_as_toml_strings() {
+        let value = r##"C:\Users\Brandon\themes\"night\"#1.toml"##;
+        let quoted = quote_toml_string(value);
+        assert_eq!(parse_toml_string(&quoted).unwrap(), value);
     }
 }

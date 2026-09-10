@@ -1,0 +1,33 @@
+format = 1
+name = "Low glare"
+
+[colors]
+main_bg = "#161A1D"
+main_fg = "#C3C8CC"
+title = "#EEEEEE"
+hi_fg = "#B54040"
+selected_bg = "#34404A"
+selected_fg = "#EEEEEE"
+inactive_fg = "#404040"
+graph_text = "#606060"
+meter_bg = "#404040"
+proc_misc = "#0DE756"
+div_line = "#2A3238"
+session_id = "#B0A070"
+status_fg = "#DC4C4C"
+warning_fg = "#DCA032"
+cpu_box = "#556D59"
+mem_box = "#6C6C4B"
+net_box = "#5C588D"
+proc_box = "#805252"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#77CA9B", "#CBC06C", "#DC4C4C"]
+process = ["#80D0A3", "#DCD179", "#D45454"]
+used = ["#592B26", "#D9626D", "#FF4769"]
+free = ["#384F21", "#B5E685", "#DCFF85"]
+cached = ["#163350", "#74E6FC", "#26C5FF"]

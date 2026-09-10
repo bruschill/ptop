@@ -1,0 +1,33 @@
+format = 1
+name = "gruvbox"
+
+[colors]
+main_bg = "#282828"
+main_fg = "#EBDBB2"
+title = "#FBF1C7"
+hi_fg = "#FB4934"
+selected_bg = "#504945"
+selected_fg = "#FBF1C7"
+inactive_fg = "#7C6F64"
+graph_text = "#A89984"
+meter_bg = "#3C3836"
+proc_misc = "#B8BB26"
+div_line = "#32302F"
+session_id = "#FABD2F"
+status_fg = "#FB4934"
+warning_fg = "#FABD2F"
+cpu_box = "#83A598"
+mem_box = "#D3869B"
+net_box = "#FE8019"
+proc_box = "#FB4934"
+claude_agent = "#D97757"
+codex_agent = "#7A9DFF"
+opencode_agent = "#4ADE80"
+pi_agent = "#C084FC"
+
+[gradients]
+cpu = ["#B8BB26", "#FABD2F", "#FB4934"]
+process = ["#8EC07C", "#FABD2F", "#FB4934"]
+used = ["#3C3836", "#FE8019", "#FB4934"]
+free = ["#282828", "#B8BB26", "#8EC07C"]
+cached = ["#282828", "#83A598", "#D3869B"]
