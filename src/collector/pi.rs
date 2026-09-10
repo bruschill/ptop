@@ -67,6 +67,10 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
     #[cfg(not(unix))]
     modified_ms: Option<u64>,
 }
@@ -767,7 +771,7 @@ impl PiCollector {
         if !metadata.is_file() || path_metadata.file_type().is_symlink() {
             return Err("session file is no longer a regular non-symlink file".to_string());
         }
-        let identity = file_identity_from_metadata(&metadata);
+        let identity = file_identity_from_file(&file, &metadata);
         if expected_identity.is_some_and(|expected| *expected != identity) {
             self.tails.remove(path);
             return Err("session file identity changed after ownership validation".to_string());
@@ -993,7 +997,7 @@ fn validate_candidate_with_budget(
     if !metadata.is_file() {
         return Err("session path is not a regular file".to_string());
     }
-    let identity = file_identity_from_metadata(&metadata);
+    let identity = file_identity_from_file(&file, &metadata);
     let header = read_header_from(&mut file, read_budget)?;
     if !expected_cwd.is_empty() && header.cwd != expected_cwd {
         return Err("session header cwd conflicts with process cwd".to_string());
@@ -1020,12 +1024,7 @@ fn canonical_regular_jsonl(path: &Path) -> Result<PathBuf, String> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("session file must be a regular non-symlink file".to_string());
     }
-    let canonical =
-        fs::canonicalize(path).map_err(|_| "session file cannot be canonicalized".to_string())?;
-    if canonical != path {
-        return Err("session file path must not traverse a symlink".to_string());
-    }
-    Ok(canonical)
+    fs::canonicalize(path).map_err(|_| "session file cannot be canonicalized".to_string())
 }
 
 #[cfg(test)]
@@ -1578,11 +1577,12 @@ fn pi_agent_root(session_path: &Path) -> Option<PathBuf> {
 }
 
 fn catalog_revision(path: &Path) -> Option<CatalogRevision> {
-    let metadata = fs::metadata(path).ok()?;
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
     Some(CatalogRevision {
         length: metadata.len(),
         modified: metadata.modified().ok(),
-        identity: file_identity_from_metadata(&metadata),
+        identity: file_identity_from_file(&file, &metadata),
     })
 }
 
@@ -1811,21 +1811,46 @@ fn file_modified_ms(path: &Path) -> Option<u64> {
 }
 
 fn file_identity(path: &Path) -> Option<FileIdentity> {
-    let metadata = fs::metadata(path).ok()?;
-    Some(file_identity_from_metadata(&metadata))
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    Some(file_identity_from_file(&file, &metadata))
 }
 
-fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
+fn file_identity_from_file(file: &File, metadata: &fs::Metadata) -> FileIdentity {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = file;
         FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        let (volume_serial_number, file_index, modified_ms) =
+            if let Some((volume, index)) = windows_file_identity(file) {
+                (Some(volume), Some(index), None)
+            } else {
+                (
+                    None,
+                    None,
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis() as u64),
+                )
+            };
+        FileIdentity {
+            volume_serial_number,
+            file_index,
+            modified_ms,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
         FileIdentity {
             modified_ms: metadata
                 .modified()
@@ -1834,6 +1859,28 @@ fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
                 .map(|duration| duration.as_millis() as u64),
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` owns a valid handle for this call, and `info` points to writable storage.
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) };
+    if result == 0 {
+        return None;
+    }
+    // SAFETY: a successful call initialized the full structure.
+    let info = unsafe { info.assume_init() };
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, file_index))
 }
 
 /// Match only executable-position Pi commands. This accepts the `pi` wrapper
@@ -2349,6 +2396,7 @@ mod tests {
     use crate::collector::process::ProcInfo;
     use crate::model::TelemetryPrecision;
     use std::io::Write;
+    use std::time::{Duration, Instant};
 
     fn proc(pid: u32, ppid: u32, command: &str) -> ProcInfo {
         ProcInfo {
@@ -2457,6 +2505,16 @@ mod tests {
         assert_ne!(sessions[0].started_at, 1);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_pi_telemetry_boundary_is_process_only() {
+        let mut budget = 4_096;
+        assert!(process_session_marker(42, &mut budget).is_none());
+        assert_eq!(process_open_jsonl_paths(42, 8, 128), (Vec::new(), 0, false));
+        assert!(process_cwd(42).is_none());
+        assert!(process_start_id(42).is_none());
+    }
+
     #[test]
     fn process_only_rows_remain_distinct_for_same_cwd() {
         let shared = shared(vec![proc(10, 1, "pi"), proc(20, 1, "pi")]);
@@ -2476,14 +2534,26 @@ mod tests {
         }));
     }
 
+    fn session_header(id: &str, cwd: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "session", "version": 3, "id": id, "cwd": cwd})
+        )
+    }
+
     fn session_file(dir: &tempfile::TempDir, id: &str, cwd: &str) -> PathBuf {
         let path = dir.path().join("session.jsonl");
-        fs::write(
-            &path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&path, session_header(id, cwd)).unwrap();
         path
+    }
+
+    #[test]
+    fn session_fixture_escapes_windows_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = r"C:\Users\runneradmin\project";
+        let path = session_file(&dir, "windows-path", cwd);
+
+        assert_eq!(read_header(&path).unwrap().cwd, cwd);
     }
 
     #[test]
@@ -2495,7 +2565,10 @@ mod tests {
             path: path.clone(),
             expected_session_id: Some("session-a".to_string()),
         };
-        assert_eq!(validate_candidate(&candidate, &cwd).unwrap().0, path);
+        assert_eq!(
+            validate_candidate(&candidate, &cwd).unwrap().0,
+            fs::canonicalize(&path).unwrap()
+        );
         assert!(validate_candidate(&candidate, "/another/project").is_err());
         let conflicting = AttachmentCandidate {
             path,
@@ -2587,6 +2660,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn session_file_beneath_symlinked_parent_is_canonicalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        let linked_dir = dir.path().join("linked");
+        fs::create_dir(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+        let real_path = real_dir.join("session.jsonl");
+        let linked_path = linked_dir.join("session.jsonl");
+        fs::write(&real_path, "{}\n").unwrap();
+
+        assert_eq!(
+            canonical_regular_jsonl(&linked_path).unwrap(),
+            fs::canonicalize(real_path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlinked_session_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy();
@@ -2634,22 +2725,14 @@ mod tests {
         let path = session_file(&dir, "first", &cwd);
         let mut collector = PiCollector::new();
         collector.tail_session(&path, 1).unwrap();
-        fs::write(
-            &path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"second\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&path, session_header("second", &cwd)).unwrap();
         assert_eq!(read_header(&path).unwrap().session_id, "second");
         assert_eq!(
             collector.tail_session(&path, 2).unwrap().offset,
             fs::metadata(&path).unwrap().len()
         );
         let replacement = dir.path().join("replacement.jsonl");
-        fs::write(
-            &replacement,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"third\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&replacement, session_header("third", &cwd)).unwrap();
         fs::rename(replacement, &path).unwrap();
         assert_eq!(read_header(&path).unwrap().session_id, "third");
         assert_eq!(
@@ -2693,9 +2776,7 @@ mod tests {
         // only the ownership header.
         fs::write(
             &path,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"owned-b\",\"cwd\":\"{cwd}\"}}\n{suffix}"
-            ),
+            format!("{}{suffix}", session_header("owned-b", &cwd)),
         )
         .unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
@@ -2719,11 +2800,7 @@ mod tests {
             identity: file_identity(&path).unwrap(),
         };
         let replacement = dir.path().join("replacement.jsonl");
-        fs::write(
-            &replacement,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"owned\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&replacement, session_header("owned", &cwd)).unwrap();
         fs::rename(replacement, &path).unwrap();
 
         let mut collector = PiCollector::new();
@@ -2783,11 +2860,7 @@ mod tests {
         let cwd = dir.path().to_string_lossy().to_string();
         let unique = session_file(&dir, "unique", &cwd);
         let shared_path = dir.path().join("shared.jsonl");
-        fs::write(
-            &shared_path,
-            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"shared\",\"cwd\":\"{cwd}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(&shared_path, session_header("shared", &cwd)).unwrap();
         let _open_shared = File::open(&shared_path).unwrap();
         let unique_identity = file_identity(&unique).unwrap();
         let shared_identity = file_identity(&shared_path).unwrap();
@@ -2949,13 +3022,7 @@ mod tests {
         let cwd = dir.path().to_string_lossy();
         let a = session_file(&dir, "budget-a", &cwd);
         let b = dir.path().join("b.jsonl");
-        fs::write(
-            &b,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"budget-b\",\"cwd\":\"{cwd}\"}}\n"
-            ),
-        )
-        .unwrap();
+        fs::write(&b, session_header("budget-b", &cwd)).unwrap();
         let mut collector = PiCollector::new();
         let a_offset = collector.tail_session(&a, 1).unwrap().offset;
         let b_offset = collector.tail_session(&b, 1).unwrap().offset;
@@ -3006,7 +3073,14 @@ mod tests {
         let old_offset = old.offset;
 
         let replacement = format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"regrow\",\"cwd\":\"{cwd}\",\"replaced\":true}}\n{{}}\n{{}}\n{{}}\n"
+            "{}\n{{}}\n{{}}\n{{}}\n",
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "regrow",
+                "cwd": cwd,
+                "replaced": true
+            })
         );
         fs::write(&path, replacement).unwrap();
         assert!(fs::metadata(&path).unwrap().len() >= old_offset);
@@ -3235,6 +3309,26 @@ mod tests {
         assert!(!format!("{cache:?}").contains("apiKey"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_survives_in_place_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.jsonl");
+        fs::write(&path, "first\n").unwrap();
+        let identity = file_identity(&path).unwrap();
+        assert!(identity.volume_serial_number.is_some());
+        assert!(identity.file_index.is_some());
+        assert!(identity.modified_ms.is_none());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        assert_eq!(file_identity(&path), Some(identity));
+    }
+
     #[test]
     fn catalog_same_length_replacement_refreshes_by_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -3309,5 +3403,100 @@ mod tests {
             .insert(root, ModelCatalogCache::default());
         collector.collect_sessions(&shared(Vec::new()));
         assert!(collector.model_catalogs.is_empty());
+    }
+
+    #[test]
+    fn documented_parser_limits_match_release_constants() {
+        let docs = include_str!("../../docs/pi-support.md");
+        let expected = [
+            format!(
+                "{} MiB of Pi session JSONL per collection tick",
+                MAX_TAIL_WORK_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "{} MiB per Pi session JSONL line",
+                MAX_TAIL_LINE_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "{} semantic tree entries per attached session",
+                MAX_SEMANTIC_ENTRIES
+            ),
+            format!(
+                "{} attachment candidates per collection tick",
+                MAX_ATTACHMENT_CANDIDATES_PER_COLLECT
+            ),
+            format!(
+                "{} Pi processes considered for attachment per collection tick",
+                MAX_PROCESSES_SCANNED_PER_COLLECT
+            ),
+            format!(
+                "{} open file descriptors per collection tick",
+                MAX_OPEN_FDS_SCANNED_PER_COLLECT
+            ),
+            format!(
+                "Model catalog files are capped at {} MiB and {} retained model entries",
+                MAX_MODEL_CATALOG_BYTES / (1024 * 1024) as u64,
+                MAX_MODEL_CATALOG_ENTRIES
+            ),
+        ];
+        for expected in expected {
+            assert!(
+                docs.contains(&expected),
+                "missing documented limit: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release benchmark; run with cargo test --release pi_parser_release_benchmark -- --ignored --nocapture"]
+    fn pi_parser_release_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut fixture =
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"benchmark\",\"cwd\":\"/tmp\"}\n"
+                .to_vec();
+        let padding = "x".repeat(96);
+        for index in 0..MAX_SEMANTIC_ENTRIES {
+            let parent = if index == 0 {
+                "null".to_string()
+            } else {
+                format!("\"entry-{}\"", index - 1)
+            };
+            let line = format!(
+                "{{\"type\":\"message\",\"id\":\"entry-{index}\",\"parentId\":{parent},\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":1,\"output\":1,\"cacheRead\":1,\"cacheWrite\":1,\"totalTokens\":4}},\"content\":[{{\"type\":\"text\",\"text\":\"{padding}\"}}]}}}}\n"
+            );
+            fixture.extend_from_slice(line.as_bytes());
+            if fixture.len() > MAX_TAIL_WORK_BYTES + MAX_TAIL_LINE_BYTES.min(line.len()) {
+                break;
+            }
+        }
+        assert!(fixture.len() > MAX_TAIL_WORK_BYTES);
+        fs::write(&path, &fixture).unwrap();
+
+        let started = Instant::now();
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let tail = collector
+            .tail_session_with_budget(&path, 1, &mut budget)
+            .unwrap();
+        let parsed = tail.semantic.session_data(tail.complete);
+        let offset = tail.offset;
+        let complete = tail.complete;
+        let entry_count = tail.semantic.entries.len();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            budget, 0,
+            "production tailer did not consume its tick budget"
+        );
+        assert!(!complete, "oversized fixture should require another tick");
+        assert!(offset > (MAX_TAIL_WORK_BYTES / 2) as u64);
+        assert!(offset <= MAX_TAIL_WORK_BYTES as u64);
+        assert_eq!(parsed.turns as usize, entry_count);
+        eprintln!("tailed {offset} JSONL bytes across {entry_count} entries in {elapsed:?}");
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "2 MiB parser gate exceeded one second: {elapsed:?}"
+        );
     }
 }

@@ -8,7 +8,7 @@ Set Padding 10
 Set Framerate 1
 
 Hide
-Type "./target/release/abtop --demo --theme white"
+Type "./target/release/ptop --demo --theme white"
 Enter
 Sleep 3s
 Show

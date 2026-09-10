@@ -1,12 +1,12 @@
 ---
 name: Bug Report
-about: Report a bug to help us improve abtop
+about: Report a bug to help us improve ptop
 labels: bug
 ---
 
 **Environment**
 - OS: <!-- macOS / Linux -->
-- abtop version: <!-- `abtop --version` -->
+- ptop version: <!-- `ptop --version` -->
 - Claude Code version: <!-- `claude --version` -->
 - Terminal: <!-- e.g. iTerm2, Alacritty, tmux -->
 

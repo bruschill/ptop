@@ -118,7 +118,7 @@ pub(crate) fn draw_config_overlay(f: &mut Frame, app: &App, theme: &Theme) {
     let close_label = t("config.close");
     lines.push(Line::from(Span::styled(
         format!(
-            " abtop v{}  {}  Esc {}",
+            " ptop v{}  {}  Esc {}",
             env!("CARGO_PKG_VERSION"),
             change_label,
             close_label

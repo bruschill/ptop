@@ -240,8 +240,12 @@ impl AgentAggregate {
         let mut active = 0usize;
         for s in sessions {
             mem_mb = mem_mb.saturating_add(s.mem_mb);
-            if s.context_percent > 0.0 {
-                ctx_sum += s.context_percent;
+            if let Some(context) = if s.telemetry.is_some() {
+                s.context_value()
+            } else {
+                (s.context_percent > 0.0).then_some(s.context_percent)
+            } {
+                ctx_sum += context;
                 ctx_n += 1;
             }
             if s.status.is_active() {
@@ -258,5 +262,58 @@ impl AgentAggregate {
             avg_ctx_pct,
             active_count: active,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::PanelVisibility;
+    use crate::model::{SessionTelemetry, TelemetryCompleteness, TelemetryPrecision};
+    use crate::theme::Theme;
+
+    #[test]
+    fn aggregate_includes_known_zero_but_excludes_unknown_pi_context() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let base = app.sessions[0].clone();
+        let make_session = |precision: TelemetryPrecision, percent: f64, window: u64| {
+            let mut session = base.clone();
+            session.agent_cli = "pi";
+            session.context_percent = percent;
+            session.context_window = window;
+            let mut telemetry = SessionTelemetry::process_only(1);
+            telemetry.context.precision = precision;
+            telemetry.context.completeness = if precision == TelemetryPrecision::Unknown {
+                TelemetryCompleteness::Unknown
+            } else {
+                TelemetryCompleteness::Complete
+            };
+            session.telemetry = Some(telemetry);
+            session
+        };
+        let sessions = vec![
+            make_session(TelemetryPrecision::Unknown, 0.0, 0),
+            make_session(TelemetryPrecision::Exact, 0.0, 200_000),
+            make_session(TelemetryPrecision::Inferred, 50.0, 200_000),
+        ];
+
+        let aggregate = AgentAggregate::from_sessions(&sessions);
+        assert_eq!(aggregate.avg_ctx_pct, 25.0);
+    }
+
+    #[test]
+    fn aggregate_preserves_legacy_zero_placeholder_behavior() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let mut zero = app.sessions[0].clone();
+        zero.context_percent = 0.0;
+        zero.telemetry = None;
+        let mut nonzero = zero.clone();
+        nonzero.context_percent = 40.0;
+
+        let aggregate = AgentAggregate::from_sessions(&[zero, nonzero]);
+        assert_eq!(aggregate.avg_ctx_pct, 40.0);
     }
 }

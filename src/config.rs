@@ -27,7 +27,7 @@ impl Default for PanelVisibility {
 
 pub struct AppConfig {
     pub theme: String,
-    /// Agent CLI names to exclude (e.g. ["pi"] in Pi Fleet or ["codex"] in legacy mode).
+    /// Agent CLI names to exclude (e.g. ["pi"] in the default mode or ["codex"] in legacy mode).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
     /// Additional Claude config directories to scan for sessions.
@@ -52,7 +52,7 @@ impl Default for AppConfig {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("abtop").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("ptop").join("config.toml"))
 }
 
 pub fn load_config() -> AppConfig {

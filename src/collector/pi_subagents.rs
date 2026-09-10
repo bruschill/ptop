@@ -1586,6 +1586,106 @@ mod tests {
     }
 
     #[test]
+    fn status_scan_ignores_child_transcripts_prompts_logs_and_tool_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("async-subagent-runs");
+        write_status(
+            &root,
+            "run-private",
+            serde_json::json!({
+                "lifecycleArtifactVersion": 3,
+                "runId": "run-private",
+                "sessionId": "parent-session",
+                "mode": "single",
+                "state": "running",
+                "startedAt": 1
+            }),
+        );
+        let run_dir = root.join("run-private");
+        for name in [
+            "events.jsonl",
+            "session.jsonl",
+            "prompt.txt",
+            "output-0.log",
+            "tool-arguments.json",
+        ] {
+            fs::write(run_dir.join(name), "private sentinel").unwrap();
+        }
+
+        let scan = status_candidates(&root).unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(
+            scan.candidates[0].path,
+            fs::canonicalize(run_dir.join("status.json")).unwrap()
+        );
+        let fleet = collect_one(&root, 2_000);
+        assert_eq!(fleet.runs.len(), 1);
+        assert!(!serde_json::to_string(&fleet)
+            .unwrap()
+            .contains("private sentinel"));
+    }
+
+    #[test]
+    fn status_scan_caps_files_per_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("async-subagent-runs");
+        for index in 0..MAX_STATUS_FILES + 5 {
+            write_status(
+                &root,
+                &format!("run-{index:03}"),
+                serde_json::json!({
+                    "lifecycleArtifactVersion": 3,
+                    "runId": format!("run-{index:03}"),
+                    "sessionId": "parent-session",
+                    "state": "complete"
+                }),
+            );
+        }
+
+        let scan = status_candidates(&root).unwrap();
+        assert_eq!(scan.candidates.len(), MAX_STATUS_FILES);
+        assert!(scan.omitted >= 5);
+    }
+
+    #[test]
+    fn documented_fleet_limits_match_release_constants() {
+        let docs = include_str!("../../docs/pi-support.md");
+        let expected = [
+            format!("{} KiB per status.json file", MAX_STATUS_BYTES / 1024),
+            format!(
+                "{} MiB of status.json data per collection tick",
+                MAX_STATUS_READ_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "{} run-directory entries examined per collection tick",
+                MAX_DIRECTORY_ENTRIES
+            ),
+            format!("{} status files per collection tick", MAX_STATUS_FILES),
+            format!("{} runs per parent session", MAX_RUNS_PER_SESSION),
+            format!("{} children per run", MAX_CHILDREN_PER_RUN),
+            format!("{} nested child levels", MAX_CHILD_DEPTH),
+            format!(
+                "Completed runs remain eligible for {} days",
+                COMPLETED_RUN_RETENTION_DAYS
+            ),
+            format!(
+                "no verifiable runner become stale after {} hours",
+                UNKNOWN_RUNNER_STALE_AFTER_MS / (60 * 60 * 1_000)
+            ),
+            format!(
+                "verified runner has disappeared becomes stale after {} seconds",
+                MISSING_RUNNER_STALE_AFTER_MS / 1_000
+            ),
+        ];
+        for expected in expected {
+            assert!(
+                docs.contains(&expected),
+                "missing documented limit: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_root_reports_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let fleet = collect_one(&temp.path().join("missing"), 2_000);

@@ -8,7 +8,7 @@ Set Padding 10
 Set Framerate 1
 
 Hide
-Type "./target/release/abtop --demo --theme catppuccin"
+Type "./target/release/ptop --demo --theme catppuccin"
 Enter
 Sleep 3s
 Show

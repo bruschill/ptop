@@ -412,7 +412,7 @@ mod tests {
     use crate::demo::populate_demo;
     use crate::model::{
         FleetExecution, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
-        SessionStatus, SourceHealth,
+        SessionStatus, SourceHealth, TelemetryCompleteness, TelemetryPrecision,
     };
     use crate::theme::Theme;
     use std::time::{Duration, UNIX_EPOCH};
@@ -573,6 +573,90 @@ mod tests {
             "separate_run_aggregate"
         );
         assert!(!json.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn pi_json_distinguishes_unknown_known_zero_inferred_estimated_and_partial() {
+        let mut app = demo_app();
+        app.monitor_mode = crate::app::MonitorMode::Pi;
+        app.token_rate_known = false;
+        let base = app.sessions[0].clone();
+        app.sessions.clear();
+
+        let make_session = |id: &str,
+                            precision: TelemetryPrecision,
+                            completeness: TelemetryCompleteness,
+                            percent: f64,
+                            window: u64,
+                            tokens: u64| {
+            let mut session = base.clone();
+            session.agent_cli = "pi";
+            session.session_id = id.to_string();
+            session.context_percent = percent;
+            session.context_window = window;
+            session.total_input_tokens = tokens;
+            session.total_output_tokens = 0;
+            session.total_cache_read = 0;
+            session.total_cache_create = 0;
+            let mut telemetry = crate::model::SessionTelemetry::process_only(123);
+            telemetry.context.precision = precision;
+            telemetry.context.completeness = completeness;
+            telemetry.context_details.tokens =
+                (precision != TelemetryPrecision::Unknown).then_some(tokens);
+            telemetry.usage.precision = precision;
+            telemetry.usage.completeness = completeness;
+            session.telemetry = Some(telemetry);
+            session
+        };
+
+        app.sessions.push(make_session(
+            "unknown",
+            TelemetryPrecision::Unknown,
+            TelemetryCompleteness::Unknown,
+            0.0,
+            0,
+            0,
+        ));
+        app.sessions.push(make_session(
+            "known-zero",
+            TelemetryPrecision::Exact,
+            TelemetryCompleteness::Complete,
+            0.0,
+            200_000,
+            0,
+        ));
+        app.sessions.push(make_session(
+            "inferred",
+            TelemetryPrecision::Inferred,
+            TelemetryCompleteness::Complete,
+            42.0,
+            200_000,
+            14,
+        ));
+        app.sessions.push(make_session(
+            "estimated-partial",
+            TelemetryPrecision::Estimated,
+            TelemetryCompleteness::Partial,
+            43.0,
+            200_000,
+            15,
+        ));
+
+        let json = serde_json::to_value(app.to_snapshot(2_000)).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert!(sessions[0]["telemetry"]["context"]["percent"].is_null());
+        assert!(sessions[0]["telemetry"]["usage"]["total_tokens"].is_null());
+        assert_eq!(sessions[1]["telemetry"]["context"]["percent"], 0.0);
+        assert_eq!(sessions[1]["telemetry"]["usage"]["total_tokens"], 0);
+        assert_eq!(sessions[1]["telemetry"]["context"]["precision"], "exact");
+        assert_eq!(sessions[2]["telemetry"]["context"]["precision"], "inferred");
+        assert_eq!(sessions[2]["telemetry"]["context"]["percent"], 42.0);
+        assert_eq!(
+            sessions[3]["telemetry"]["context"]["precision"],
+            "estimated"
+        );
+        assert_eq!(sessions[3]["telemetry"]["usage"]["completeness"], "partial");
+        assert_eq!(sessions[3]["telemetry"]["usage"]["total_tokens"], 15);
     }
 
     #[test]
