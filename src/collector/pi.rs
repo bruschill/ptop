@@ -242,6 +242,13 @@ struct HerdrSession {
     status: SessionStatus,
 }
 
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HerdrProcessMarker {
+    pane_id: String,
+    socket_path: String,
+}
+
 #[derive(Default)]
 struct HerdrDiscovery {
     sessions: HashMap<u32, HerdrSession>,
@@ -2190,26 +2197,17 @@ fn collect_children(pid: u32, shared: &SharedProcessData) -> Vec<ChildProcess> {
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn discover_herdr_sessions(live: &HashSet<u32>) -> HerdrDiscovery {
-    if std::env::var_os("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return HerdrDiscovery::default();
-    }
-    let Some(socket_path) = std::env::var("HERDR_SOCKET_PATH").ok() else {
-        return HerdrDiscovery::default();
-    };
     let binary = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let deadline = Instant::now() + Duration::from_millis(HERDR_DISCOVERY_BUDGET_MS);
-    discover_herdr_sessions_with(
-        live,
-        |pid| process_herdr_pane_id(pid, &socket_path),
-        |args| {
-            let remaining = deadline.checked_duration_since(Instant::now())?;
-            run_bounded_herdr_json(
-                &binary,
-                args,
-                remaining.min(Duration::from_millis(HERDR_COMMAND_TIMEOUT_MS)),
-            )
-        },
-    )
+    discover_herdr_sessions_with(live, process_herdr_marker, |marker, args| {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        run_bounded_herdr_json(
+            &binary,
+            &marker.socket_path,
+            args,
+            remaining.min(Duration::from_millis(HERDR_COMMAND_TIMEOUT_MS)),
+        )
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
@@ -2220,32 +2218,30 @@ fn discover_herdr_sessions(_live: &HashSet<u32>) -> HerdrDiscovery {
 #[cfg(any(target_os = "linux", target_vendor = "apple", test))]
 fn discover_herdr_sessions_with<P, F>(
     live: &HashSet<u32>,
-    mut pane_id_for_pid: P,
+    mut marker_for_pid: P,
     mut run: F,
 ) -> HerdrDiscovery
 where
-    P: FnMut(u32) -> Option<String>,
-    F: FnMut(&[String]) -> Option<Value>,
+    P: FnMut(u32) -> Option<HerdrProcessMarker>,
+    F: FnMut(&HerdrProcessMarker, &[String]) -> Option<Value>,
 {
     let mut discovery = HerdrDiscovery::default();
     let mut roots: Vec<u32> = live.iter().copied().collect();
     roots.sort_unstable();
     for pid in roots.into_iter().take(MAX_HERDR_ROOTS) {
-        let Some(pane_id) = pane_id_for_pid(pid) else {
+        let Some(marker) = marker_for_pid(pid) else {
             continue;
         };
-        if pane_id.is_empty() || pane_id.len() > 128 {
-            continue;
-        }
+        let pane_id = &marker.pane_id;
         let pane_args = vec![
             "pane".to_string(),
             "current".to_string(),
             "--pane".to_string(),
             pane_id.clone(),
         ];
-        let Some(first) = run(&pane_args)
+        let Some(first) = run(&marker, &pane_args)
             .as_ref()
-            .and_then(|value| parse_herdr_pane_snapshot(value, &pane_id))
+            .and_then(|value| parse_herdr_pane_snapshot(value, pane_id))
         else {
             continue;
         };
@@ -2255,12 +2251,12 @@ where
             "--pane".to_string(),
             pane_id.clone(),
         ];
-        let process_matches = run(&process_args)
+        let process_matches = run(&marker, &process_args)
             .as_ref()
-            .is_some_and(|value| herdr_process_info_contains(value, &pane_id, pid));
-        let second = run(&pane_args)
+            .is_some_and(|value| herdr_process_info_contains(value, pane_id, pid));
+        let second = run(&marker, &pane_args)
             .as_ref()
-            .and_then(|value| parse_herdr_pane_snapshot(value, &pane_id));
+            .and_then(|value| parse_herdr_pane_snapshot(value, pane_id));
         if !process_matches || second.as_ref().is_none_or(|second| second != &first) {
             discovery.ambiguous.insert(pid);
             continue;
@@ -2325,6 +2321,7 @@ fn herdr_process_info_contains(value: &Value, pane_id: &str, pid: u32) -> bool {
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn run_bounded_herdr_json(
     binary: &std::ffi::OsStr,
+    socket_path: &str,
     args: &[String],
     timeout: Duration,
 ) -> Option<Value> {
@@ -2334,6 +2331,7 @@ fn run_bounded_herdr_json(
     let mut command = std::process::Command::new(binary);
     command
         .args(args)
+        .env("HERDR_SOCKET_PATH", socket_path)
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -2419,16 +2417,23 @@ fn parse_env_value(env: &[u8], name: &[u8], max_len: usize) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple", test))]
-fn parse_herdr_pane_id(env: &[u8], expected_socket_path: &str) -> Option<String> {
-    let socket_path = parse_env_value(env, b"HERDR_SOCKET_PATH=", 4096)?;
-    if socket_path != expected_socket_path {
+fn parse_herdr_process_marker(env: &[u8]) -> Option<HerdrProcessMarker> {
+    if parse_env_value(env, b"HERDR_ENV=", 8)?.as_str() != "1" {
         return None;
     }
-    parse_env_value(env, b"HERDR_PANE_ID=", 128)
+    let pane_id = parse_env_value(env, b"HERDR_PANE_ID=", 128)?;
+    let socket_path = parse_env_value(env, b"HERDR_SOCKET_PATH=", 4096)?;
+    if !Path::new(&socket_path).is_absolute() {
+        return None;
+    }
+    Some(HerdrProcessMarker {
+        pane_id,
+        socket_path,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn process_herdr_pane_id(pid: u32, expected_socket_path: &str) -> Option<String> {
+fn process_herdr_marker(pid: u32) -> Option<HerdrProcessMarker> {
     let file = File::open(format!("/proc/{pid}/environ")).ok()?;
     let mut bytes = Vec::new();
     file.take((MAX_HERDR_ENV_BYTES + 1) as u64)
@@ -2437,11 +2442,11 @@ fn process_herdr_pane_id(pid: u32, expected_socket_path: &str) -> Option<String>
     if bytes.len() > MAX_HERDR_ENV_BYTES {
         return None;
     }
-    parse_herdr_pane_id(&bytes, expected_socket_path)
+    parse_herdr_process_marker(&bytes)
 }
 
 #[cfg(target_vendor = "apple")]
-fn process_herdr_pane_id(pid: u32, expected_socket_path: &str) -> Option<String> {
+fn process_herdr_marker(pid: u32) -> Option<HerdrProcessMarker> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size = 0_usize;
     if unsafe {
@@ -2475,7 +2480,7 @@ fn process_herdr_pane_id(pid: u32, expected_socket_path: &str) -> Option<String>
     }
     bytes.truncate(size);
     let env = macos_process_environment(&bytes)?;
-    parse_herdr_pane_id(env, expected_socket_path)
+    parse_herdr_process_marker(env)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -2837,15 +2842,22 @@ mod tests {
         })
     }
 
-    #[test]
-    fn herdr_process_marker_requires_the_same_server_socket() {
-        let env = b"HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH=/tmp/herdr-a.sock\0";
+    fn herdr_marker() -> HerdrProcessMarker {
+        HerdrProcessMarker {
+            pane_id: "w1X:p1".to_string(),
+            socket_path: "/tmp/herdr.sock".to_string(),
+        }
+    }
 
-        assert_eq!(
-            parse_herdr_pane_id(env, "/tmp/herdr-a.sock").as_deref(),
-            Some("w1X:p1")
-        );
-        assert!(parse_herdr_pane_id(env, "/tmp/herdr-b.sock").is_none());
+    #[test]
+    fn herdr_process_marker_is_autodetected_from_the_pi_process() {
+        let env = b"HERDR_ENV=1\0HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH=/tmp/herdr.sock\0";
+
+        assert_eq!(parse_herdr_process_marker(env), Some(herdr_marker()));
+        assert!(parse_herdr_process_marker(
+            b"HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH=/tmp/herdr.sock\0"
+        )
+        .is_none());
     }
 
     #[test]
@@ -2855,8 +2867,8 @@ mod tests {
         let live = HashSet::from([25835]);
         let discovered = discover_herdr_sessions_with(
             &live,
-            |_pid| Some("w1X:p1".to_string()),
-            |args| match args {
+            |_pid| Some(herdr_marker()),
+            |_marker, args| match args {
                 [scope, action, flag, pane]
                     if scope == "pane"
                         && action == "current"
@@ -2897,8 +2909,8 @@ mod tests {
         let pane_reads = Cell::new(0);
         let discovered = discover_herdr_sessions_with(
             &HashSet::from([10]),
-            |_pid| Some("w1X:p1".to_string()),
-            |args| {
+            |_pid| Some(herdr_marker()),
+            |_marker, args| {
                 if args.get(1).map(String::as_str) == Some("process-info") {
                     return Some(herdr_process_info(10));
                 }
@@ -2935,6 +2947,7 @@ mod tests {
         let started = Instant::now();
         assert!(run_bounded_herdr_json(
             script.as_os_str(),
+            "/tmp/herdr.sock",
             &["sleep".to_string()],
             Duration::from_millis(50),
         )
@@ -2942,6 +2955,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(run_bounded_herdr_json(
             script.as_os_str(),
+            "/tmp/herdr.sock",
             &["oversized".to_string()],
             Duration::from_secs(1),
         )

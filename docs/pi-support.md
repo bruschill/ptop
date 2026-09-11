@@ -18,7 +18,8 @@ A Pi process row always remains visible. Failed, incomplete, conflicting, or uns
 
 - `process only` means no owned session JSONL is attached.
 - `attached` means ownership passed the high-confidence identity checks.
-- In Herdr, ptop accepts a session path only when the Pi process names the pane, Herdr reports that PID in the pane's foreground process group, and two pane snapshots have the same session path and revision.
+- ptop autodetects Herdr from each Pi process's pane ID and socket path, so ptop itself can run inside or outside Herdr without extra environment variables.
+- ptop accepts a Herdr session path only when Herdr reports that PID in the pane's foreground process group and two pane snapshots have the same session path and revision.
 - Herdr `working` maps to executing; `idle`, `done`, and `blocked` map to waiting.
 - Unknown values render as `—`, not zero.
 - `~` marks inferred values.
