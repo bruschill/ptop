@@ -2842,22 +2842,37 @@ mod tests {
         })
     }
 
+    fn herdr_test_socket() -> &'static str {
+        if cfg!(windows) {
+            r"C:\herdr.sock"
+        } else {
+            "/tmp/herdr.sock"
+        }
+    }
+
     fn herdr_marker() -> HerdrProcessMarker {
         HerdrProcessMarker {
             pane_id: "w1X:p1".to_string(),
-            socket_path: "/tmp/herdr.sock".to_string(),
+            socket_path: herdr_test_socket().to_string(),
         }
     }
 
     #[test]
     fn herdr_process_marker_is_autodetected_from_the_pi_process() {
-        let env = b"HERDR_ENV=1\0HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH=/tmp/herdr.sock\0";
+        let env = format!(
+            "HERDR_ENV=1\0HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH={}\0",
+            herdr_test_socket()
+        );
+        let incomplete = format!(
+            "HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH={}\0",
+            herdr_test_socket()
+        );
 
-        assert_eq!(parse_herdr_process_marker(env), Some(herdr_marker()));
-        assert!(parse_herdr_process_marker(
-            b"HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH=/tmp/herdr.sock\0"
-        )
-        .is_none());
+        assert_eq!(
+            parse_herdr_process_marker(env.as_bytes()),
+            Some(herdr_marker())
+        );
+        assert!(parse_herdr_process_marker(incomplete.as_bytes()).is_none());
     }
 
     #[test]
@@ -2897,6 +2912,72 @@ mod tests {
                 status: SessionStatus::Executing,
             })
         );
+    }
+
+    #[test]
+    fn herdr_discovery_routes_each_process_through_its_own_server_socket() {
+        use std::cell::RefCell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = RefCell::new(Vec::new());
+        let live = HashSet::from([10, 20]);
+        let discovered = discover_herdr_sessions_with(
+            &live,
+            |pid| {
+                Some(HerdrProcessMarker {
+                    pane_id: format!("pane-{pid}"),
+                    socket_path: dir
+                        .path()
+                        .join(format!("herdr-{pid}.sock"))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+            },
+            |marker, args| {
+                let pid: u32 = marker.pane_id.strip_prefix("pane-")?.parse().ok()?;
+                calls
+                    .borrow_mut()
+                    .push((pid, marker.socket_path.clone(), args[1].clone()));
+                if args.get(1).map(String::as_str) == Some("process-info") {
+                    return Some(serde_json::json!({
+                        "result": {
+                            "process_info": {
+                                "foreground_processes": [{"pid": pid}],
+                                "pane_id": marker.pane_id
+                            }
+                        }
+                    }));
+                }
+                Some(serde_json::json!({
+                    "result": {
+                        "pane": {
+                            "agent": "pi",
+                            "agent_session": {
+                                "agent": "pi",
+                                "kind": "path",
+                                "source": "herdr:pi",
+                                "value": dir.path().join(format!("session-{pid}.jsonl"))
+                            },
+                            "agent_status": "working",
+                            "pane_id": marker.pane_id,
+                            "revision": 1
+                        }
+                    }
+                }))
+            },
+        );
+
+        assert_eq!(discovered.sessions.len(), 2);
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 6);
+        for (pid, socket_path, _action) in calls {
+            assert_eq!(
+                socket_path,
+                dir.path()
+                    .join(format!("herdr-{pid}.sock"))
+                    .to_string_lossy()
+            );
+        }
     }
 
     #[test]
