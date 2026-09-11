@@ -6,8 +6,8 @@ ptop discovers local Pi processes by default, then attaches telemetry only when 
 
 | Platform | Process discovery | Owned session telemetry | Controls |
 | --- | --- | --- | --- |
-| macOS | Supported and tested | Supported through a Pi process's directly open session JSONL file | Terminal jump and kill require the existing backend-specific identity checks |
-| Linux | Supported and tested | Supported through bounded `/proc` environment markers or directly open session JSONL files | tmux jump and kill require the existing identity checks |
+| macOS | Supported and tested | Supported through a directly open session JSONL file or a validated Herdr pane claim | Terminal jump and kill require the existing backend-specific identity checks |
+| Linux | Supported and tested | Supported through bounded `/proc` environment markers, directly open session JSONL files, or a validated Herdr pane claim | tmux jump and kill require the existing identity checks |
 | Windows | Supported and tested | Process-only | Pi terminal jump and kill are disabled |
 
 Windows stays process-only until the process layer exposes a trustworthy working directory and process-start identity. Other platforms are not part of the release-tested Pi contract.
@@ -18,6 +18,8 @@ A Pi process row always remains visible. Failed, incomplete, conflicting, or uns
 
 - `process only` means no owned session JSONL is attached.
 - `attached` means ownership passed the high-confidence identity checks.
+- In Herdr, ptop accepts a session path only when the Pi process names the pane, Herdr reports that PID in the pane's foreground process group, and two pane snapshots have the same session path and revision.
+- Herdr `working` maps to executing; `idle`, `done`, and `blocked` map to waiting.
 - Unknown values render as `—`, not zero.
 - `~` marks inferred values.
 - `≈` marks estimated values.
@@ -49,6 +51,7 @@ The limits below are release contracts. Exceeding a limit keeps the process row 
 - 128 attachment candidates per collection tick.
 - 128 Pi processes considered for attachment per collection tick.
 - 4096 open file descriptors per collection tick.
+- Herdr discovery checks at most 32 Pi roots per refresh, reads at most 256 KiB per command, allows 300 ms per command, and stops after 1 second total.
 - No retained partial-line buffer. An incomplete final line is reread from its newline boundary on the next tick.
 - Model catalog files are capped at 2 MiB and 1024 retained model entries.
 - Tail and model caches are removed when their owned live attachment disappears.
