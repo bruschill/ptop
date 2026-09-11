@@ -216,8 +216,6 @@ The JSON snapshot includes `monitor_mode`, `token_rate_value`, and structured Pi
 
 ptop grew from [graykode/abtop](https://github.com/graykode/abtop). Pi agent support started in [graykode/abtop#63](https://github.com/graykode/abtop/pull/63), opened by [@ptahdunbar](https://github.com/ptahdunbar).
 
-Huge thanks to [@tbouquet](https://github.com/tbouquet) for driving much of ptop's recent shape: themes, config overlay and panel toggles, session filtering, subagent tree view, the context window gauge with compaction detection, and many fixes and security improvements.
-
 ## License
 
 MIT
