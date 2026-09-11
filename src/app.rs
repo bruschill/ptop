@@ -981,8 +981,10 @@ impl App {
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
     /// Done sessions skip pending state to avoid stuck "..." display.
     pub fn session_summary(&self, session: &AgentSession) -> String {
-        if session.telemetry.is_some() && session.agent_cli == "pi" {
-            return "process only".to_string();
+        if session.agent_cli == "pi" {
+            if let Some(telemetry) = session.telemetry.as_ref() {
+                return telemetry.attachment.label().to_string();
+            }
         }
         if let Some(summary) = self.summaries.get(&session.session_id) {
             summary.clone()
@@ -1326,6 +1328,23 @@ mod tests {
         assert!(!app.show_quota);
         assert!(!app.show_mcp);
         assert!(!app.summaries_enabled());
+    }
+
+    #[test]
+    fn pi_summary_reports_attachment_state() {
+        let app = App::new_pi(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("pi");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        session.telemetry = Some(telemetry.clone());
+        assert_eq!(app.session_summary(&session), "process only");
+
+        telemetry.attachment = crate::model::AttachmentState::Attached;
+        session.telemetry = Some(telemetry);
+        assert_eq!(app.session_summary(&session), "attached");
     }
 
     #[test]

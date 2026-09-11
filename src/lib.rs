@@ -929,22 +929,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let filename = OsString::from_vec(vec![b't', 0xff, b'.', b't']);
         let path = directory.path().join(&filename);
-        std::fs::write(&path, include_str!("theme/builtins/btop.toml")).unwrap();
+        let write_result = std::fs::write(&path, include_str!("theme/builtins/btop.toml"));
         let request = theme_request_from_args(&[
             OsString::from("ptop"),
             OsString::from("--theme-file"),
             filename,
         ])
         .unwrap();
-        let loaded = resolve_initial_theme(
+        let load_result = resolve_initial_theme(
             request,
             &config::AppConfig::default(),
             directory.path(),
             None,
             None,
-        )
-        .unwrap();
-        assert_eq!(loaded.source, theme::ThemeSource::File { path });
+        );
+
+        match write_result {
+            Ok(()) => assert_eq!(
+                load_result.unwrap().source,
+                theme::ThemeSource::File { path }
+            ),
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                {
+                    assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+                    let load_error = load_result.unwrap_err();
+                    assert!(load_error.contains("theme file"), "{load_error}");
+                }
+                #[cfg(not(target_os = "macos"))]
+                panic!("failed to create non-UTF-8 theme filename: {error}");
+            }
+        }
     }
 
     #[test]

@@ -12,8 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::process::Stdio;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_TAIL_WORK_BYTES: usize = 2 * 1024 * 1024;
@@ -21,6 +23,16 @@ const MAX_TAIL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_ATTACHMENT_CANDIDATES_PER_COLLECT: usize = 128;
 const MAX_PROCESSES_SCANNED_PER_COLLECT: usize = 128;
 const MAX_OPEN_FDS_SCANNED_PER_COLLECT: usize = 4096;
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+const MAX_HERDR_ROOTS: usize = 32;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const MAX_HERDR_JSON_BYTES: usize = 256 * 1024;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const MAX_HERDR_ENV_BYTES: usize = 256 * 1024;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const HERDR_COMMAND_TIMEOUT_MS: u64 = 300;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const HERDR_DISCOVERY_BUDGET_MS: u64 = 1_000;
 #[cfg(target_vendor = "apple")]
 const MAX_LSOF_RECORD_BYTES: usize = 4096;
 const HEADER_READ_CHUNK_BYTES: usize = 4096;
@@ -41,6 +53,9 @@ pub struct PiCollector {
     cwd_cache: HashMap<u32, String>,
     start_id_cache: HashMap<u32, Option<String>>,
     attachments: HashMap<u32, PiAttachment>,
+    herdr_sessions: HashMap<u32, HerdrSession>,
+    herdr_ambiguous: HashSet<u32>,
+    herdr_sessions_initialized: bool,
     tails: HashMap<PathBuf, PiTail>,
     model_catalogs: HashMap<PathBuf, ModelCatalogCache>,
     subagents: PiSubagentsCollector,
@@ -221,6 +236,33 @@ struct AttachmentResult {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct HerdrSession {
+    path: PathBuf,
+    status: SessionStatus,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HerdrProcessMarker {
+    pane_id: String,
+    socket_path: String,
+}
+
+#[derive(Default)]
+struct HerdrDiscovery {
+    sessions: HashMap<u32, HerdrSession>,
+    ambiguous: HashSet<u32>,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+#[derive(Debug, Clone, PartialEq)]
+struct HerdrPaneSnapshot {
+    path: PathBuf,
+    revision: u64,
+    status: SessionStatus,
+}
+
 impl PiCollector {
     pub fn new() -> Self {
         Self {
@@ -228,6 +270,9 @@ impl PiCollector {
             cwd_cache: HashMap::new(),
             start_id_cache: HashMap::new(),
             attachments: HashMap::new(),
+            herdr_sessions: HashMap::new(),
+            herdr_ambiguous: HashSet::new(),
+            herdr_sessions_initialized: false,
             tails: HashMap::new(),
             model_catalogs: HashMap::new(),
             subagents: PiSubagentsCollector::new(),
@@ -241,6 +286,8 @@ impl PiCollector {
         self.cwd_cache.retain(|pid, _| live.contains(pid));
         self.start_id_cache.retain(|pid, _| live.contains(pid));
         self.attachments.retain(|pid, _| live.contains(pid));
+        self.herdr_sessions.retain(|pid, _| live.contains(pid));
+        self.herdr_ambiguous.retain(|pid| live.contains(pid));
 
         let observed_at_ms = current_time_ms();
         for pid in &pi_pids {
@@ -253,6 +300,8 @@ impl PiCollector {
                 self.first_seen_ms.remove(pid);
                 self.cwd_cache.remove(pid);
                 self.attachments.remove(pid);
+                self.herdr_sessions.remove(pid);
+                self.herdr_ambiguous.remove(pid);
             }
             self.start_id_cache.insert(*pid, start_id);
             self.first_seen_ms.entry(*pid).or_insert(observed_at_ms);
@@ -260,6 +309,12 @@ impl PiCollector {
                 let cwd = process_cwd(*pid).unwrap_or_default();
                 self.cwd_cache.insert(*pid, cwd);
             }
+        }
+        if !self.herdr_sessions_initialized || shared.slow_tick {
+            let discovery = discover_herdr_sessions(&live);
+            self.herdr_sessions = discovery.sessions;
+            self.herdr_ambiguous = discovery.ambiguous;
+            self.herdr_sessions_initialized = true;
         }
 
         let mut read_budget = MAX_TAIL_WORK_BYTES;
@@ -313,6 +368,11 @@ impl PiCollector {
             .filter_map(|pid| {
                 let proc = shared.process_info.get(&pid)?;
                 let cwd = self.cwd_cache.get(&pid).cloned().unwrap_or_default();
+                let status = self
+                    .herdr_sessions
+                    .get(&pid)
+                    .map(|session| session.status.clone())
+                    .unwrap_or(SessionStatus::Unknown);
                 let project_name = process::last_path_segment(&cwd)
                     .filter(|name| !name.is_empty())
                     .map(str::to_string)
@@ -367,7 +427,7 @@ impl PiCollector {
                         .get(&pid)
                         .copied()
                         .unwrap_or(observed_at_ms),
-                    status: SessionStatus::Unknown,
+                    status,
                     model: data.model.clone(),
                     effort: data.effort.clone(),
                     context_percent: match (data.context_tokens, data.context_window) {
@@ -439,6 +499,17 @@ impl PiCollector {
         };
         for &root in roots {
             let mut discovered = Vec::new();
+            if let Some(session) = self.herdr_sessions.get(&root) {
+                if discovery_budget.candidate_slots == 0 {
+                    candidate_limit_roots.insert(root);
+                } else {
+                    discovered.push(AttachmentCandidate {
+                        path: session.path.clone(),
+                        expected_session_id: None,
+                    });
+                    discovery_budget.candidate_slots -= 1;
+                }
+            }
             if let Some(attachment) = self.attachments.get(&root) {
                 if attachment.start_id == self.start_id_cache.get(&root).cloned().flatten() {
                     if discovery_budget.candidate_slots == 0 {
@@ -469,6 +540,15 @@ impl PiCollector {
             .into_iter()
             .map(|root| (root, "session candidate limit exceeded".to_string()))
             .collect();
+        for root in roots
+            .iter()
+            .filter(|root| self.herdr_ambiguous.contains(root))
+        {
+            errors.insert(
+                *root,
+                "Herdr pane ownership changed during session discovery".to_string(),
+            );
+        }
         for &root in roots {
             let cwd = self
                 .cwd_cache
@@ -2115,6 +2195,314 @@ fn collect_children(pid: u32, shared: &SharedProcessData) -> Vec<ChildProcess> {
     children
 }
 
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn discover_herdr_sessions(live: &HashSet<u32>) -> HerdrDiscovery {
+    let binary = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let deadline = Instant::now() + Duration::from_millis(HERDR_DISCOVERY_BUDGET_MS);
+    discover_herdr_sessions_with(live, process_herdr_marker, |marker, args| {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        run_bounded_herdr_json(
+            &binary,
+            &marker.socket_path,
+            args,
+            remaining.min(Duration::from_millis(HERDR_COMMAND_TIMEOUT_MS)),
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn discover_herdr_sessions(_live: &HashSet<u32>) -> HerdrDiscovery {
+    HerdrDiscovery::default()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+fn discover_herdr_sessions_with<P, F>(
+    live: &HashSet<u32>,
+    mut marker_for_pid: P,
+    mut run: F,
+) -> HerdrDiscovery
+where
+    P: FnMut(u32) -> Option<HerdrProcessMarker>,
+    F: FnMut(&HerdrProcessMarker, &[String]) -> Option<Value>,
+{
+    let mut discovery = HerdrDiscovery::default();
+    let mut roots: Vec<u32> = live.iter().copied().collect();
+    roots.sort_unstable();
+    for pid in roots.into_iter().take(MAX_HERDR_ROOTS) {
+        let Some(marker) = marker_for_pid(pid) else {
+            continue;
+        };
+        let pane_id = &marker.pane_id;
+        let pane_args = vec![
+            "pane".to_string(),
+            "current".to_string(),
+            "--pane".to_string(),
+            pane_id.clone(),
+        ];
+        let Some(first) = run(&marker, &pane_args)
+            .as_ref()
+            .and_then(|value| parse_herdr_pane_snapshot(value, pane_id))
+        else {
+            continue;
+        };
+        let process_args = vec![
+            "pane".to_string(),
+            "process-info".to_string(),
+            "--pane".to_string(),
+            pane_id.clone(),
+        ];
+        let process_matches = run(&marker, &process_args)
+            .as_ref()
+            .is_some_and(|value| herdr_process_info_contains(value, pane_id, pid));
+        let second = run(&marker, &pane_args)
+            .as_ref()
+            .and_then(|value| parse_herdr_pane_snapshot(value, pane_id));
+        if !process_matches || second.as_ref().is_none_or(|second| second != &first) {
+            discovery.ambiguous.insert(pid);
+            continue;
+        }
+        discovery.sessions.insert(
+            pid,
+            HerdrSession {
+                path: first.path,
+                status: first.status,
+            },
+        );
+    }
+    discovery
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+fn parse_herdr_pane_snapshot(value: &Value, pane_id: &str) -> Option<HerdrPaneSnapshot> {
+    let pane = value.pointer("/result/pane")?;
+    if pane.get("pane_id").and_then(Value::as_str) != Some(pane_id)
+        || pane.get("agent").and_then(Value::as_str) != Some("pi")
+    {
+        return None;
+    }
+    let session = pane.get("agent_session")?;
+    if session.get("agent").and_then(Value::as_str) != Some("pi")
+        || session.get("source").and_then(Value::as_str) != Some("herdr:pi")
+        || session.get("kind").and_then(Value::as_str) != Some("path")
+    {
+        return None;
+    }
+    let path = session.get("value").and_then(Value::as_str)?;
+    if path.len() > 4096 || !Path::new(path).is_absolute() {
+        return None;
+    }
+    let status = match pane.get("agent_status").and_then(Value::as_str) {
+        Some("working") => SessionStatus::Executing,
+        Some("idle" | "done" | "blocked") => SessionStatus::Waiting,
+        _ => SessionStatus::Unknown,
+    };
+    Some(HerdrPaneSnapshot {
+        path: PathBuf::from(path),
+        revision: pane.get("revision").and_then(Value::as_u64)?,
+        status,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+fn herdr_process_info_contains(value: &Value, pane_id: &str, pid: u32) -> bool {
+    value.pointer("/result/process_info").is_some_and(|info| {
+        info.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+            && info
+                .get("foreground_processes")
+                .and_then(Value::as_array)
+                .is_some_and(|processes| {
+                    processes.iter().any(|process| {
+                        process.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
+                    })
+                })
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn run_bounded_herdr_json(
+    binary: &std::ffi::OsStr,
+    socket_path: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<Value> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(args)
+        .env("HERDR_SOCKET_PATH", socket_path)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+        return None;
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    let mut status = None;
+    let mut eof = false;
+    let mut failed = false;
+    while !eof || status.is_none() {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    if bytes.len().saturating_add(count) > MAX_HERDR_JSON_BYTES {
+                        failed = true;
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            break;
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(child_status) => status = child_status,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if (!eof || status.is_none()) && Instant::now() >= deadline {
+            failed = true;
+            break;
+        }
+        if !eof || status.is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    if failed {
+        let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+    if status.is_none() {
+        status = child.wait().ok();
+    }
+    if failed || status.is_none_or(|status| !status.success()) {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+fn parse_env_value(env: &[u8], name: &[u8], max_len: usize) -> Option<String> {
+    env.split(|byte| *byte == 0).find_map(|entry| {
+        let value = entry.strip_prefix(name)?;
+        if value.is_empty() || value.len() > max_len {
+            return None;
+        }
+        std::str::from_utf8(value).ok().map(str::to_string)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple", test))]
+fn parse_herdr_process_marker(env: &[u8]) -> Option<HerdrProcessMarker> {
+    if parse_env_value(env, b"HERDR_ENV=", 8)?.as_str() != "1" {
+        return None;
+    }
+    let pane_id = parse_env_value(env, b"HERDR_PANE_ID=", 128)?;
+    let socket_path = parse_env_value(env, b"HERDR_SOCKET_PATH=", 4096)?;
+    if !Path::new(&socket_path).is_absolute() {
+        return None;
+    }
+    Some(HerdrProcessMarker {
+        pane_id,
+        socket_path,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_herdr_marker(pid: u32) -> Option<HerdrProcessMarker> {
+    let file = File::open(format!("/proc/{pid}/environ")).ok()?;
+    let mut bytes = Vec::new();
+    file.take((MAX_HERDR_ENV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_HERDR_ENV_BYTES {
+        return None;
+    }
+    parse_herdr_process_marker(&bytes)
+}
+
+#[cfg(target_vendor = "apple")]
+fn process_herdr_marker(pid: u32) -> Option<HerdrProcessMarker> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0_usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size == 0
+        || size > MAX_HERDR_ENV_BYTES
+    {
+        return None;
+    }
+    let mut bytes = vec![0_u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(size);
+    let env = macos_process_environment(&bytes)?;
+    parse_herdr_process_marker(env)
+}
+
+#[cfg(target_vendor = "apple")]
+fn macos_process_environment(procargs: &[u8]) -> Option<&[u8]> {
+    let argc = i32::from_ne_bytes(procargs.get(..4)?.try_into().ok()?);
+    if !(0..=4096).contains(&argc) {
+        return None;
+    }
+    let mut offset = 4;
+    offset += procargs.get(offset..)?.iter().position(|byte| *byte == 0)? + 1;
+    while procargs.get(offset) == Some(&0) {
+        offset += 1;
+    }
+    for _ in 0..argc {
+        offset += procargs.get(offset..)?.iter().position(|byte| *byte == 0)? + 1;
+    }
+    while procargs.get(offset) == Some(&0) {
+        offset += 1;
+    }
+    procargs.get(offset..)
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_session_marker(env: &[u8]) -> Option<(PathBuf, String)> {
     let mut path = None;
@@ -2424,6 +2812,317 @@ mod tests {
         }
     }
 
+    fn herdr_pane(path: &Path, revision: u64, status: &str) -> Value {
+        serde_json::json!({
+            "result": {
+                "pane": {
+                    "agent": "pi",
+                    "agent_session": {
+                        "agent": "pi",
+                        "kind": "path",
+                        "source": "herdr:pi",
+                        "value": path
+                    },
+                    "agent_status": status,
+                    "pane_id": "w1X:p1",
+                    "revision": revision
+                }
+            }
+        })
+    }
+
+    fn herdr_process_info(pid: u32) -> Value {
+        serde_json::json!({
+            "result": {
+                "process_info": {
+                    "foreground_processes": [{"pid": pid}, {"pid": 26131}],
+                    "pane_id": "w1X:p1"
+                }
+            }
+        })
+    }
+
+    fn herdr_test_socket() -> &'static str {
+        if cfg!(windows) {
+            r"C:\herdr.sock"
+        } else {
+            "/tmp/herdr.sock"
+        }
+    }
+
+    fn herdr_marker() -> HerdrProcessMarker {
+        HerdrProcessMarker {
+            pane_id: "w1X:p1".to_string(),
+            socket_path: herdr_test_socket().to_string(),
+        }
+    }
+
+    #[test]
+    fn herdr_process_marker_is_autodetected_from_the_pi_process() {
+        let env = format!(
+            "HERDR_ENV=1\0HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH={}\0",
+            herdr_test_socket()
+        );
+        let incomplete = format!(
+            "HERDR_PANE_ID=w1X:p1\0HERDR_SOCKET_PATH={}\0",
+            herdr_test_socket()
+        );
+
+        assert_eq!(
+            parse_herdr_process_marker(env.as_bytes()),
+            Some(herdr_marker())
+        );
+        assert!(parse_herdr_process_marker(incomplete.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn herdr_discovery_maps_stable_pi_session_and_status_to_owning_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("pi-session.jsonl");
+        let live = HashSet::from([25835]);
+        let discovered = discover_herdr_sessions_with(
+            &live,
+            |_pid| Some(herdr_marker()),
+            |_marker, args| match args {
+                [scope, action, flag, pane]
+                    if scope == "pane"
+                        && action == "current"
+                        && flag == "--pane"
+                        && pane == "w1X:p1" =>
+                {
+                    Some(herdr_pane(&session_path, 7, "working"))
+                }
+                [scope, action, flag, pane]
+                    if scope == "pane"
+                        && action == "process-info"
+                        && flag == "--pane"
+                        && pane == "w1X:p1" =>
+                {
+                    Some(herdr_process_info(25835))
+                }
+                _ => None,
+            },
+        );
+
+        assert!(discovered.ambiguous.is_empty());
+        assert_eq!(
+            discovered.sessions.get(&25835),
+            Some(&HerdrSession {
+                path: session_path,
+                status: SessionStatus::Executing,
+            })
+        );
+    }
+
+    #[test]
+    fn herdr_discovery_routes_each_process_through_its_own_server_socket() {
+        use std::cell::RefCell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = RefCell::new(Vec::new());
+        let live = HashSet::from([10, 20]);
+        let discovered = discover_herdr_sessions_with(
+            &live,
+            |pid| {
+                Some(HerdrProcessMarker {
+                    pane_id: format!("pane-{pid}"),
+                    socket_path: dir
+                        .path()
+                        .join(format!("herdr-{pid}.sock"))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+            },
+            |marker, args| {
+                let pid: u32 = marker.pane_id.strip_prefix("pane-")?.parse().ok()?;
+                calls
+                    .borrow_mut()
+                    .push((pid, marker.socket_path.clone(), args[1].clone()));
+                if args.get(1).map(String::as_str) == Some("process-info") {
+                    return Some(serde_json::json!({
+                        "result": {
+                            "process_info": {
+                                "foreground_processes": [{"pid": pid}],
+                                "pane_id": marker.pane_id
+                            }
+                        }
+                    }));
+                }
+                Some(serde_json::json!({
+                    "result": {
+                        "pane": {
+                            "agent": "pi",
+                            "agent_session": {
+                                "agent": "pi",
+                                "kind": "path",
+                                "source": "herdr:pi",
+                                "value": dir.path().join(format!("session-{pid}.jsonl"))
+                            },
+                            "agent_status": "working",
+                            "pane_id": marker.pane_id,
+                            "revision": 1
+                        }
+                    }
+                }))
+            },
+        );
+
+        assert_eq!(discovered.sessions.len(), 2);
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 6);
+        for (pid, socket_path, _action) in calls {
+            assert_eq!(
+                socket_path,
+                dir.path()
+                    .join(format!("herdr-{pid}.sock"))
+                    .to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn herdr_pane_restart_is_ambiguous() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.jsonl");
+        let second_path = dir.path().join("second.jsonl");
+        let pane_reads = Cell::new(0);
+        let discovered = discover_herdr_sessions_with(
+            &HashSet::from([10]),
+            |_pid| Some(herdr_marker()),
+            |_marker, args| {
+                if args.get(1).map(String::as_str) == Some("process-info") {
+                    return Some(herdr_process_info(10));
+                }
+                let count = pane_reads.get();
+                pane_reads.set(count + 1);
+                Some(if count == 0 {
+                    herdr_pane(&first_path, 7, "working")
+                } else {
+                    herdr_pane(&second_path, 8, "idle")
+                })
+            },
+        );
+
+        assert!(discovered.sessions.is_empty());
+        assert_eq!(discovered.ambiguous, HashSet::from([10]));
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn herdr_command_runner_bounds_time_and_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-herdr");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = sleep ]; then sleep 2; printf '{}\\n'; exit; fi\nprintf '{\"padding\":\"'\ndd if=/dev/zero bs=1024 count=300 2>/dev/null | tr '\\000' x\nprintf '\"}\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let started = Instant::now();
+        assert!(run_bounded_herdr_json(
+            script.as_os_str(),
+            "/tmp/herdr.sock",
+            &["sleep".to_string()],
+            Duration::from_millis(50),
+        )
+        .is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(run_bounded_herdr_json(
+            script.as_os_str(),
+            "/tmp/herdr.sock",
+            &["oversized".to_string()],
+            Duration::from_secs(1),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn herdr_reported_session_attaches_without_an_open_jsonl_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = session_file(&dir, "herdr-session", &cwd);
+        let shared = shared(vec![proc(10, 1, "pi")]);
+        let mut collector = PiCollector::new();
+        collector.cwd_cache.insert(10, cwd);
+        collector.start_id_cache.insert(10, None);
+        collector.herdr_sessions.insert(
+            10,
+            HerdrSession {
+                path: path.clone(),
+                status: SessionStatus::Executing,
+            },
+        );
+
+        let result = collector.resolve_attachments(&[10], &shared);
+
+        assert_eq!(
+            result
+                .get(&10)
+                .and_then(|result| result.attachment.as_ref())
+                .map(|attachment| attachment.path.clone()),
+            Some(fs::canonicalize(path).unwrap())
+        );
+    }
+
+    #[test]
+    fn ambiguous_herdr_claim_blocks_a_cached_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = session_file(&dir, "herdr-session", &cwd);
+        let shared = shared(vec![proc(10, 1, "pi")]);
+        let mut collector = PiCollector::new();
+        collector.cwd_cache.insert(10, cwd);
+        collector.start_id_cache.insert(10, None);
+        collector.herdr_sessions.insert(
+            10,
+            HerdrSession {
+                path,
+                status: SessionStatus::Executing,
+            },
+        );
+        assert!(collector
+            .resolve_attachments(&[10], &shared)
+            .get(&10)
+            .is_some_and(|result| result.attachment.is_some()));
+
+        collector.herdr_sessions.clear();
+        collector.herdr_ambiguous.insert(10);
+        let result = collector.resolve_attachments(&[10], &shared);
+
+        assert!(result
+            .get(&10)
+            .is_some_and(|result| result.attachment.is_none()));
+    }
+
+    #[test]
+    fn pid_reuse_drops_cached_herdr_ownership() {
+        let pid = u32::MAX;
+        let mut collector = PiCollector::new();
+        collector
+            .start_id_cache
+            .insert(pid, Some("stale-start".to_string()));
+        collector.cwd_cache.insert(pid, "/tmp".to_string());
+        collector.herdr_sessions.insert(
+            pid,
+            HerdrSession {
+                path: PathBuf::from("/tmp/stale.jsonl"),
+                status: SessionStatus::Executing,
+            },
+        );
+        collector.herdr_sessions_initialized = true;
+
+        collector.collect_sessions(&shared(vec![proc(pid, 1, "pi")]));
+
+        assert!(!collector.herdr_sessions.contains_key(&pid));
+    }
+
     #[test]
     fn matches_supported_pi_launches() {
         assert!(is_pi_command("pi"));
@@ -2513,6 +3212,9 @@ mod tests {
         assert_eq!(process_open_jsonl_paths(42, 8, 128), (Vec::new(), 0, false));
         assert!(process_cwd(42).is_none());
         assert!(process_start_id(42).is_none());
+        assert!(discover_herdr_sessions(&HashSet::from([42]))
+            .sessions
+            .is_empty());
     }
 
     #[test]
