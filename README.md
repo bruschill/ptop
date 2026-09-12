@@ -4,6 +4,10 @@
 
 ptop is a local terminal monitor for Pi processes, owned session telemetry, fleet runs, child processes, listening ports, and project state.
 
+![ptop demo using the madeofcode theme](https://raw.githubusercontent.com/bruschill/ptop/main/assets/demo.png)
+
+The demo uses the user-created [madeofcode](https://github.com/bruschill/madeofcode) theme.
+
 ## What ptop shows
 
 - Pi sessions with status, model, thinking level, context, tokens, memory, and current telemetry state.
@@ -88,7 +92,31 @@ Use `--theme <name>` or set `theme` in the configuration file. Packaged themes:
 
 `btop`, `dracula`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`, `light`, and `white`.
 
-Use `--theme-file <path>` for a custom Theme Format v1 file. See [Theme files](docs/themes.md).
+| btop (default) | dracula | catppuccin |
+|:-:|:-:|:-:|
+| ![btop](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/btop.png) | ![dracula](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/dracula.png) | ![catppuccin](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/catppuccin.png) |
+
+| tokyo-night | gruvbox | nord |
+|:-:|:-:|:-:|
+| ![tokyo-night](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/tokyo-night.png) | ![gruvbox](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/gruvbox.png) | ![nord](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/nord.png) |
+
+Colorblind-friendly themes:
+
+| high-contrast | protanopia |
+|:-:|:-:|
+| ![high-contrast](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/high-contrast.png) | ![protanopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/protanopia.png) |
+
+| deuteranopia | tritanopia |
+|:-:|:-:|
+| ![deuteranopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/deuteranopia.png) | ![tritanopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/tritanopia.png) |
+
+Light themes (`light`, a Solarized cream theme, and `white`, a GitHub-style pure white theme):
+
+| light | white |
+|:-:|:-:|
+| ![light](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/light.png) | ![white](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/white.png) |
+
+You can create your own theme as a Theme Format v1 TOML file and load it with `--theme-file <path>`. See [Theme files](docs/themes.md).
 
 ## Configuration
 
