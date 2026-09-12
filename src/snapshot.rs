@@ -8,14 +8,13 @@
 //! audit and full transcripts are still omitted to keep the payload small.
 //!
 //! This is a pure read: [`App::to_snapshot`] never ticks or spawns anything.
-//! Call it after [`App::tick_no_summaries`] (or `tick`) on a background thread.
+//! Call it after [`App::tick`] on a background thread.
 
 use crate::app::App;
-use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
     AttachmentConfidence, AttachmentState, ChatRole, ChildProcess, ContextTelemetryDetails,
-    FleetTelemetry, OrphanPort, RateLimitInfo, SessionStatus, SourceHealth, TelemetryMetadata,
+    FleetTelemetry, OrphanPort, SessionStatus, SourceHealth, TelemetryMetadata,
     UsageTelemetryDetails, MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
@@ -24,8 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Top-level snapshot returned by [`App::to_snapshot`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
-    /// Active product collector mode.
-    pub monitor_mode: crate::app::MonitorMode,
     /// Unix-epoch milliseconds when this snapshot was built.
     pub generated_at_ms: u64,
     /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
@@ -46,16 +43,12 @@ pub struct Snapshot {
     /// Collector tick interval in milliseconds. Divide `token_rate` by
     /// `interval_ms / 1000` for a per-second rate.
     pub interval_ms: u64,
-    /// Live agent sessions, newest first (same order as the TUI).
+    /// Live Pi sessions, newest first (same order as the TUI).
     pub sessions: Vec<SessionView>,
-    /// Account-level rate limits (Claude, Codex, …).
-    pub rate_limits: Vec<RateLimitInfo>,
     /// Ports left open by processes whose parent session has ended. Empty on a
     /// one-shot snapshot — orphan detection needs cross-tick history, so it
     /// only populates for a long-running monitor.
     pub orphan_ports: Vec<OrphanPort>,
-    /// Detected MCP servers (currently `codex mcp-server`).
-    pub mcp_servers: Vec<McpServerView>,
 }
 
 /// One chat line from the transcript tail (detail view only).
@@ -210,26 +203,6 @@ pub struct SessionView {
     pub telemetry: Option<SessionTelemetryView>,
 }
 
-/// A detected MCP server, with the internal `SystemTime` mtime resolved to a
-/// plain epoch-millis number for web clients.
-#[derive(Debug, Clone, Serialize)]
-pub struct McpServerView {
-    /// OS process id of the MCP server.
-    pub pid: u32,
-    /// Resolved parent CLI: "claude", "codex", or "?".
-    pub parent_cli: &'static str,
-    /// `-c profile=<name>` value, if any.
-    pub profile: Option<String>,
-    /// Resident memory of the MCP server process, in KiB.
-    pub mem_kb: u64,
-    /// Rollouts written within the active-mtime window.
-    pub active_count: usize,
-    /// Total open rollout fds.
-    pub rollout_count: usize,
-    /// Latest rollout mtime as Unix-epoch milliseconds, if known.
-    pub last_activity_ms: Option<u64>,
-}
-
 /// Keep at most the last `n` items of a slice.
 fn tail<T: Clone>(v: &[T], n: usize) -> Vec<T> {
     if v.len() > n {
@@ -353,25 +326,7 @@ impl App {
             })
             .collect();
 
-        let mcp_servers = if self.is_pi_mode() {
-            Vec::new()
-        } else {
-            self.mcp_servers
-                .iter()
-                .map(|m| McpServerView {
-                    pid: m.pid,
-                    parent_cli: m.parent_cli,
-                    profile: m.profile.clone(),
-                    mem_kb: m.mem_kb,
-                    active_count: m.active_count(now, ACTIVE_MTIME_SECS),
-                    rollout_count: m.rollouts.len(),
-                    last_activity_ms: m.latest_mtime().and_then(epoch_ms),
-                })
-                .collect()
-        };
-
         Snapshot {
-            monitor_mode: self.monitor_mode,
             generated_at_ms: epoch_ms(now).unwrap_or(0),
             host: self.host_metrics,
             aggregate: self.agent_aggregate,
@@ -381,11 +336,6 @@ impl App {
                 .then(|| self.token_rates.back().copied().unwrap_or(0.0)),
             interval_ms,
             sessions,
-            rate_limits: if self.is_pi_mode() {
-                Vec::new()
-            } else {
-                self.rate_limits.clone()
-            },
             orphan_ports: if self.is_pi_mode() {
                 self.orphan_ports
                     .iter()
@@ -399,7 +349,6 @@ impl App {
             } else {
                 self.orphan_ports.clone()
             },
-            mcp_servers,
         }
     }
 }
@@ -418,7 +367,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn demo_app() -> App {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         populate_demo(&mut app);
         app
     }
@@ -477,10 +426,6 @@ mod tests {
         assert!(snap.generated_at_ms > 0);
         assert!(!snap.sessions.is_empty());
         assert!(snap.host.is_some(), "demo populates host metrics");
-        assert!(
-            snap.rate_limits.is_empty(),
-            "Pi demo omits account rate limits"
-        );
 
         for s in &snap.sessions {
             // Bounded tails.
@@ -496,7 +441,6 @@ mod tests {
     #[test]
     fn pi_snapshot_uses_structured_unknowns_instead_of_numeric_placeholders() {
         let mut app = demo_app();
-        app.monitor_mode = crate::app::MonitorMode::Pi;
         app.token_rate_known = false;
         let session = app.sessions.first_mut().unwrap();
         session.agent_cli = "pi";
@@ -551,8 +495,6 @@ mod tests {
 
         let snap = app.to_snapshot(2_000);
         let pi = &snap.sessions[0];
-        assert!(snap.rate_limits.is_empty());
-        assert!(snap.mcp_servers.is_empty());
         assert_eq!(snap.token_rate_value, None);
         let telemetry = pi.telemetry.as_ref().unwrap();
         assert_eq!(telemetry.context.percent, None);
@@ -581,7 +523,6 @@ mod tests {
     #[test]
     fn pi_json_distinguishes_unknown_known_zero_inferred_estimated_and_partial() {
         let mut app = demo_app();
-        app.monitor_mode = crate::app::MonitorMode::Pi;
         app.token_rate_known = false;
         let base = app.sessions[0].clone();
         app.sessions.clear();

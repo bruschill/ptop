@@ -9,10 +9,9 @@
 //! # Public API for library consumers
 //!
 //! The stable surface for in-process consumers is [`app`] (notably
-//! [`App::to_snapshot`](app::App::to_snapshot) and
-//! [`App::tick_no_summaries`](app::App::tick_no_summaries)), [`snapshot`],
-//! [`config`], [`demo`], [`host_info`], and the data types in [`model`]. The
-//! [`collector`], [`locale`], [`setup`], [`theme`], and [`ui`] modules are
+//! [`App::to_snapshot`](app::App::to_snapshot) and [`App::tick`](app::App::tick)),
+//! [`snapshot`], [`config`], [`demo`], [`host_info`], and the data types in
+//! [`model`]. The [`collector`], [`locale`], [`theme`], and [`ui`] modules are
 //! published mainly to support the bundled TUI binary and may change without a
 //! semver-major bump — depend on them at your own risk.
 //!
@@ -36,9 +35,9 @@
 //! use ptop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_pi(Theme::default(), &cfg.hidden_agents, cfg.panels);
+//! let mut app = App::new(Theme::default(), cfg.panels);
 //! loop {
-//!     app.tick_no_summaries();                // refresh without spawning `claude --print`
+//!     app.tick();                             // refresh Pi process and telemetry data
 //!     let snap = app.to_snapshot(2_000);      // pure read → JSON-friendly DTO
 //!     let json = serde_json::to_string(&snap).unwrap();
 //!     // ... serve `json`, sleep for the interval, repeat ...
@@ -76,7 +75,7 @@ use std::time::Duration;
 /// Construct a headless `App` from loaded config + theme. Shared by the
 /// `--json` and `--once` entry points.
 fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
-    App::new_pi(theme, &cfg.hidden_agents, cfg.panels)
+    App::new(theme, cfg.panels)
 }
 
 fn has_flag(args: &[OsString], flag: &str) -> bool {
@@ -226,15 +225,14 @@ pub fn run() -> io::Result<()> {
     let mouse_capture = options.mouse_capture;
 
     // --json flag: print a machine-readable JSON snapshot and exit.
-    // Single tick, no summary subprocesses. Useful for scripting and as a
-    // manual check of the web snapshot API; the web tool uses the library
-    // `App::to_snapshot` directly rather than shelling out to this.
+    // Useful for scripting and as a manual check of the web snapshot API; the
+    // web tool uses the library `App::to_snapshot` directly.
     if has_flag(&args, "--json") {
         let mut app = build_app(initial_theme, &cfg);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
-            app.tick_no_summaries();
+            app.tick();
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
             Ok(json) => {
@@ -255,17 +253,6 @@ pub fn run() -> io::Result<()> {
             demo::populate_demo(&mut app);
         } else {
             app.tick();
-            if app.summaries_enabled() {
-                // Retry-aware budget: two 10s attempts plus slack.
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                while std::time::Instant::now() < deadline {
-                    app.drain_and_retry_summaries();
-                    if !app.has_pending_summaries() && !app.has_retryable_summaries() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
         }
         print_snapshot(&app);
         return Ok(());
@@ -348,7 +335,7 @@ fn run_app(
     exit_on_jump: bool,
     config: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = App::new_pi(theme, &config.hidden_agents, config.panels);
+    let mut app = App::new(theme, config.panels);
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -417,8 +404,7 @@ fn handle_key_press(
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
-            KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
+            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
         }
@@ -458,8 +444,7 @@ fn handle_key_press(
             KeyCode::Char('t') => app.cycle_theme(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
-            KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
+            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
             KeyCode::Char('?') => app.toggle_help(),
@@ -560,41 +545,7 @@ fn format_token_value(session: &model::AgentSession) -> String {
 }
 
 fn print_snapshot(app: &App) {
-    if app.is_pi_mode() {
-        println!("ptop — {} Pi processes\n", app.sessions.len());
-    } else {
-        println!(
-            "ptop — {} sessions, {} mcp servers\n",
-            app.sessions.len(),
-            app.mcp_servers.len()
-        );
-    }
-    if !app.mcp_servers.is_empty() {
-        let now = std::time::SystemTime::now();
-        for server in &app.mcp_servers {
-            let active = server.active_count(now, collector::mcp::ACTIVE_MTIME_SECS);
-            let total = server.rollouts.len();
-            let last_age = server
-                .latest_mtime()
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|d| {
-                    if d.as_secs() < 60 {
-                        format!("{}s", d.as_secs())
-                    } else if d.as_secs() < 3600 {
-                        format!("{}m", d.as_secs() / 60)
-                    } else {
-                        format!("{}h", d.as_secs() / 3600)
-                    }
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let profile = server.profile.as_deref().unwrap_or("default");
-            println!(
-                "  mcp pid={} parent={} profile={:<16} active={}/{} last={}",
-                server.pid, server.parent_cli, profile, active, total, last_age
-            );
-        }
-        println!();
-    }
+    println!("ptop — {} Pi processes\n", app.sessions.len());
     for session in &app.sessions {
         let status = match &session.status {
             model::SessionStatus::Thinking => "◉ Think",
@@ -882,11 +833,7 @@ mod tests {
 
     #[test]
     fn demo_mouse_orphan_click_does_not_tick_collectors() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let area = Rect::new(0, 0, 120, 40);
         let (column, row) = (0..area.width)
@@ -928,11 +875,7 @@ mod tests {
 
     #[test]
     fn pi_demo_renders_attached_telemetry() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1091,11 +1034,7 @@ mod tests {
 
     #[test]
     fn text_values_distinguish_unknown_exact_inferred_estimated_and_partial() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let session = app.sessions.first_mut().unwrap();
         session.agent_cli = "pi";
@@ -1138,11 +1077,7 @@ mod tests {
 
     #[test]
     fn enter_jump_failure_renders_footer_status() {
-        let mut app = App::new_with_config(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
 
         handle_key_press(

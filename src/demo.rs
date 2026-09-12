@@ -295,8 +295,6 @@ fn populate_pi_demo(app: &mut App) {
             process_start_id: Some("pi-demo-7520".into()),
         },
     ];
-    app.summaries.clear();
-    app.rate_limits.clear();
     app.orphan_ports = vec![OrphanPort {
         port: 8088,
         pid: 7298,
@@ -330,7 +328,7 @@ mod tests {
 
     #[test]
     fn pi_demo_has_attached_sessions_with_authoritative_token_rate_and_runs() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         populate_demo(&mut app);
 
         assert!(app.is_pi_mode());
@@ -398,11 +396,11 @@ mod tests {
 
     #[test]
     fn pi_demo_snapshot_uses_pi_privacy_suppression() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         populate_demo(&mut app);
         let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 
-        assert!(json.contains("\"monitor_mode\":\"pi\""));
+        assert!(!json.contains("monitor_mode"));
         assert!(json.contains("\"token_rate_value\":"));
         assert!(json.contains("\"command\":\"node\""));
         assert!(!json.contains("--checkout"));

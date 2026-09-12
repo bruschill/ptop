@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn process_only_context_has_no_zero_bar() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn inferred_context_tokens_without_window_show_no_meter() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];

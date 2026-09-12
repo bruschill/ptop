@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn aggregate_includes_known_zero_but_excludes_unknown_pi_context() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let base = app.sessions[0].clone();
         let make_session = |precision: TelemetryPrecision, percent: f64, window: u64| {
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn aggregate_preserves_legacy_zero_placeholder_behavior() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let mut zero = app.sessions[0].clone();
         zero.context_percent = 0.0;

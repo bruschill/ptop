@@ -1,6 +1,6 @@
 use super::{
     pi_subagents::{pi_subagent_runner_run_id, PiSubagentParent, PiSubagentsCollector},
-    process, AgentCollector, SharedProcessData,
+    process, SharedProcessData,
 };
 use crate::model::{
     AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
@@ -945,8 +945,8 @@ impl Default for PiCollector {
     }
 }
 
-impl AgentCollector for PiCollector {
-    fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
+impl PiCollector {
+    pub(crate) fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
 }
@@ -2805,10 +2805,6 @@ mod tests {
             children_map,
             ports: HashMap::new(),
             slow_tick: false,
-            mcp_server_pids: HashSet::new(),
-            mcp_owned_rollouts: HashSet::new(),
-            mcp_suppress: true,
-            desktop_rollout_fd_map: HashMap::new(),
         }
     }
 

@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn footer_renders_concise_cmux_socket_failure() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.set_status("cmux: socket broken; restart cmux".to_string());
 
         let backend = TestBackend::new(120, 1);

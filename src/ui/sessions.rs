@@ -62,7 +62,7 @@ fn draw_sessions_panel_impl(
     runs_promoted: bool,
 ) {
     // Render the outer block
-    let block = btop_block_active("sessions", "⁶", theme.proc_box, theme, active);
+    let block = btop_block_active("sessions", "⁵", theme.proc_box, theme, active);
     f.render_widget(block, area);
 
     let inner = Rect {
@@ -1581,7 +1581,7 @@ mod tests {
 
     #[test]
     fn codex_non_1m_context_window_does_not_show_1m_suffix() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.sessions.push(AgentSession {
             agent_cli: "codex",
             pid: 42,
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn session_table_clears_rows_when_selection_scrolls() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.sessions = vec![
             test_session("first111", "first"),
             test_session("second22", "second"),
@@ -1705,7 +1705,7 @@ mod tests {
 
     #[test]
     fn session_table_repaints_selection_marker_when_moving() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.sessions = vec![
             test_session("first111", "first"),
             test_session("second22", "second"),
@@ -1737,7 +1737,7 @@ mod tests {
 
     #[test]
     fn process_only_pi_session_renders_unknown_context_and_tokens() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         let mut session = test_session("process-42", "project");
         session.agent_cli = "pi";
         session.pid = 42;
@@ -1789,7 +1789,7 @@ mod tests {
 
     #[test]
     fn pi_session_table_distinguishes_telemetry_precision_and_known_zero() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         for (id, precision, completeness, percent, tokens, window) in [
             (
                 "unknown",
@@ -1868,7 +1868,7 @@ mod tests {
 
     #[test]
     fn pi_fleet_runs_render_in_selected_session_detail_at_narrow_width() {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         let mut session = test_session("parent-session", "project");
         session.agent_cli = "pi";
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
