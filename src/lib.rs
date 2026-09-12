@@ -54,7 +54,6 @@ pub mod host_info;
 pub mod jump;
 pub mod locale;
 pub mod model;
-pub mod setup;
 pub mod snapshot;
 pub mod theme;
 pub mod ui;
@@ -75,19 +74,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Construct a headless `App` from loaded config + theme. Shared by the
-/// `--json` and `--once` entry points. The product path is Pi-only; `--legacy`
-/// retains the previous multi-agent collector during stabilization.
-fn build_app(theme: theme::Theme, cfg: &config::AppConfig, legacy_mode: bool) -> App {
-    if legacy_mode {
-        App::new_with_config_and_claude_dirs(
-            theme,
-            &cfg.hidden_agents,
-            cfg.panels,
-            &cfg.claude_config_dirs,
-        )
-    } else {
-        App::new_pi(theme, &cfg.hidden_agents, cfg.panels)
-    }
+/// `--json` and `--once` entry points.
+fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
+    App::new_pi(theme, &cfg.hidden_agents, cfg.panels)
 }
 
 fn has_flag(args: &[OsString], flag: &str) -> bool {
@@ -195,6 +184,10 @@ fn exit_with_message(message: &str) -> ! {
 
 pub fn run() -> io::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
+    let options = match runtime_options_from_args(&args) {
+        Ok(options) => options,
+        Err(message) => exit_with_message(&message),
+    };
 
     // Keep theme-independent commands ahead of config and theme resolution.
     if has_flag(&args, "--version") || has_flag(&args, "-V") {
@@ -203,10 +196,6 @@ pub fn run() -> io::Result<()> {
     }
     if has_flag(&args, "--update") {
         return run_update();
-    }
-    if has_flag(&args, "--setup") {
-        setup::run_setup();
-        return Ok(());
     }
 
     let explicit_theme = match theme_request_from_args(&args) {
@@ -232,11 +221,7 @@ pub fn run() -> io::Result<()> {
         Err(message) => exit_with_message(&message),
     };
 
-    let options = runtime_options_from_args(&args);
     let demo_mode = options.demo_mode;
-    // Demo follows the selected monitor mode. Only an explicit --legacy opts
-    // into legacy collectors; all demo paths populate fixtures without a tick.
-    let legacy_mode = options.legacy_mode;
     let exit_on_jump = options.exit_on_jump;
     let mouse_capture = options.mouse_capture;
 
@@ -245,7 +230,7 @@ pub fn run() -> io::Result<()> {
     // manual check of the web snapshot API; the web tool uses the library
     // `App::to_snapshot` directly rather than shelling out to this.
     if has_flag(&args, "--json") {
-        let mut app = build_app(initial_theme, &cfg, legacy_mode);
+        let mut app = build_app(initial_theme, &cfg);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -265,7 +250,7 @@ pub fn run() -> io::Result<()> {
 
     // --once flag: print snapshot and exit
     if has_flag(&args, "--once") {
-        let mut app = build_app(initial_theme, &cfg, legacy_mode);
+        let mut app = build_app(initial_theme, &cfg);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -294,14 +279,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        legacy_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -319,38 +297,58 @@ pub fn run() -> io::Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimeOptions {
     demo_mode: bool,
-    legacy_mode: bool,
     exit_on_jump: bool,
     mouse_capture: bool,
 }
 
-fn runtime_options_from_args(args: &[OsString]) -> RuntimeOptions {
-    RuntimeOptions {
-        demo_mode: has_flag(args, "--demo"),
-        legacy_mode: has_flag(args, "--legacy"),
-        exit_on_jump: has_flag(args, "--exit-on-jump"),
-        mouse_capture: has_flag(args, "--mouse"),
+fn runtime_options_from_args(args: &[OsString]) -> Result<RuntimeOptions, String> {
+    let mut options = RuntimeOptions {
+        demo_mode: false,
+        exit_on_jump: false,
+        mouse_capture: false,
+    };
+    let mut index = 1;
+
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == OsStr::new("--theme") || argument == OsStr::new("--theme-file") {
+            let option = argument.to_string_lossy();
+            args.get(index + 1)
+                .filter(|value| !value.to_string_lossy().starts_with('-'))
+                .ok_or_else(|| format!("{option} requires a value"))?;
+            index += 2;
+            continue;
+        }
+
+        if argument == OsStr::new("--demo") {
+            options.demo_mode = true;
+        } else if argument == OsStr::new("--exit-on-jump") {
+            options.exit_on_jump = true;
+        } else if argument == OsStr::new("--mouse") {
+            options.mouse_capture = true;
+        } else if !matches!(
+            argument.to_str(),
+            Some("--json" | "--once" | "--update" | "--version" | "-V")
+        ) {
+            return Err(format!(
+                "unknown option or argument: {}",
+                argument.to_string_lossy()
+            ));
+        }
+        index += 1;
     }
+
+    Ok(options)
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     demo_mode: bool,
-    legacy_mode: bool,
     theme: theme::Theme,
     exit_on_jump: bool,
     config: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = if legacy_mode {
-        App::new_with_config_and_claude_dirs(
-            theme,
-            &config.hidden_agents,
-            config.panels,
-            &config.claude_config_dirs,
-        )
-    } else {
-        App::new_pi(theme, &config.hidden_agents, config.panels)
-    };
+    let mut app = App::new_pi(theme, &config.hidden_agents, config.panels);
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -838,44 +836,48 @@ mod tests {
 
     #[test]
     fn mouse_capture_is_opt_in() {
-        assert!(!runtime_options_from_args(&[OsString::from("ptop")]).mouse_capture);
+        assert!(
+            !runtime_options_from_args(&[OsString::from("ptop")])
+                .unwrap()
+                .mouse_capture
+        );
         assert!(
             runtime_options_from_args(&[OsString::from("ptop"), OsString::from("--mouse")])
+                .unwrap()
                 .mouse_capture
         );
     }
 
     #[test]
-    fn runtime_options_keep_pi_as_default_and_allow_legacy_demo_with_mouse() {
+    fn runtime_options_accept_pi_demo_with_mouse() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
 
         assert_eq!(
             runtime_options_from_args(&args(&["ptop"])),
-            RuntimeOptions {
+            Ok(RuntimeOptions {
                 demo_mode: false,
-                legacy_mode: false,
                 exit_on_jump: false,
                 mouse_capture: false,
-            }
+            })
         );
         assert_eq!(
             runtime_options_from_args(&args(&["ptop", "--demo", "--mouse"])),
-            RuntimeOptions {
+            Ok(RuntimeOptions {
                 demo_mode: true,
-                legacy_mode: false,
                 exit_on_jump: false,
                 mouse_capture: true,
-            }
+            })
         );
-        assert_eq!(
-            runtime_options_from_args(&args(&["ptop", "--legacy", "--demo"])),
-            RuntimeOptions {
-                demo_mode: true,
-                legacy_mode: true,
-                exit_on_jump: false,
-                mouse_capture: false,
-            }
-        );
+    }
+
+    #[test]
+    fn runtime_options_reject_removed_and_unknown_options() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        for option in ["--legacy", "--setup", "--unknown"] {
+            let error = runtime_options_from_args(&args(&["ptop", option])).unwrap_err();
+            assert!(error.contains(option), "{error}");
+        }
     }
 
     #[test]
@@ -1081,12 +1083,10 @@ mod tests {
     }
 
     #[test]
-    fn product_entry_uses_pi_collector_unless_legacy_is_requested() {
+    fn product_entry_uses_pi_collector() {
         let cfg = config::AppConfig::default();
-        let pi = build_app(theme::Theme::default(), &cfg, false);
-        let legacy = build_app(theme::Theme::default(), &cfg, true);
-        assert!(pi.is_pi_mode());
-        assert_eq!(legacy.monitor_mode, app::MonitorMode::Legacy);
+        let app = build_app(theme::Theme::default(), &cfg);
+        assert!(app.is_pi_mode());
     }
 
     #[test]

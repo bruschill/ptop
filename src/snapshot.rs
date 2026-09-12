@@ -418,7 +418,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn demo_app() -> App {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
         populate_demo(&mut app);
         app
     }
@@ -477,7 +477,10 @@ mod tests {
         assert!(snap.generated_at_ms > 0);
         assert!(!snap.sessions.is_empty());
         assert!(snap.host.is_some(), "demo populates host metrics");
-        assert!(!snap.rate_limits.is_empty(), "demo populates rate limits");
+        assert!(
+            snap.rate_limits.is_empty(),
+            "Pi demo omits account rate limits"
+        );
 
         for s in &snap.sessions {
             // Bounded tails.
