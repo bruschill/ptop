@@ -1,6 +1,6 @@
 # ptop
 
-**Like [abtop](https://github.com/graykode/abtop), but for Pi coding agents, with `pi-subagents` support.**
+**Like [abtop](https://github.com/graykode/abtop), but for Pi coding agents**
 
 ptop is a local terminal monitor for Pi processes, owned session telemetry, fleet runs, child processes, listening ports, and project state.
 
@@ -14,6 +14,10 @@ ptop is a local terminal monitor for Pi processes, owned session telemetry, flee
 - Process-only Pi rows when telemetry cannot be attached safely.
 
 ptop reads local process and filesystem metadata. It does not call an agent API.
+
+## Supported Pi packages
+
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents): fleet run and child lifecycle telemetry.
 
 ## Install
 
@@ -35,7 +39,7 @@ cargo install ptop
 powershell -c "irm https://github.com/bruschill/ptop/releases/latest/download/ptop-installer.ps1 | iex"
 ```
 
-Windows support is process-only. It uses `sysinfo` for process and host metrics and `netstat -ano` for listening ports. Session-file attachment, terminal jump, and process kill controls are disabled until trusted identity checks are available. Windows reports load average as 0.
+On Windows, ptop shows Pi processes, host metrics, listening ports, and Git status. Session-file attachment and `pi-subagents` fleet telemetry are unavailable; terminal jump and process kill controls are disabled until trusted identity checks are available. Windows reports load average as 0.
 
 Pre-built binaries are available on the [GitHub Releases](https://github.com/bruschill/ptop/releases) page.
 
@@ -58,7 +62,7 @@ Unknown and removed options fail with a clear error.
 
 ### Terminal jump
 
-Press `Enter` to focus the terminal that owns the selected Pi process. ptop supports cmux, tmux, and iTerm2, in that order. The process command and start identity are checked again before a jump. Windows does not support terminal jump.
+Press `Enter` to focus the terminal that owns the selected Pi process. On macOS, ptop tries cmux, tmux, then iTerm2. On Linux, it tries cmux then tmux. The process command and start identity are checked again before a jump. Windows does not support terminal jump.
 
 Example with tmux:
 
@@ -165,7 +169,7 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 
 ## Privacy
 
-ptop does not retain or publish prompt text, assistant text, tool arguments, tool results, or child transcripts. Pi session parsing keeps identity and numeric telemetry only. Fleet collection reads supported lifecycle status metadata, not child output logs or transcript files.
+ptop does not retain or publish prompt text, assistant text, tool arguments, tool results, or child transcripts. Pi session parsing keeps identity, safe metadata, and structured numeric telemetry only. Fleet collection reads supported lifecycle status metadata, not child output logs or transcript files.
 
 TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. Package installation and `ptop --update` are separate user-requested operations.
 
