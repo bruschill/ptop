@@ -4,24 +4,20 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug)]
 pub struct PanelVisibility {
     pub context: bool,
-    pub quota: bool,
     pub tokens: bool,
     pub projects: bool,
     pub ports: bool,
     pub sessions: bool,
-    pub mcp: bool,
 }
 
 impl Default for PanelVisibility {
     fn default() -> Self {
         Self {
             context: true,
-            quota: true,
             tokens: true,
             projects: true,
             ports: true,
             sessions: true,
-            mcp: true,
         }
     }
 }
@@ -30,12 +26,6 @@ impl Default for PanelVisibility {
 pub struct AppConfig {
     pub theme: String,
     pub theme_file: Option<PathBuf>,
-    /// Agent CLI names to exclude (e.g. ["pi"] in the default mode or ["codex"] in legacy mode).
-    /// Matched case-insensitively against each collector's agent_cli identifier.
-    pub hidden_agents: Vec<String>,
-    /// Additional Claude config directories to scan for sessions.
-    /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
-    pub claude_config_dirs: Vec<PathBuf>,
     pub panels: PanelVisibility,
     /// UI language override. Empty string means auto-detect from `LANG`.
     /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
@@ -47,8 +37,6 @@ impl Default for AppConfig {
         Self {
             theme: "btop".to_string(),
             theme_file: None,
-            hidden_agents: Vec::new(),
-            claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
             language: String::new(),
         }
@@ -181,26 +169,16 @@ fn parse_config_body_checked(
         }
 
         let value = strip_inline_comment(raw_value).trim();
-        if key == "hidden_agents" {
-            config.hidden_agents = parse_string_array(value);
-            continue;
-        }
-        if key == "claude_config_dirs" {
-            config.claude_config_dirs = parse_path_array(value);
-            continue;
-        }
         match key {
             "language" => {
                 config.language = parse_toml_string(raw_value)
                     .unwrap_or_else(|_| value.trim_matches('"').trim_matches('\'').to_string())
             }
             "show_context" => config.panels.context = parse_bool(value).unwrap_or(true),
-            "show_quota" => config.panels.quota = parse_bool(value).unwrap_or(true),
             "show_tokens" => config.panels.tokens = parse_bool(value).unwrap_or(true),
             "show_projects" => config.panels.projects = parse_bool(value).unwrap_or(true),
             "show_ports" => config.panels.ports = parse_bool(value).unwrap_or(true),
             "show_sessions" => config.panels.sessions = parse_bool(value).unwrap_or(true),
-            "show_mcp" => config.panels.mcp = parse_bool(value).unwrap_or(true),
             _ => {}
         }
     }
@@ -278,46 +256,6 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
-#[derive(Deserialize)]
-struct StringArrayValue {
-    value: Vec<String>,
-}
-
-/// Parse a simple one-line TOML string array like `["a", "b"]`.
-/// Returns an empty Vec for malformed input to keep compatibility loading infallible.
-fn parse_string_array(raw: &str) -> Vec<String> {
-    toml::from_str::<StringArrayValue>(&format!("value = {raw}"))
-        .map(|parsed| parsed.value)
-        .unwrap_or_default()
-}
-
-fn parse_path_array(raw: &str) -> Vec<PathBuf> {
-    parse_string_array(raw)
-        .into_iter()
-        .map(|value| expand_home_path(&value))
-        .collect()
-}
-
-fn expand_home_path(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    #[cfg(windows)]
-    if let Some(rest) = raw.strip_prefix("~\\") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(raw)
-}
-
 pub fn save_theme(name: &str) -> Result<(), String> {
     write_with_edits(&[
         ("theme", Some(quote_toml_string(name))),
@@ -338,12 +276,10 @@ pub fn save_theme_file(path: &Path) -> Result<(), String> {
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
     write_with_updates(&[
         ("show_context", panels.context.to_string()),
-        ("show_quota", panels.quota.to_string()),
         ("show_tokens", panels.tokens.to_string()),
         ("show_projects", panels.projects.to_string()),
         ("show_ports", panels.ports.to_string()),
         ("show_sessions", panels.sessions.to_string()),
-        ("show_mcp", panels.mcp.to_string()),
     ])
 }
 
@@ -459,62 +395,27 @@ fn rewrite_config_lines(content: &str, edits: &[(&str, Option<String>)]) -> Resu
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_string_array_basic() {
-        assert_eq!(parse_string_array(r#"["codex"]"#), vec!["codex"]);
-        assert_eq!(
-            parse_string_array(r#"["codex", "claude"]"#),
-            vec!["codex", "claude"]
-        );
-    }
-
-    #[test]
-    fn parse_string_array_quote_styles_and_whitespace() {
-        assert_eq!(
-            parse_string_array(r#"[ 'codex' , "claude" ]"#),
-            vec!["codex", "claude"]
-        );
-    }
-
-    #[test]
-    fn parse_string_array_empty_and_malformed() {
-        assert!(parse_string_array("[]").is_empty());
-        assert!(parse_string_array("not an array").is_empty());
-        assert!(parse_string_array(r#"["a",,]"#)
-            .iter()
-            .all(|s| !s.is_empty()));
-    }
-
-    #[test]
-    fn parse_path_array_expands_home_relative_entries() {
-        let home = dirs::home_dir().unwrap();
-        let paths = parse_path_array(r#"["~/.claude-personal", "/tmp/.claude-work"]"#);
-
-        assert_eq!(paths[0], home.join(".claude-personal"));
-        assert_eq!(paths[1], PathBuf::from("/tmp/.claude-work"));
-    }
-
-    #[test]
-    fn parse_config_body_loads_claude_config_dirs() {
-        let home = dirs::home_dir().unwrap();
-        let cfg = parse_config_body(r#"claude_config_dirs = ["~/.claude-personal"]"#);
-
-        assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
-    }
-
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {
         vec![("theme", format!("\"{}\"", name))]
     }
 
     #[test]
-    fn rewrite_theme_preserves_hidden_agents_line() {
-        let before = "theme = \"btop\"\nhidden_agents = [\"codex\"]\n";
+    fn obsolete_keys_are_ignored_and_preserved_by_rewrites() {
+        let before = "theme = \"btop\"\nhidden_agents = [\"codex\"]\nclaude_config_dirs = [\"~/.claude-work\"]\nshow_quota = false\nshow_mcp = false\n";
+        let config = parse_config_body(before);
+        assert!(config.panels.context);
+        assert!(config.panels.tokens);
+
         let after = rewrite_kv_lines(before, &theme_update("dracula"));
         assert!(after.contains("theme = \"dracula\""));
-        assert!(
-            after.contains("hidden_agents = [\"codex\"]"),
-            "hidden_agents line dropped:\n{after}"
-        );
+        for key in [
+            "hidden_agents",
+            "claude_config_dirs",
+            "show_quota",
+            "show_mcp",
+        ] {
+            assert!(after.contains(key), "{key} line dropped:\n{after}");
+        }
     }
 
     #[test]
@@ -528,22 +429,22 @@ mod tests {
 
     #[test]
     fn rewrite_theme_appends_when_missing() {
-        let before = "hidden_agents = [\"codex\"]\n";
+        let before = "future_key = 42\n";
         let after = rewrite_kv_lines(before, &theme_update("gruvbox"));
-        assert!(after.contains("hidden_agents = [\"codex\"]"));
+        assert!(after.contains("future_key = 42"));
         assert!(after.contains("theme = \"gruvbox\""));
     }
 
     #[test]
     fn rewrite_panels_replaces_existing_and_appends_missing() {
-        let before = "theme = \"btop\"\nshow_quota = true\n";
+        let before = "theme = \"btop\"\nshow_tokens = true\n";
         let updates: Vec<(&str, String)> = vec![
-            ("show_quota", "false".to_string()),
+            ("show_tokens", "false".to_string()),
             ("show_projects", "false".to_string()),
         ];
         let after = rewrite_kv_lines(before, &updates);
-        assert!(after.contains("show_quota = false"));
-        assert!(!after.contains("show_quota = true"));
+        assert!(after.contains("show_tokens = false"));
+        assert!(!after.contains("show_tokens = true"));
         assert!(after.contains("show_projects = false"));
         assert!(after.contains("theme = \"btop\""));
     }
@@ -577,12 +478,11 @@ mod tests {
 
     #[test]
     fn duplicate_theme_selection_is_rejected_unless_cli_overrides_it() {
-        let body = "theme_file = 42\ntheme_file = false\nhidden_agents = [\"codex\"]\n";
+        let body = "theme_file = 42\ntheme_file = false\nfuture_key = 42\n";
         assert!(parse_config_body_checked(body, Path::new("config.toml"), false).is_err());
 
         let config = parse_config_body_checked(body, Path::new("config.toml"), true).unwrap();
         assert_eq!(config.theme_file, None);
-        assert_eq!(config.hidden_agents, vec!["codex"]);
     }
 
     #[test]
@@ -623,9 +523,9 @@ mod tests {
 
     #[test]
     fn panel_rewrites_preserve_a_quoted_theme_path() {
-        let body = "theme_file = \"themes/low glare#1.toml\"\nshow_quota = true\n";
+        let body = "theme_file = \"themes/low glare#1.toml\"\nshow_tokens = true\n";
         let rewritten =
-            rewrite_config_lines(body, &[("show_quota", Some("false".to_string()))]).unwrap();
+            rewrite_config_lines(body, &[("show_tokens", Some("false".to_string()))]).unwrap();
         let config =
             parse_config_body_checked(&rewritten, Path::new("config.toml"), false).unwrap();
 
@@ -633,7 +533,7 @@ mod tests {
             config.theme_file,
             Some(PathBuf::from("themes/low glare#1.toml"))
         );
-        assert!(!config.panels.quota);
+        assert!(!config.panels.tokens);
     }
 
     #[test]

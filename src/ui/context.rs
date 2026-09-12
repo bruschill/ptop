@@ -41,15 +41,7 @@ pub(crate) fn draw_context_panel_active(
         let rates: Vec<f64> = app.token_rates.iter().copied().collect();
         let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
         let total = aggregate_tokens_label(app);
-        let active = if app.is_pi_mode() {
-            "—".to_string()
-        } else {
-            app.sessions
-                .iter()
-                .filter(|s| s.status.is_active())
-                .count()
-                .to_string()
-        };
+        let active = "—";
 
         let rate_label = t("context.rate");
         let total_label = t("context.total");

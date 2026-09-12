@@ -401,9 +401,6 @@ fn handle_key_press(
     } else if app.view_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
-            KeyCode::Char('T') => app.tree_view = !app.tree_view,
-            KeyCode::Char('l') => app.toggle_timeline(),
-            KeyCode::Char('f') => app.toggle_file_audit(),
             KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
@@ -442,15 +439,12 @@ fn handle_key_press(
             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
             KeyCode::Char('t') => app.cycle_theme(),
-            KeyCode::Char('T') => app.tree_view = !app.tree_view,
-            KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
             KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
             KeyCode::Char('?') => app.toggle_help(),
             KeyCode::Char('/') => app.filter_active = true,
             KeyCode::Esc if !app.filter_text.is_empty() => app.clear_filter(),
-            KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_file_audit(),
             KeyCode::Enter if !demo_mode => match jump_to_session(app) {
                 JumpOutcome::Jumped if exit_on_jump => app.quit(),
                 JumpOutcome::Failed(msg) => app.set_status(msg),
@@ -552,7 +546,6 @@ fn print_snapshot(app: &App) {
             model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
             model::SessionStatus::Unknown => "? Unknown",
-            model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };
         let sid_short = if session.session_id.len() >= 7 {
@@ -565,15 +558,11 @@ fn print_snapshot(app: &App) {
         let model = if session.model.is_empty() {
             "—".to_string()
         } else {
-            session.model.replace("claude-", "")
+            session.model.clone()
         };
         let context = format_context_value(session);
         let tokens = format_token_value(session);
-        let age = if session.agent_cli == "pi" {
-            format!("seen:{}", session.elapsed_display())
-        } else {
-            session.elapsed_display()
-        };
+        let age = format!("seen:{}", session.elapsed_display());
         println!(
             "  {} {:<20} {} {} {:<10} CTX:{} Tok:{} Mem:{}M {}",
             session.pid,
@@ -681,21 +670,12 @@ fn print_snapshot(app: &App) {
                 }
             }
         }
-        if session.agent_cli == "pi" && session.process_start_id.is_none() {
+        if session.process_start_id.is_none() {
             println!("       identity: PID only (reuse not guarded)");
         }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
-            let command = if session.agent_cli == "pi" {
-                model::safe_process_label(&child.command)
-            } else {
-                child
-                    .command
-                    .split_whitespace()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
+            let command = model::safe_process_label(&child.command);
             println!(
                 "       {} {} {}K {}",
                 child.pid,
@@ -1026,10 +1006,10 @@ mod tests {
     }
 
     #[test]
-    fn product_entry_uses_pi_collector() {
+    fn product_entry_constructs_the_app() {
         let cfg = config::AppConfig::default();
         let app = build_app(theme::Theme::default(), &cfg);
-        assert!(app.is_pi_mode());
+        assert!(app.sessions.is_empty());
     }
 
     #[test]
@@ -1037,7 +1017,6 @@ mod tests {
         let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let session = app.sessions.first_mut().unwrap();
-        session.agent_cli = "pi";
         session.context_percent = 0.0;
         session.context_window = 0;
         session.total_input_tokens = 0;

@@ -280,7 +280,6 @@ mod tests {
         let base = app.sessions[0].clone();
         let make_session = |precision: TelemetryPrecision, percent: f64, window: u64| {
             let mut session = base.clone();
-            session.agent_cli = "pi";
             session.context_percent = percent;
             session.context_window = window;
             let mut telemetry = SessionTelemetry::process_only(1);

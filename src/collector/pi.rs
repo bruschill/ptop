@@ -409,7 +409,6 @@ impl PiCollector {
                     }
                 }
                 Some(AgentSession {
-                    agent_cli: "pi",
                     pid,
                     session_id: attachment
                         .map(|attachment| attachment.session_id.clone())
@@ -455,18 +454,7 @@ impl PiCollector {
                     context_history: data.context_history,
                     compaction_count: data.compactions,
                     context_window: data.context_window.unwrap_or(0),
-                    subagents: Vec::new(),
-                    mem_file_count: 0,
-                    mem_line_count: 0,
                     children: collect_children(pid, shared),
-                    initial_prompt: String::new(),
-                    first_assistant_text: String::new(),
-                    chat_messages: Vec::new(),
-                    tool_calls: Vec::new(),
-                    pending_since_ms: 0,
-                    thinking_since_ms: 0,
-                    file_accesses: Vec::new(),
-                    config_root: String::new(),
                     telemetry: Some(telemetry),
                     process_start_id,
                 })
@@ -3225,8 +3213,7 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_ne!(sessions[0].session_id, sessions[1].session_id);
         assert!(sessions.iter().all(|session| {
-            session.agent_cli == "pi"
-                && session.status == SessionStatus::Unknown
+            session.status == SessionStatus::Unknown
                 && session.context_value().is_none()
                 && session.usage_precision() == TelemetryPrecision::Unknown
         }));

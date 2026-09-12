@@ -144,7 +144,6 @@ fn populate_pi_demo(app: &mut App) {
     let now = now_ms();
     app.sessions = vec![
         AgentSession {
-            agent_cli: "pi",
             pid: 7301,
             session_id: "pi-demo-checkout".into(),
             cwd: "/Users/demo/storefront".into(),
@@ -169,23 +168,12 @@ fn populate_pi_demo(app: &mut App) {
             context_history: vec![48_000, 72_000, 98_000, 128_000],
             compaction_count: 0,
             context_window: 200_000,
-            subagents: vec![],
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: vec![ChildProcess {
                 pid: 7310,
                 command: "node worker.js --checkout".into(),
                 mem_kb: 82_000,
                 port: Some(4173),
             }],
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: vec![],
-            tool_calls: vec![],
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: vec![],
-            config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
                 "anthropic",
@@ -196,7 +184,6 @@ fn populate_pi_demo(app: &mut App) {
             process_start_id: Some("pi-demo-7301".into()),
         },
         AgentSession {
-            agent_cli: "pi",
             pid: 7402,
             session_id: "pi-demo-metrics".into(),
             cwd: "/Users/demo/observability".into(),
@@ -221,23 +208,12 @@ fn populate_pi_demo(app: &mut App) {
             context_history: vec![94_000, 132_000, 174_000],
             compaction_count: 0,
             context_window: 200_000,
-            subagents: vec![],
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: vec![ChildProcess {
                 pid: 7414,
                 command: "python metrics_server.py --debug".into(),
                 mem_kb: 44_000,
                 port: Some(9090),
             }],
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: vec![],
-            tool_calls: vec![],
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: vec![],
-            config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
                 "openai",
@@ -248,7 +224,6 @@ fn populate_pi_demo(app: &mut App) {
             process_start_id: Some("pi-demo-7402".into()),
         },
         AgentSession {
-            agent_cli: "pi",
             pid: 7520,
             session_id: "pi-demo-release".into(),
             cwd: "/Users/demo/release-tools".into(),
@@ -273,18 +248,7 @@ fn populate_pi_demo(app: &mut App) {
             context_history: vec![22_000, 41_000, 58_000],
             compaction_count: 0,
             context_window: 200_000,
-            subagents: vec![],
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: vec![],
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: vec![],
-            tool_calls: vec![],
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: vec![],
-            config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
                 "anthropic",
@@ -331,10 +295,8 @@ mod tests {
         let mut app = App::new(Theme::default(), PanelVisibility::default());
         populate_demo(&mut app);
 
-        assert!(app.is_pi_mode());
         assert!(app.token_rate_known);
         assert!(app.sessions.len() >= 3);
-        assert!(app.sessions.iter().all(|session| session.agent_cli == "pi"));
         assert!(app.sessions.iter().all(|session| {
             session.telemetry.as_ref().is_some_and(|telemetry| {
                 telemetry.attachment == crate::model::AttachmentState::Attached

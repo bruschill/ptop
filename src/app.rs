@@ -96,8 +96,8 @@ pub struct App {
     pub token_rates: VecDeque<f64>,
     /// Whether the latest token-rate observation is authoritative.
     pub token_rate_known: bool,
-    /// Per-session previous token totals, keyed by (agent_cli, session_id).
-    prev_tokens: HashMap<(String, String), u64>,
+    /// Per-session previous token totals, keyed by session ID.
+    prev_tokens: HashMap<String, u64>,
     collector: Collector,
     /// Ports left open by processes whose parent sessions have ended.
     pub orphan_ports: Vec<OrphanPort>,
@@ -116,12 +116,8 @@ pub struct App {
     pub maximized_narrow_section: Option<NarrowSection>,
     pub config_open: bool,
     pub config_selected: usize,
-    pub tree_view: bool,
     pub filter_text: String,
     pub filter_active: bool,
-    pub show_timeline: bool,
-    pub timeline_scroll: usize,
-    pub show_file_audit: bool,
     /// Host vitals sampler (CPU% delta needs prior snapshot).
     host_sampler: HostSampler,
     /// Latest host metrics snapshot (None until first valid sample).
@@ -158,22 +154,14 @@ impl App {
             maximized_narrow_section: None,
             config_open: false,
             config_selected: 0,
-            tree_view: false,
             filter_text: String::new(),
             filter_active: false,
-            show_timeline: false,
-            timeline_scroll: 0,
-            show_file_audit: false,
             host_sampler: HostSampler::new(),
             host_metrics: None,
             agent_aggregate: AgentAggregate::default(),
             help_open: false,
             view_open: false,
         }
-    }
-
-    pub fn is_pi_mode(&self) -> bool {
-        true
     }
 
     pub fn all_usage_known(&self) -> bool {
@@ -195,7 +183,7 @@ impl App {
 
         let mut rate: f64 = 0.0;
         for session in &self.sessions {
-            let key = (session.agent_cli.to_string(), session.session_id.clone());
+            let key = session.session_id.clone();
             let total = session.active_tokens();
             let previous = self.prev_tokens.get(&key).copied().unwrap_or(total);
             rate += total.saturating_sub(previous) as f64;
@@ -238,20 +226,14 @@ impl App {
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
             context: self.show_context,
-            quota: false,
             tokens: self.show_tokens,
             projects: self.show_projects,
             ports: self.show_ports,
             sessions: self.show_sessions,
-            mcp: false,
         };
         if let Err(e) = crate::config::save_panel_visibility(&panels) {
             self.set_status(format!("panels save failed: {}", e));
         }
-    }
-
-    pub fn toggle_file_audit(&mut self) {
-        self.show_file_audit = !self.show_file_audit;
     }
 
     pub fn toggle_config(&mut self) {
@@ -432,11 +414,6 @@ impl App {
         }
     }
 
-    pub fn toggle_timeline(&mut self) {
-        self.show_timeline = !self.show_timeline;
-        self.timeline_scroll = 0;
-    }
-
     pub fn cycle_theme(&mut self) {
         let catalog = crate::theme::ThemeCatalog::packaged();
         let name = next_packaged_theme_name(&self.theme);
@@ -491,7 +468,6 @@ impl App {
         s.project_name.to_lowercase().contains(query)
             || s.model.to_lowercase().contains(query)
             || s.session_id.to_lowercase().contains(query)
-            || s.initial_prompt.to_lowercase().contains(query)
             || s.cwd.to_lowercase().contains(query)
             || format!("{:?}", s.status).to_lowercase().contains(query)
     }
@@ -562,10 +538,7 @@ impl App {
             return;
         }
         let session = &self.sessions[self.selected];
-        if matches!(session.status, SessionStatus::Done)
-            || session.agent_cli != "pi"
-            || session.pid == 0
-        {
+        if matches!(session.status, SessionStatus::Done) || session.pid == 0 {
             return;
         }
         #[cfg(target_os = "windows")]
@@ -670,7 +643,7 @@ impl App {
             return JumpOutcome::NoOp;
         }
         let session = &self.sessions[self.selected];
-        if session.agent_cli != "pi" || session.pid == 0 {
+        if session.pid == 0 {
             return JumpOutcome::NoOp;
         }
         let target_pid = session.pid;
@@ -731,9 +704,8 @@ mod tests {
         assert_eq!(next_packaged_theme_name(&btop), "dracula");
     }
 
-    fn waiting_session(cli: &'static str) -> AgentSession {
+    fn waiting_session() -> AgentSession {
         AgentSession {
-            agent_cli: cli,
             pid: 1,
             session_id: String::new(),
             cwd: String::new(),
@@ -756,18 +728,7 @@ mod tests {
             token_history: vec![],
             context_history: vec![],
             context_window: 0,
-            subagents: vec![],
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: vec![],
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: vec![],
-            tool_calls: vec![],
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: vec![],
-            config_root: String::new(),
             git_added: 0,
             git_modified: 0,
             telemetry: None,
@@ -793,7 +754,7 @@ mod tests {
     #[test]
     fn pi_summary_reports_attachment_state() {
         let app = App::new(Theme::default(), crate::config::PanelVisibility::default());
-        let mut session = waiting_session("pi");
+        let mut session = waiting_session();
         let mut telemetry = crate::model::SessionTelemetry::process_only(1);
         session.telemetry = Some(telemetry.clone());
         assert_eq!(app.session_summary(&session), "process only");
@@ -806,12 +767,11 @@ mod tests {
     #[test]
     fn unknown_pi_usage_is_not_aggregated_as_known_zero() {
         let mut app = App::new(Theme::default(), crate::config::PanelVisibility::default());
-        let mut session = waiting_session("pi");
+        let mut session = waiting_session();
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(1));
         app.sessions.push(session);
         app.token_rates.push_back(99.0);
-        app.prev_tokens
-            .insert(("pi".to_string(), "session".to_string()), 99);
+        app.prev_tokens.insert("session".to_string(), 99);
 
         app.update_token_rate();
 

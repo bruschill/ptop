@@ -20,9 +20,6 @@ cpu_box = "#7DCFFF"
 mem_box = "#BB9AF7"
 net_box = "#F7768E"
 proc_box = "#FF9E64"
-claude_agent = "#D97757"
-codex_agent = "#7A9DFF"
-opencode_agent = "#4ADE80"
 pi_agent = "#C084FC"
 
 [gradients]

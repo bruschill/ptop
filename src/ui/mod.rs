@@ -411,11 +411,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     if app.show_ports {
         mid_sections.push(DesktopPanel::Narrow(NarrowSection::Ports));
     }
-    if app.is_pi_mode()
-        && app.show_sessions
-        && area.width >= RUNS_PROMOTION_WIDTH
-        && runs::selected_has_runs(app)
-    {
+    if app.show_sessions && area.width >= RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
         mid_sections.push(DesktopPanel::Runs);
     }
 
@@ -423,7 +419,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let mid_h_ideal: u16 = 8;
     let sessions_ideal: u16 = if app.show_sessions {
         let base = (app.sessions.len() as u16 * 2 + 7).max(8);
-        if app.is_pi_mode() && area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
+        if area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
             base.saturating_add(7)
         } else {
             base
@@ -831,20 +827,8 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
 
     let inner_h = area.height.saturating_sub(2);
     let visible = app.visible_indices();
-    let session_rows: u16 = visible
-        .iter()
-        .map(|&i| {
-            let base = 2u16;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len() as u16
-            } else {
-                base
-            }
-        })
-        .sum();
-    let detail_reserve: u16 = if app.show_timeline {
-        (inner_h * 2 / 3).min(inner_h.saturating_sub(5))
-    } else if inner_h <= 12 {
+    let session_rows = visible.len() as u16 * 2;
+    let detail_reserve: u16 = if inner_h <= 12 {
         6.min(inner_h.saturating_sub(3))
     } else {
         10.min(inner_h / 2)
@@ -858,35 +842,13 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
 
     let visible_rows = table_h.saturating_sub(1) as usize;
     let selected_pos = visible.iter().position(|&i| i == app.selected).unwrap_or(0);
-    let selected_row_start: usize = visible
-        .iter()
-        .take(selected_pos)
-        .map(|&i| {
-            let base = 2;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len()
-            } else {
-                base
-            }
-        })
-        .sum();
-    let selected_session_rows = if app.tree_view {
-        2 + app
-            .sessions
-            .get(app.selected)
-            .map_or(0, |s| s.subagents.len())
-    } else {
-        2
-    };
+    let selected_row_start = selected_pos * 2;
+    let selected_session_rows = 2;
     let scroll_offset = (selected_row_start + selected_session_rows).saturating_sub(visible_rows);
     let target_row = scroll_offset + row.saturating_sub(table_y + 1) as usize;
     let mut offset = 0usize;
     for &idx in &visible {
-        let rows = if app.tree_view {
-            2 + app.sessions[idx].subagents.len()
-        } else {
-            2
-        };
+        let rows = 2;
         if target_row >= offset && target_row < offset + rows {
             return Some(idx);
         }
@@ -925,16 +887,6 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 // ── utility functions ────────────────────────────────────────────────────────
-
-pub(crate) fn fmt_mem_kb(kb: u64) -> String {
-    if kb >= 1_048_576 {
-        format!("{:.1}G", kb as f64 / 1_048_576.0)
-    } else if kb >= 1024 {
-        format!("{}M", kb / 1024)
-    } else {
-        format!("{}K", kb)
-    }
-}
 
 pub(crate) fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
@@ -1507,7 +1459,6 @@ mod tests {
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];
-        session.agent_cli = "pi";
         session.session_id = "parent-session-ＡＢ-with-a-very-long-identity".to_string();
         session.project_name = "project-ＡＢ-with-a-very-long-name".to_string();
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
@@ -1573,7 +1524,6 @@ mod tests {
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];
-        session.agent_cli = "pi";
         session.pid = 42;
         session.session_id = "process-42".to_string();
         session.context_percent = 0.0;
