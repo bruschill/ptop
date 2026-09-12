@@ -92,7 +92,7 @@ cargo build --release
 cargo test --release pi_parser_release_benchmark -- --ignored --nocapture
 ```
 
-CI classifies changed paths before scheduling checks. Platform build, Clippy, and test jobs run on macOS, Linux, and Windows when Rust build inputs or compile-time embedded files change. The explicit legacy-constructor regressions and Pi parser benchmark run only when their implementations or dependencies change. Manual workflow dispatches run every check. Release planning on pull requests runs only when Cargo or cargo-dist configuration changes.
+CI classifies changed paths before scheduling checks. Platform build, Clippy, and test jobs run on macOS, Linux, and Windows when Rust build inputs or compile-time embedded files change. The explicit legacy-constructor regressions and Pi parser benchmark run only when their implementations or dependencies change. Manual workflow dispatches run every check.
 
 The rustfmt gate runs when Rust files or its CI configuration change. It checks Rust files changed from the provided base, including committed, staged, and unstaged changes, because the older codebase does not yet pass a whole-repository Rust 1.88 formatting check. The Clippy gate allows the existing `uninlined_format_args` style lint so unrelated formatting does not block the release; every other warning remains denied.
 
