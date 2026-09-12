@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "ptop"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "crossterm",

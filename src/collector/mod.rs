@@ -6,7 +6,7 @@ use crate::model::{AgentSession, OrphanPort, SessionStatus};
 use std::collections::{HashMap, HashSet};
 
 /// Strip control characters and Unicode bidi override/isolate marks before
-/// transcript text is stored for terminal rendering.
+/// bounded lifecycle labels are rendered in the terminal.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
     s.chars()
         .filter(|c| {
