@@ -1,110 +1,134 @@
 # Pi support and release gates
 
-ptop discovers local Pi processes by default, then attaches telemetry only when it can prove ownership of the session file without ambiguity. Use `ptop --legacy` for the Claude Code, Codex CLI, and OpenCode collectors during stabilization.
-
-`ptop --demo` follows the default Pi mode without starting collectors. It supplies three attached Pi sessions with complete usage, a known token-rate history, host metrics, ports, and a healthy fleet run. `ptop --legacy --demo` selects the existing collector-free legacy fixture set. The Pi demo intentionally has no process-only row; process-only telemetry stays in focused tests so the default demonstration does not imply that unknown usage is authoritative.
+ptop monitors local Pi coding-agent processes only. Process discovery is independent from telemetry attachment, so every verified top-level Pi process remains visible even when no session file can be attached.
 
 ## Platform contract
 
-| Platform | Process discovery | Owned session telemetry | Controls |
-| --- | --- | --- | --- |
-| macOS | Supported and tested | Supported through a directly open session JSONL file or a validated Herdr pane claim | Terminal jump and kill require the existing backend-specific identity checks |
-| Linux | Supported and tested | Supported through bounded `/proc` environment markers, directly open session JSONL files, or a validated Herdr pane claim | tmux jump and kill require the existing identity checks |
-| Windows | Supported and tested | Process-only | Pi terminal jump and kill are disabled |
+| Capability | macOS | Linux | Windows |
+|---|---:|---:|---:|
+| Pi process discovery | Yes | Yes | Yes |
+| Child process and port discovery | Yes | Yes | Yes |
+| Owned session telemetry attachment | Yes | Yes | Process-only |
+| `pi-subagents` fleet status | Yes | Yes | Unavailable |
+| Git working-tree enrichment | Yes | Yes | Yes |
+| Terminal jump | cmux, tmux, iTerm2 | cmux, tmux | Disabled |
+| Pi process kill | Yes | Yes | Disabled |
 
-Windows stays process-only until the process layer exposes a trustworthy working directory and process-start identity. Other platforms are not part of the release-tested Pi contract.
+Windows uses `sysinfo` and `netstat -ano`. It reports load average as 0. Jump and kill controls remain disabled until ptop can apply the same trusted process-identity checks used on Unix.
 
-## Telemetry contract
+On macOS and Linux, ptop checks that a controlled PID still belongs to a Pi process. Where available, it also compares an opaque process-start identity to prevent PID reuse from targeting another process.
 
-A Pi process row always remains visible. Failed, incomplete, conflicting, or unsupported telemetry does not remove that row.
+## Telemetry attachment contract
 
-- `process only` means no owned session JSONL is attached.
-- `attached` means ownership passed the high-confidence identity checks.
-- ptop autodetects Herdr from each Pi process's pane ID and socket path, so ptop itself can run inside or outside Herdr without extra environment variables.
-- ptop accepts a Herdr session path only when Herdr reports that PID in the pane's foreground process group and two pane snapshots have the same session path and revision.
-- Herdr `working` maps to executing; `idle`, `done`, and `blocked` map to waiting.
-- Unknown values render as `—`, not zero.
-- `~` marks inferred values.
-- `≈` marks estimated values.
-- `+` after tokens marks a partial total.
-- Structured `telemetry` fields in JSON are authoritative for Pi.
-- Legacy numeric JSON fields remain compatibility placeholders for Pi consumers.
-- Unknown `status.json` schema versions expose bounded identity metadata only. They do not claim lifecycle, usage, child, or terminal state.
-- Fleet usage remains a separate run aggregate because parent session totals may already include child usage.
+A process row does not require telemetry. ptop attaches a Pi parent session JSONL only when all required ownership evidence agrees:
 
-Runs remain in the selected-session detail at 80x24 and 100x24. At 140 columns or wider, an available selected-session run list moves to a dedicated Runs panel. The same run is not rendered in both places.
+1. The process is a supported top-level Pi launch, not a nested Pi child.
+2. The candidate file is owned through a supported process or Herdr discovery path.
+3. The JSONL header session ID and working directory match the candidate claim.
+4. The file identity remains stable while it is read.
+5. No other live Pi process claims the same session path or session ID.
 
-## Privacy boundary
+Missing, stale, unsupported, invalid, or ambiguous evidence produces a visible `process only` row. It never causes ptop to guess an attachment.
 
-ptop reads local process metadata, owned parent session JSONL files, model catalog metadata, and supported `pi-subagents` `status.json` files. It does not read child session transcripts, prompt files, `events.jsonl`, output logs, or tool-argument files from the subagent run directory.
+Telemetry values include metadata for precision (`unknown`, `inferred`, `estimated`, or `exact`), completeness (`unknown`, `partial`, or `complete`), provenance, observation time, and source health. Authoritative JSON fields use `null` for unavailable values. Numeric compatibility fields must not be treated as authoritative when the structured value is `null`.
 
-The owned parent JSONL parser inspects records for identity, usage, model metadata, and context size. It does not retain or publish prompt text, assistant text, tool arguments, or tool results. Pi snapshots and TUI rows reduce child process commands to executable names.
+Model and provider values are Pi metadata. Their names do not select another collector or monitored agent.
 
-ptop does not generate summaries or call `claude --print`. `--once`, `--json`, the TUI, and library callers using `tick_no_summaries()` keep that behavior.
+## Fleet and run telemetry
 
-## Parser and retention limits
+ptop reads supported `pi-subagents` lifecycle `status.json` files and associates them with an owned Pi parent session. Lifecycle schema version 3 can expose run state, execution mode, usage, child state, and process-terminal metadata.
 
-The limits below are release contracts. Exceeding a limit keeps the process row visible and marks telemetry partial, omitted, unavailable, or unhealthy instead of publishing an incomplete value as complete.
+Parent session usage and run usage use separate accounting. Consumers must not add them together as if they were one token total.
 
-### Parent session JSONL
-
-- 2 MiB of Pi session JSONL per collection tick across attached sessions.
-- 1 MiB per Pi session JSONL line.
-- 8192 semantic tree entries per attached session.
-- 128 attachment candidates per collection tick.
-- 128 Pi processes considered for attachment per collection tick.
-- 4096 open file descriptors per collection tick.
-- Herdr discovery checks at most 32 Pi roots per refresh, reads at most 256 KiB per command, allows 300 ms per command, and stops after 1 second total.
-- No retained partial-line buffer. An incomplete final line is reread from its newline boundary on the next tick.
-- Model catalog files are capped at 2 MiB and 1024 retained model entries.
-- Tail and model caches are removed when their owned live attachment disappears.
-
-### Fleet status metadata
+Safety limits include:
 
 - 256 KiB per status.json file.
 - 2 MiB of status.json data per collection tick.
 - 512 run-directory entries examined per collection tick.
 - 128 status files per collection tick.
 - 20 runs per parent session.
-- 64 children per run across 3 nested child levels.
+- 64 children per run.
+- 3 nested child levels.
 - Completed runs remain eligible for 30 days.
-- Active snapshots with no verifiable runner become stale after 24 hours. A snapshot whose verified runner has disappeared becomes stale after 30 seconds.
+- Runs with no verifiable runner become stale after 24 hours.
+- A run whose verified runner has disappeared becomes stale after 30 seconds.
 
-## Performance benchmark
+Unknown lifecycle versions do not become trusted run telemetry.
 
-Run the bounded parser benchmark in release mode:
+## Privacy boundary
+
+The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. It does not retain or publish:
+
+- prompt text
+- assistant text
+- tool arguments or tool results
+- chat transcripts or tool previews
+- child transcripts, events, prompt files, or output logs
+
+TUI, text snapshots, and JSON snapshots reduce child and orphan process commands to executable labels. Fleet status labels are bounded and terminal-control characters are removed before display.
+
+ptop makes no network request while monitoring. It reads local files, process metadata, Git status, and listening-port state.
+
+## Parent parser limits
+
+The parent session tailer is stateful. It scans an attached file once, then reads only appended bytes. It handles incomplete lines, truncation, replacement, deletion, malformed records, and oversized lines without retaining raw transcript content.
+
+Current limits:
+
+- 2 MiB of Pi session JSONL per collection tick.
+- 1 MiB per Pi session JSONL line.
+- 8192 semantic tree entries per attached session.
+- 128 attachment candidates per collection tick.
+- 128 Pi processes considered for attachment per collection tick.
+- 4096 open file descriptors per collection tick.
+- Model catalog files are capped at 2 MiB and 1024 retained model entries.
+
+These are defensive implementation limits, not a promise that every external Pi schema will remain compatible.
+
+## Shared enrichment and polling
+
+Process information is collected every two seconds. Ports and Git status use the slower poll path, normally every ten seconds, with port-cache invalidation when the tracked PID set changes.
+
+Orphan detection is cross-tick state. A child port becomes orphaned only after its parent Pi session disappears while the child remains alive and listening. Before sending a signal, ptop performs a fresh port scan and compares the current command with the tracked command.
+
+## JSON snapshot contract
+
+`ptop --json` and `App::to_snapshot` expose:
+
+- host and aggregate metrics
+- live Pi session identity and state
+- structured context and usage telemetry
+- bounded token history
+- fleet runs and children
+- privacy-safe child process labels
+- orphan ports
+
+Snapshots omit monitor-mode discriminators, account quota, MCP server state, per-session transcript data, tool previews, file-audit data, and old multi-agent identifiers.
+
+`App::to_snapshot` is a pure read. Call `App::tick` before taking a fresh snapshot.
+
+## Validation
+
+Run the parser benchmark when parent parsing or its limits change:
 
 ```bash
 cargo test --release pi_parser_release_benchmark -- --ignored --nocapture
 ```
 
-The benchmark parses and reconstructs up to one full 2 MiB tick budget. The release gate requires it to finish within one second. The byte, entry, and retention caps remain the primary deterministic controls. Wall-clock results still depend on the host.
-
-## Release checklist
-
-Run these checks before publishing:
+Before release, run:
 
 ```bash
-scripts/check-rustfmt.sh "$(git merge-base HEAD origin/main)"
-cargo clippy --all-targets -- -D warnings -A clippy::uninlined-format-args
-cargo test --all-targets
+./scripts/check-rustfmt.sh
+cargo test
+cargo clippy -- -D warnings
 cargo build --release
-cargo test --release pi_parser_release_benchmark -- --ignored --nocapture
+cargo run -- --demo --once
+cargo run -- --once
+cargo publish --dry-run
 ```
 
-CI classifies changed paths before scheduling checks. Platform build, Clippy, and test jobs run on macOS, Linux, and Windows when Rust build inputs or compile-time embedded files change. The explicit legacy-constructor regressions and Pi parser benchmark run only when their implementations or dependencies change. Manual workflow dispatches run every check.
+CI must pass on macOS, Linux, and Windows. Release builds must retain process-only rows, privacy suppression, bounded parsing, fleet accounting separation, process identity checks, port/orphan behavior, and terminal-jump behavior.
 
-The rustfmt gate runs when Rust files or its CI configuration change. It checks Rust files changed from the provided base, including committed, staged, and unstaged changes, because the older codebase does not yet pass a whole-repository Rust 1.88 formatting check. The Clippy gate allows the existing `uninlined_format_args` style lint so unrelated formatting does not block the release; every other warning remains denied.
+## Compatibility policy
 
-Before changing a support claim, verify:
-
-- Privacy tests still exclude private content and prohibited subagent artifact paths.
-- Ambiguous ownership still leaves a process-only row.
-- JSON, text, and TUI output still distinguish unknown from known zero.
-- 80x24, 100x24, and wide desktop layout tests pass.
-- Legacy collector construction and snapshot compatibility tests pass.
-- Platform-specific tests match the documented support table.
-
-## Stabilization policy
-
-Pi and `pi-subagents` files are local implementation contracts that may change. New schema versions remain unsupported until capability tests define each accepted field. Add fields to the structured Pi snapshot contract instead of changing legacy meanings. Keep `--legacy` available until a separate compatibility decision removes it.
+Pi session files and `pi-subagents` lifecycle files are local implementation contracts. New schema versions remain unavailable until explicitly supported and tested. ptop fails closed on ambiguous ownership and preserves the process row instead of inventing telemetry.

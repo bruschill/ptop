@@ -680,7 +680,7 @@ fn task_row_text(task_text: &str, max_width: usize) -> String {
 }
 
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
-    // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
+    // Pi may report model identifiers such as "claude-opus-4-6"; display them compactly.
     let s = model.strip_prefix("claude-").unwrap_or(model);
     let s = s.trim_end_matches("[1m]");
     // Extract name and version: "opus-4-6" → ("opus", "4.6")
@@ -714,7 +714,7 @@ mod tests {
         let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.sessions.push(AgentSession {
             pid: 42,
-            session_id: "codex-session".into(),
+            session_id: "pi-session".into(),
             cwd: "/tmp/project".into(),
             project_name: "project".into(),
             started_at: 0,

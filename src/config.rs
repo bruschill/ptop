@@ -197,13 +197,13 @@ fn parse_config_body_checked(
 
 fn parse_theme_name(raw: &str) -> Result<String, String> {
     parse_toml_string(raw).or_else(|_| {
-        let legacy = strip_inline_comment(raw).trim();
-        if !legacy.is_empty()
-            && legacy
+        let unquoted = strip_inline_comment(raw).trim();
+        if !unquoted.is_empty()
+            && unquoted
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
-            Ok(legacy.to_string())
+            Ok(unquoted.to_string())
         } else {
             Err("expected a quoted string or an unquoted built-in name".to_string())
         }

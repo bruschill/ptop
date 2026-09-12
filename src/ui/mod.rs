@@ -962,8 +962,6 @@ mod tests {
         assert_eq!(fmt_age(60), "1m ago");
         assert_eq!(fmt_age(125), "2m ago");
         assert_eq!(fmt_age(7_200), "2h ago");
-        // Regression: the quota panel used to render this raw as "341493ago"
-        // because it formatted seconds without unit conversion.
         assert_eq!(fmt_age(341_493), "3d ago");
     }
 
@@ -1323,10 +1321,12 @@ mod tests {
                 text.contains("process only"),
                 "missing attachment state at {width}x{height}\n{text}"
             );
-            assert!(
-                !text.contains("quota"),
-                "quota rendered in Pi mode at {width}x{height}\n{text}"
-            );
+            for removed_panel in ["quota", "mcp"] {
+                assert!(
+                    !text.to_lowercase().contains(removed_panel),
+                    "{removed_panel} rendered at {width}x{height}\n{text}"
+                );
+            }
         }
     }
 

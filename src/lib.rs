@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn product_entry_constructs_the_app() {
+    fn product_entry_uses_the_pi_only_app_constructor() {
         let cfg = config::AppConfig::default();
         let app = build_app(theme::Theme::default(), &cfg);
         assert!(app.sessions.is_empty());

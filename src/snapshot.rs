@@ -27,8 +27,8 @@ pub struct Snapshot {
     /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
     /// before the first valid sample.
     pub host: Option<HostMetrics>,
-    /// Legacy aggregate metrics. In Pi process-only mode, token, context, and
-    /// active-count members are compatibility placeholders rather than zeros.
+    /// Compatibility aggregate metrics. In Pi process-only mode, token, context,
+    /// and active-count members are placeholders rather than known zeros.
     pub aggregate: AgentAggregate,
     /// Most recent per-tick token rate: the delta of *active* tokens, where
     /// active = input + output + cache_create (cache_read is excluded to avoid
@@ -106,15 +106,15 @@ pub struct SessionView {
     pub model: String,
     /// Reasoning effort reported by Pi; empty when unavailable.
     pub effort: String,
-    /// Agent CLI version string, if known.
+    /// Pi version string, if known.
     pub version: String,
-    /// Legacy context-window fill. For Pi records this is a compatibility
-    /// placeholder; use `telemetry.context.percent` as the authoritative value.
+    /// Compatibility context-window fill. Use `telemetry.context.percent` as
+    /// the authoritative value.
     pub context_percent: f64,
-    /// Legacy context-window size. Pi-aware consumers must use
+    /// Compatibility context-window size. Consumers should use
     /// `telemetry.context.window_tokens`.
     pub context_window: u64,
-    /// Legacy token total. Pi-aware consumers must use
+    /// Compatibility token total. Consumers should use
     /// `telemetry.usage.total_tokens`.
     pub total_tokens: u64,
     /// Cumulative input (prompt) tokens for the session.
@@ -424,7 +424,7 @@ mod tests {
 
         let json = serde_json::to_value(&snap).unwrap();
         let session_json = json["sessions"][0].as_object().unwrap();
-        for private_or_legacy_field in [
+        for excluded_field in [
             "agent_cli",
             "config_root",
             "subagents",
@@ -435,8 +435,8 @@ mod tests {
             "file_accesses",
         ] {
             assert!(
-                !session_json.contains_key(private_or_legacy_field),
-                "snapshot exposed {private_or_legacy_field}"
+                !session_json.contains_key(excluded_field),
+                "snapshot exposed {excluded_field}"
             );
         }
         assert!(json["sessions"][0]["telemetry"]["context"]["percent"].is_null());
@@ -544,8 +544,15 @@ mod tests {
     fn readme_documents_json_snapshot_privacy_surface() {
         let readme = include_str!("../README.md");
         assert!(readme.contains("--json"));
-        assert!(readme.contains("JSON snapshot includes"));
-        assert!(readme.contains("chat_messages"));
-        assert!(readme.contains("summary"));
+        assert!(readme.contains("The JSON snapshot includes"));
+        for excluded in [
+            "prompt text",
+            "assistant text",
+            "tool arguments",
+            "tool results",
+            "child transcripts",
+        ] {
+            assert!(readme.contains(excluded), "README omits {excluded}");
+        }
     }
 }

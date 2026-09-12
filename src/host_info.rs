@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_preserves_legacy_zero_placeholder_behavior() {
+    fn aggregate_preserves_compatibility_zero_placeholder_behavior() {
         let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let mut zero = app.sessions[0].clone();
