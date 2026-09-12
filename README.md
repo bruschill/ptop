@@ -1,6 +1,6 @@
 # ptop
 
-**Like [btop](https://github.com/aristocratos/btop), but for Pi coding agents.**
+**Like [abtop](https://github.com/graykode/abtop), but for Pi coding agents, with `pi-subagents` support.**
 
 ptop monitors local Pi processes, owned session telemetry, child processes, subagent runs, listening ports, and project state from one terminal UI.
 
