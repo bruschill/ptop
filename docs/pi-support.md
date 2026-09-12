@@ -2,6 +2,8 @@
 
 ptop discovers local Pi processes by default, then attaches telemetry only when it can prove ownership of the session file without ambiguity. Use `ptop --legacy` for the Claude Code, Codex CLI, and OpenCode collectors during stabilization.
 
+`ptop --demo` follows the default Pi mode without starting collectors. It supplies three attached Pi sessions with complete usage, a known token-rate history, host metrics, ports, and a healthy fleet run. `ptop --legacy --demo` selects the existing collector-free legacy fixture set. The Pi demo intentionally has no process-only row; process-only telemetry stays in focused tests so the default demonstration does not imply that unknown usage is authoritative.
+
 ## Platform contract
 
 | Platform | Process discovery | Owned session telemetry | Controls |
