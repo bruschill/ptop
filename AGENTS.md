@@ -337,7 +337,7 @@ cargo clippy                   # Lint
    gh run list --workflow Release --limit 5
    gh run list --workflow "Publish to crates.io" --limit 5
    ```
-6. `release.yml` builds platform binaries, creates the GitHub Release, and updates the Homebrew formula.
+6. `release.yml` builds platform binaries and creates the GitHub Release.
 7. `publish.yml` runs `cargo publish` to crates.io automatically.
 
 **Do NOT run `cargo publish` or `gh release create` manually** — the CI workflows handle both.
