@@ -1308,7 +1308,7 @@ mod tests {
     fn supported_agent_command_accepts_opencode_and_pi() {
         assert!(is_supported_agent_command("/usr/local/bin/claude"));
         assert!(is_supported_agent_command("codex --resume abc"));
-        assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(is_supported_agent_command("/usr/local/bin/opencode"));
         assert!(is_supported_agent_command("pi --mode rpc"));
         assert!(!is_supported_agent_command("node server.js"));
         assert!(!command_matches_agent(
