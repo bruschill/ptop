@@ -11,9 +11,73 @@ on:
         required: false
         default: HEAD^
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      format: ${{ steps.filter.outputs.format }}
+      platform: ${{ steps.filter.outputs.platform }}
+      legacy: ${{ steps.filter.outputs.legacy }}
+      pi_parser: ${{ steps.filter.outputs.pi_parser }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            format:
+              - '**/*.rs'
+              - 'scripts/check-rustfmt.sh'
+              - '.github/workflows/ci.yml'
+            platform:
+              - '**/*.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'clippy.toml'
+              - 'scripts/ptop-statusline.sh'
+              - 'README.md'
+              - 'docs/pi-support.md'
+              - '.github/workflows/ci.yml'
+            legacy:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'src/app.rs'
+              - 'src/collector/**'
+              - 'src/config.rs'
+              - 'src/demo.rs'
+              - 'src/host_info.rs'
+              - 'src/lib.rs'
+              - 'src/model/**'
+              - 'src/snapshot.rs'
+              - 'src/theme/**'
+              - '.github/workflows/ci.yml'
+            pi_parser:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'src/collector/mod.rs'
+              - 'src/collector/pi.rs'
+              - 'src/collector/pi_subagents.rs'
+              - 'src/collector/process.rs'
+              - 'src/model/**'
+              - '.github/workflows/ci.yml'
+
   format:
     name: Format
+    needs: changes
+    if: needs.changes.outputs.format == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +99,8 @@ jobs:
 
   platform:
     name: ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.platform == 'true' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +124,8 @@ jobs:
 
   legacy-regression:
     name: Legacy collector regression
+    needs: changes
+    if: needs.changes.outputs.legacy == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +137,8 @@ jobs:
 
   pi-parser-budget:
     name: Pi parser budget
+    needs: changes
+    if: needs.changes.outputs.pi_parser == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
