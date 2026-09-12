@@ -81,6 +81,7 @@ impl NarrowSection {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 struct KillConfirmation {
     pid: u32,
     session_id: String,
@@ -104,6 +105,7 @@ pub struct App {
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
     /// Stable process/session identity awaiting a second kill key press.
+    #[cfg(not(target_os = "windows"))]
     kill_confirm: Option<KillConfirmation>,
     pub theme: Theme,
     pub show_context: bool,
@@ -142,6 +144,7 @@ impl App {
             collector: Collector::new(),
             orphan_ports: Vec::new(),
             status_msg: None,
+            #[cfg(not(target_os = "windows"))]
             kill_confirm: None,
             theme,
             show_context: panels.context,
@@ -533,6 +536,7 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "windows")]
     pub fn kill_selected(&mut self) {
         if self.sessions.is_empty() {
             return;
@@ -541,12 +545,18 @@ impl App {
         if matches!(session.status, SessionStatus::Done) || session.pid == 0 {
             return;
         }
-        #[cfg(target_os = "windows")]
-        {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn kill_selected(&mut self) {
+        if self.sessions.is_empty() {
             return;
         }
-
+        let session = &self.sessions[self.selected];
+        if matches!(session.status, SessionStatus::Done) || session.pid == 0 {
+            return;
+        }
         let selected_identity = (session.pid, session.session_id.clone());
 
         // Confirm against stable process/session identity, not a mutable table row.
@@ -593,13 +603,16 @@ impl App {
     /// Kill all orphan port processes (Shift+X).
     /// Does a fresh port scan and validates PID identity + port ownership
     /// immediately before sending any signals to avoid PID reuse / stale cache issues.
+    #[cfg(target_os = "windows")]
     pub fn kill_orphan_ports(&mut self) {
-        #[cfg(target_os = "windows")]
-        {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
-            return;
-        }
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+    }
 
+    /// Kill all orphan port processes (Shift+X).
+    /// Does a fresh port scan and validates PID identity + port ownership
+    /// immediately before sending any signals to avoid PID reuse / stale cache issues.
+    #[cfg(not(target_os = "windows"))]
+    pub fn kill_orphan_ports(&mut self) {
         use crate::collector::process::get_listening_ports;
 
         // Fresh port scan right now — don't rely on cached data
@@ -638,6 +651,24 @@ impl App {
     /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
+    #[cfg(target_os = "windows")]
+    pub fn jump_to_session(&mut self) -> JumpOutcome {
+        if self.sessions.is_empty() {
+            return JumpOutcome::NoOp;
+        }
+        let session = &self.sessions[self.selected];
+        if session.pid == 0 {
+            return JumpOutcome::NoOp;
+        }
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+        JumpOutcome::NoOp
+    }
+
+    /// Jump to the terminal running the selected session's agent process.
+    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// see [`crate::jump`]. No-op when nothing is selected or no backend
+    /// recognizes the process.
+    #[cfg(not(target_os = "windows"))]
     pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
@@ -648,13 +679,6 @@ impl App {
         }
         let target_pid = session.pid;
         let process_start_id = session.process_start_id.clone();
-
-        #[cfg(target_os = "windows")]
-        {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
-            return JumpOutcome::NoOp;
-        }
-
         let process_info = crate::collector::process::get_process_info();
         let verified = process_info.get(&target_pid).is_some_and(|proc| {
             let same_start = process_start_id.as_ref().is_none_or(|expected| {
@@ -682,6 +706,7 @@ impl App {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn is_killable_agent_command(cmd: &str) -> bool {
     crate::collector::pi::is_pi_command(cmd)
 }
