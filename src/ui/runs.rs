@@ -10,7 +10,7 @@ use ratatui::Frame;
 use super::{btop_block_active, fmt_tokens, truncate_str};
 
 pub(crate) fn draw_runs_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let block = btop_block_active("runs", "⁷", theme.proc_box, theme, false);
+    let block = btop_block_active("runs", "⁶", theme.proc_box, theme, false);
     f.render_widget(block, area);
 
     let inner = Rect {

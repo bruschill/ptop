@@ -2,27 +2,22 @@
 
 **Like [abtop](https://github.com/graykode/abtop), but for Pi coding agents, with `pi-subagents` support.**
 
-ptop monitors local Pi processes, owned session telemetry, child processes, subagent runs, listening ports, and project state from one terminal UI.
-
-The previous Claude Code, Codex CLI, and OpenCode monitor remains available through `ptop --legacy` during the transition.
+ptop is a local terminal monitor for Pi processes, owned session telemetry, fleet runs, child processes, listening ports, and project state.
 
 ## What ptop shows
 
-- Local Pi processes, child processes, listening ports, and project state.
-- Context and usage telemetry when a session file can be attached with high-confidence ownership evidence.
-- Local `pi-subagents` run state, usage, children, and terminal proof from supported `status.json` files.
-- Unknown, inferred, estimated, and partial telemetry as distinct states instead of reporting missing data as zero.
-- Run details inside the selected session on compact terminals and in a dedicated Runs panel at 140 columns or wider.
-- Structured Pi telemetry in `ptop --json` for local tools and dashboards.
+- Pi sessions with status, model, thinking level, context, tokens, memory, and current telemetry state.
+- `pi-subagents` fleet runs and child lifecycle metadata.
+- Per-project Git branch and working-tree counts.
+- Child processes, listening ports, port conflicts, and orphan ports.
+- Host CPU, memory, and load metrics.
+- Process-only Pi rows when telemetry cannot be attached safely.
 
-ptop is read-only and makes no network calls. It does not require API keys or authentication.
+ptop reads local process and filesystem metadata. It does not call an agent API.
 
 ## Install
 
 ### macOS / Linux
-
-> [!IMPORTANT]
-> On Linux, ensure `sqlite3` is installed to enable monitoring for OpenCode sessions.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bruschill/ptop/releases/latest/download/ptop-installer.sh | sh
@@ -36,185 +31,143 @@ cargo install ptop
 
 ### Windows
 
-Native support, with no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows Pi support is process-only; Pi terminal jump and kill controls are disabled until trusted identity checks are available. Windows has no load average, so LOAD is reported as 0. OpenCode discovery in legacy mode additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it ptop prints a one-time warning to stderr.
-
 ```powershell
 powershell -c "irm https://github.com/bruschill/ptop/releases/latest/download/ptop-installer.ps1 | iex"
 ```
 
-Or `cargo install ptop` from any terminal with Git in PATH. Claude Code config is resolved automatically from `%USERPROFILE%\.claude`.
+Windows support is process-only. It uses `sysinfo` for process and host metrics and `netstat -ano` for listening ports. Session-file attachment, terminal jump, and process kill controls are disabled until trusted identity checks are available. Windows reports load average as 0.
 
-### Other
-
-Pre-built binaries for all platforms are available on the [GitHub Releases](https://github.com/bruschill/ptop/releases) page.
+Pre-built binaries are available on the [GitHub Releases](https://github.com/bruschill/ptop/releases) page.
 
 ## Usage
 
 ```bash
-ptop                    # Launch the ptop TUI
-ptop --once             # Print a ptop snapshot and exit
-ptop --json             # Print one ptop JSON snapshot and exit
-ptop --legacy           # Use Claude/Codex/OpenCode collection
+ptop                    # Launch the TUI
+ptop --once             # Print one text snapshot and exit
+ptop --json             # Print one JSON snapshot and exit
 ptop --demo             # Show collector-free Pi demo data
-ptop --legacy --demo    # Show the collector-free legacy demo data
-ptop --setup            # Install the legacy Claude rate-limit hook
-ptop --theme dracula    # Launch with a packaged theme
-ptop --theme-file ./my-theme.toml  # Launch with a user theme
-ptop --mouse            # Enable mouse click/scroll navigation
+ptop --theme dracula    # Use a packaged theme
+ptop --theme-file ./my-theme.toml  # Use a Theme Format v1 file
+ptop --mouse            # Enable mouse click and scroll navigation
+ptop --exit-on-jump     # Quit after Enter jumps to a session terminal
+ptop --update           # Update ptop
+ptop --version          # Print the version
 ```
 
-Recommended terminal size: **120x40** or larger. The minimum is 80x24, and panels hide when space is limited. Pi run metadata stays in the selected-session detail at 80x24 and 100x24. At 140 columns or wider, available runs move to a dedicated Runs panel.
-Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
+Unknown and removed options fail with a clear error.
 
-### Terminal Jump
+### Terminal jump
 
-Press `Enter` to focus the terminal running the selected agent. ptop supports cmux, tmux, and iTerm2 on macOS when it can verify the target session.
+Press `Enter` to focus the terminal that owns the selected Pi process. ptop supports cmux, tmux, and iTerm2, in that order. The process command and start identity are checked again before a jump. Windows does not support terminal jump.
+
+Example with tmux:
 
 ```bash
 tmux new -s work
 # pane 0: ptop
-# pane 1: claude (project A)
-# pane 2: claude (project B)
-# → Enter on a session in ptop jumps to its pane
+# pane 1: pi (project A)
+# pane 2: pi (project B)
+# Enter on a session in ptop jumps to its pane
 ```
 
-## Modes and supported agents
+## Pi telemetry
 
-ptop is the default Pi monitor. Run `ptop --legacy` to monitor Claude Code, Codex CLI, and OpenCode with the previous collectors.
+ptop always discovers live Pi processes first. It attaches a Pi JSONL session only when ownership is unambiguous and the session identity and working directory match. A process remains visible as `process only` when attachment is missing, stale, unsupported, or ambiguous.
 
-| Feature | Pi | Claude Code | Codex CLI | OpenCode |
-| --- | :---: | :---: | :---: | :---: |
-| Process discovery | ✅ | ✅ | ✅ | ✅ |
-| Owned session telemetry | macOS/Linux | ✅ | ✅ | ✅ |
-| Token tracking | Attached sessions | ✅ | ✅ | ✅ |
-| Context window | Attached sessions | ✅ | ✅ | ❌ |
-| Parent activity state | Unknown | ✅ | ✅ | ✅ |
-| Current task text | Hidden | ✅ | ✅ | ❌ |
-| Account rate limit | — | ✅ | ✅ | ❌ |
-| Git status | ✅ | ✅ | ✅ | ✅ |
-| Children / ports | ✅ | ✅ | ✅ | ✅ |
-| Subagent run metadata | `status.json` | ✅ | ❌ | ❌ |
-| Memory status | — | ✅ | ❌ | ❌ |
+Model and provider names come from Pi metadata. A value such as `claude-opus-4-6` identifies the model used by Pi, not another monitored agent.
 
-`ptop --demo` uses attached, privacy-safe Pi fixtures with multiple sessions, known token rates, ports, host metrics, and a fleet run. It does not scan local processes or files. Add `--legacy` to keep the previous Claude/Codex/OpenCode demo fixtures.
-
-Pi telemetry requires unambiguous ownership. Windows stays process-only. See [Pi support and release gates](docs/pi-support.md) for platform boundaries, privacy rules, parser limits, compatibility policy, and validation commands.
-
-OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+Fleet data comes from supported `pi-subagents` `status.json` files. Parent usage and run usage remain separate to prevent double counting. See [Pi support and release gates](docs/pi-support.md) for the full telemetry, platform, parser, and privacy contracts.
 
 ## Themes
 
-12 packaged themes are included, with 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle packaged themes, launch one with `--theme <name>`, or load a Theme Format v1 TOML file with `--theme-file <path>`. Packaged and user themes use the same loader. See [Theme files](docs/themes.md).
+Use `--theme <name>` or set `theme` in the configuration file. Packaged themes:
 
-| btop (default) | dracula | catppuccin |
-|:-:|:-:|:-:|
-| ![btop](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/btop.png) | ![dracula](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/dracula.png) | ![catppuccin](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/catppuccin.png) |
+`btop`, `dracula`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`, `light`, and `white`.
 
-| tokyo-night | gruvbox | nord |
-|:-:|:-:|:-:|
-| ![tokyo-night](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/tokyo-night.png) | ![gruvbox](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/gruvbox.png) | ![nord](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/nord.png) |
-
-Colorblind-friendly themes:
-
-| high-contrast | protanopia |
-|:-:|:-:|
-| ![high-contrast](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/high-contrast.png) | ![protanopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/protanopia.png) |
-
-| deuteranopia | tritanopia |
-|:-:|:-:|
-| ![deuteranopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/deuteranopia.png) | ![tritanopia](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/tritanopia.png) |
-
-Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) for bright terminals:
-
-| light | white |
-|:-:|:-:|
-| ![light](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/light.png) | ![white](https://raw.githubusercontent.com/bruschill/ptop/main/assets/themes/white.png) |
+Use `--theme-file <path>` for a custom Theme Format v1 file. See [Theme files](docs/themes.md).
 
 ## Configuration
 
-The `ptop/config.toml` file under your platform config directory supports:
+ptop stores `config.toml` under the platform configuration directory:
+
+- Linux: `$XDG_CONFIG_HOME/ptop/config.toml`, normally `~/.config/ptop/config.toml`.
+- macOS: `~/Library/Application Support/ptop/config.toml`.
+- Windows: `%APPDATA%\ptop\config.toml`.
 
 ```toml
 # Choose either a packaged theme or a Theme Format v1 file.
 theme = "btop"
 # theme_file = "themes/low-glare.toml"
-# Hide agent CLIs from the TUI (case-insensitive).
-# Use "pi" in the default mode, or legacy CLI names with --legacy.
-hidden_agents = ["codex"]
-# Additional Claude Code profile roots to scan.
-# ptop also auto-discovers ~/.claude and ~/.claude-* roots that contain
-# both sessions/ and projects/.
-claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
-# UI language. Omit or leave empty to auto-detect from LANG.
-language = "zh"
-# Panel visibility. Pi mode always suppresses quota and MCP panels.
+
+# UI language. Empty means auto-detect from LANG.
+language = "en"
+
+# Panel visibility.
 show_context = true
-show_quota = true
 show_tokens = true
 show_projects = true
 show_ports = true
 show_sessions = true
-show_mcp = true
 ```
 
-### Supported Languages
+Unknown keys are ignored and preserved when ptop rewrites known settings. This keeps obsolete configuration keys harmless.
 
-| Code | Language            |
-| ---- | ------------------- |
-| `en` | English (default)   |
-| `zh` | Simplified Chinese  |
+### Supported languages
 
-When `language` is unset, ptop auto-detects from `LANG`. Any value starting with `zh` switches to Simplified Chinese; other values use English.
+- English
+- Simplified Chinese
 
-## Key Bindings
+## Key bindings
 
-| Key                | Action                               |
-| ------------------ | ------------------------------------ |
-| `↑`/`↓` or `k`/`j` | Select session                       |
-| `Enter`            | Jump to session terminal             |
-| `x`                | Kill selected session                |
-| `X`                | Kill all orphan ports                |
-| `t`                | Cycle theme                          |
-| `1`-`7`            | Toggle panel visibility              |
-| `Esc`              | Open/close config page               |
-| `q`                | Quit                                 |
-| `r`                | Force refresh                        |
+| Key | Action |
+|---|---|
+| `↑`/`↓` or `k`/`j` | Select a session |
+| `←`/`→`, `Shift+Tab`/`Tab` | Change compact-layout tab |
+| `w`, `u`, `s` | Open Work, Usage, or System tab |
+| `+` / `-` | Maximize or restore the active compact section |
+| `Enter` | Jump to the selected session terminal |
+| `x` | Confirm and kill the selected Pi process |
+| `X` | Kill verified orphan-port processes |
+| `/` | Filter sessions |
+| `Esc` | Clear the filter or close an overlay |
+| `1`–`5` | Toggle context, tokens, projects, ports, or sessions |
+| `t` | Cycle the theme |
+| `v` | Open the view menu |
+| `c` | Open configuration |
+| `r` | Refresh |
+| `?` | Show help |
+| `q` | Quit |
 
-## Library / JSON snapshot
+Mouse input is disabled by default. Pass `--mouse` to enable clicks and scrolling.
 
-The `ptop` package is also a library crate, so local tools can reuse its data-collection
-layer in-process without rescanning or subprocesses and serialize the same
-state the TUI renders.
+## Library and JSON snapshot
 
 ```bash
-ptop --json    # one-shot JSON snapshot for scripts
+ptop --json
 ```
 
-For long-running consumers, build an `App`, refresh it with
-`App::tick_no_summaries()` (which never spawns `claude --print`, so it doesn't
-touch your Claude quota), and call `App::to_snapshot(interval_ms)` to get a
-JSON-serializable [`Snapshot`]:
+The JSON snapshot includes host metrics, aggregate values, authoritative Pi telemetry, bounded token history, fleet runs, privacy-safe child process labels, and orphan ports. Unknown telemetry uses `null` in authoritative fields instead of a numeric placeholder.
+
+Library example:
 
 ```rust,no_run
 use ptop::app::App;
 use ptop::{config, theme::Theme};
 
 let cfg = config::load_config();
-let mut app = App::new_pi(
-    Theme::default(), &cfg.hidden_agents, cfg.panels,
-);
-app.tick_no_summaries();
+let mut app = App::new(Theme::default(), cfg.panels);
+app.tick();
 let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
+# let _ = json;
 ```
 
-`App` is not `Send` (it owns the collectors), so keep it on one thread and pass
-the serialized JSON elsewhere.
+`App::to_snapshot` is a pure read. Call `App::tick` before taking a fresh snapshot.
 
 ## Privacy
 
-ptop reads local files and local process/open-file metadata only. No API keys, no auth. The default Pi mode is metadata-only and does not generate summaries or make network calls. It reads owned parent session JSONL for identity and numeric telemetry, but does not retain or publish prompt text, assistant text, tool arguments, or tool results. Its subagent adapter reads supported `status.json` files only, not child transcripts, prompt files, events, output logs, or tool-argument files. Legacy mode can generate session summaries through `claude --print`; that command may call the Claude API.
+ptop does not retain or publish prompt text, assistant text, tool arguments, tool results, or child transcripts. Pi session parsing keeps identity and numeric telemetry only. Fleet collection reads supported lifecycle status metadata, not child output logs or transcript files.
 
-The JSON snapshot includes `monitor_mode`, `token_rate_value`, and structured Pi `telemetry` fields. Process-only Pi rows use `null` for authoritative context, usage, and token-rate values; the legacy numeric fields remain compatibility placeholders. Pi output never includes child command arguments, prompts, task text, tool arguments, tool results, or transcript content. It reduces child commands to executable labels. Legacy snapshots can include `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Treat snapshots as local/private data. Do not write them to shared logs or expose them on a network without access controls.
+TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. Package installation and `ptop --update` are separate user-requested operations.
 
 ## Acknowledgements
 

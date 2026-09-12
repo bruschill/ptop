@@ -1,7 +1,6 @@
 use crate::app::App;
 use crate::locale::t;
 use crate::theme::Theme;
-use chrono::Timelike;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -133,15 +132,6 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         }
     }
 
-    let now = chrono::Utc::now();
-    let peak_info = peak_hours_warning(app.is_pi_mode(), now.hour(), now.minute());
-    if let Some(ref peak) = peak_info.filter(|_| !compact) {
-        spans.push(Span::styled(
-            format!(" {peak} "),
-            Style::default().fg(theme.warning_fg),
-        ));
-    }
-
     let visible_count = app.visible_indices().len();
     let sessions_label = t("footer.sessions");
     let count_label = if visible_count < app.sessions.len() {
@@ -167,19 +157,6 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// US business hours = PT 5am–11am = UTC 12:00–18:00.
-fn peak_hours_warning(pi_mode: bool, hour: u32, minute: u32) -> Option<String> {
-    if pi_mode || !(12..18).contains(&hour) {
-        return None;
-    }
-    let mins_left = (18 - hour) * 60 - minute;
-    let h = mins_left / 60;
-    let m = mins_left % 60;
-    let peak_label = t("footer.peak_hours");
-    let resets_in = t("footer.resets_in");
-    Some(format!("⚡{} ({} {}h{:02}m)", peak_label, resets_in, h, m))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,14 +165,8 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
-    fn pi_mode_suppresses_provider_peak_hours_warning() {
-        assert!(peak_hours_warning(true, 13, 0).is_none());
-        assert!(peak_hours_warning(false, 13, 0).is_some());
-    }
-
-    #[test]
     fn footer_renders_concise_cmux_socket_failure() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         app.set_status("cmux: socket broken; restart cmux".to_string());
 
         let backend = TestBackend::new(120, 1);

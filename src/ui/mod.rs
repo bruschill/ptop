@@ -3,10 +3,8 @@ mod context;
 mod footer;
 mod header;
 mod help;
-mod mcp;
 mod ports;
 mod projects;
-mod quota;
 mod runs;
 mod sessions;
 mod tokens;
@@ -82,35 +80,6 @@ pub(crate) fn meter_bar(
     for i in 0..width {
         if i < filled {
             let cell_pct = (i as f64 / width as f64) * 100.0;
-            spans.push(Span::styled(
-                "■",
-                Style::default().fg(grad_at(gradient, cell_pct)),
-            ));
-        } else {
-            spans.push(Span::styled("■", Style::default().fg(meter_bg)));
-        }
-    }
-    spans
-}
-
-/// Meter bar showing remaining quota: filled = remaining, color reflects urgency.
-/// When remaining is high → green (safe), when low → red (danger).
-pub(crate) fn remaining_bar(
-    remaining_pct: f64,
-    width: usize,
-    gradient: &[Color; 101],
-    meter_bg: Color,
-) -> Vec<Span<'static>> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let clamped = remaining_pct.clamp(0.0, 100.0);
-    let filled = ((clamped / 100.0) * width as f64).round() as usize;
-    let used_pct = 100.0 - clamped;
-    let mut spans = Vec::new();
-    for i in 0..width {
-        if i < filled {
-            let cell_pct = used_pct;
             spans.push(Span::styled(
                 "■",
                 Style::default().fg(grad_at(gradient, cell_pct)),
@@ -405,9 +374,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         .any(|(panel, _)| *panel == DesktopPanel::Runs);
     for (panel, area) in &layout.mid {
         match panel {
-            DesktopPanel::Narrow(NarrowSection::Quota) => {
-                quota::draw_quota_panel(f, app, *area, theme)
-            }
             DesktopPanel::Narrow(NarrowSection::Tokens) => {
                 tokens::draw_tokens_panel(f, app, *area, theme)
             }
@@ -417,7 +383,6 @@ pub fn draw(f: &mut Frame, app: &App) {
             DesktopPanel::Narrow(NarrowSection::Ports) => {
                 ports::draw_ports_panel(f, app, *area, theme)
             }
-            DesktopPanel::Narrow(NarrowSection::Mcp) => mcp::draw_mcp_panel(f, app, *area, theme),
             DesktopPanel::Runs => runs::draw_runs_panel(f, app, *area, theme),
             DesktopPanel::Narrow(NarrowSection::Sessions | NarrowSection::Context) => {}
         }
@@ -437,9 +402,6 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     const MID_MIN: u16 = 6;
 
     let mut mid_sections = Vec::new();
-    if app.show_quota {
-        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Quota));
-    }
     if app.show_tokens {
         mid_sections.push(DesktopPanel::Narrow(NarrowSection::Tokens));
     }
@@ -449,14 +411,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     if app.show_ports {
         mid_sections.push(DesktopPanel::Narrow(NarrowSection::Ports));
     }
-    if app.show_mcp {
-        mid_sections.push(DesktopPanel::Narrow(NarrowSection::Mcp));
-    }
-    if app.is_pi_mode()
-        && app.show_sessions
-        && area.width >= RUNS_PROMOTION_WIDTH
-        && runs::selected_has_runs(app)
-    {
+    if app.show_sessions && area.width >= RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
         mid_sections.push(DesktopPanel::Runs);
     }
 
@@ -464,7 +419,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let mid_h_ideal: u16 = 8;
     let sessions_ideal: u16 = if app.show_sessions {
         let base = (app.sessions.len() as u16 * 2 + 7).max(8);
-        if app.is_pi_mode() && area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
+        if area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
             base.saturating_add(7)
         } else {
             base
@@ -699,10 +654,8 @@ fn draw_narrow_section(
             projects::draw_projects_panel_active(f, app, area, theme, active)
         }
         NarrowSection::Context => context::draw_context_panel_active(f, app, area, theme, active),
-        NarrowSection::Quota => quota::draw_quota_panel_active(f, app, area, theme, active),
         NarrowSection::Tokens => tokens::draw_tokens_panel_active(f, app, area, theme, active),
         NarrowSection::Ports => ports::draw_ports_panel_active(f, app, area, theme, active),
-        NarrowSection::Mcp => mcp::draw_mcp_panel_active(f, app, area, theme, active),
     }
 }
 
@@ -874,20 +827,8 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
 
     let inner_h = area.height.saturating_sub(2);
     let visible = app.visible_indices();
-    let session_rows: u16 = visible
-        .iter()
-        .map(|&i| {
-            let base = 2u16;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len() as u16
-            } else {
-                base
-            }
-        })
-        .sum();
-    let detail_reserve: u16 = if app.show_timeline {
-        (inner_h * 2 / 3).min(inner_h.saturating_sub(5))
-    } else if inner_h <= 12 {
+    let session_rows = visible.len() as u16 * 2;
+    let detail_reserve: u16 = if inner_h <= 12 {
         6.min(inner_h.saturating_sub(3))
     } else {
         10.min(inner_h / 2)
@@ -901,35 +842,13 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
 
     let visible_rows = table_h.saturating_sub(1) as usize;
     let selected_pos = visible.iter().position(|&i| i == app.selected).unwrap_or(0);
-    let selected_row_start: usize = visible
-        .iter()
-        .take(selected_pos)
-        .map(|&i| {
-            let base = 2;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len()
-            } else {
-                base
-            }
-        })
-        .sum();
-    let selected_session_rows = if app.tree_view {
-        2 + app
-            .sessions
-            .get(app.selected)
-            .map_or(0, |s| s.subagents.len())
-    } else {
-        2
-    };
+    let selected_row_start = selected_pos * 2;
+    let selected_session_rows = 2;
     let scroll_offset = (selected_row_start + selected_session_rows).saturating_sub(visible_rows);
     let target_row = scroll_offset + row.saturating_sub(table_y + 1) as usize;
     let mut offset = 0usize;
     for &idx in &visible {
-        let rows = if app.tree_view {
-            2 + app.sessions[idx].subagents.len()
-        } else {
-            2
-        };
+        let rows = 2;
         if target_row >= offset && target_row < offset + rows {
             return Some(idx);
         }
@@ -968,16 +887,6 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 // ── utility functions ────────────────────────────────────────────────────────
-
-pub(crate) fn fmt_mem_kb(kb: u64) -> String {
-    if kb >= 1_048_576 {
-        format!("{:.1}G", kb as f64 / 1_048_576.0)
-    } else if kb >= 1024 {
-        format!("{}M", kb / 1024)
-    } else {
-        format!("{}K", kb)
-    }
-}
 
 pub(crate) fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
@@ -1053,8 +962,6 @@ mod tests {
         assert_eq!(fmt_age(60), "1m ago");
         assert_eq!(fmt_age(125), "2m ago");
         assert_eq!(fmt_age(7_200), "2h ago");
-        // Regression: the quota panel used to render this raw as "341493ago"
-        // because it formatted seconds without unit conversion.
         assert_eq!(fmt_age(341_493), "3d ago");
     }
 
@@ -1070,7 +977,7 @@ mod tests {
             proc_misc: Color::Rgb(4, 5, 6),
             ..Theme::default()
         };
-        let app = App::new_with_config(theme, &[], PanelVisibility::default());
+        let app = App::new(theme, PanelVisibility::default());
         let backend = TestBackend::new(MIN_WIDTH, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -1150,7 +1057,7 @@ mod tests {
 
     #[test]
     fn compact_tab_switch_renders_selected_panel() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.set_narrow_tab(NarrowTab::Usage);
 
@@ -1160,8 +1067,8 @@ mod tests {
         let text = format!("{}", terminal.backend());
 
         assert!(
-            text.contains("quota"),
-            "usage tab should render quota panel\n{text}"
+            text.contains("context"),
+            "usage tab should render context panel\n{text}"
         );
         assert!(
             text.contains("tokens"),
@@ -1175,7 +1082,7 @@ mod tests {
 
     #[test]
     fn compact_click_targets_tabs_and_sessions() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let area = Rect {
             x: 0,
@@ -1227,7 +1134,7 @@ mod tests {
 
     #[test]
     fn compact_tabs_highlight_only_active_tab() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let area = Rect {
             x: 0,
@@ -1290,7 +1197,7 @@ mod tests {
 
     #[test]
     fn compact_sections_split_evenly_and_ports_kill_is_clickable() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let area = Rect {
             x: 0,
@@ -1301,7 +1208,7 @@ mod tests {
         let body = narrow_chunks(area)[1];
 
         let usage_sections = narrow_section_areas(&app, NarrowTab::Usage, body);
-        assert_eq!(usage_sections.len(), 3);
+        assert_eq!(usage_sections.len(), 2);
         let min_h = usage_sections
             .iter()
             .map(|(_, area)| area.height)
@@ -1340,7 +1247,7 @@ mod tests {
 
     #[test]
     fn compact_zoom_renders_only_selected_section() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         let area = Rect {
             x: 0,
@@ -1350,17 +1257,17 @@ mod tests {
         };
         let body = narrow_chunks(area)[1];
 
-        app.toggle_narrow_section_zoom(NarrowSection::Quota);
+        app.toggle_narrow_section_zoom(NarrowSection::Context);
         let sections = narrow_section_areas(&app, NarrowTab::Usage, body);
         assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0], (NarrowSection::Quota, body));
+        assert_eq!(sections[0], (NarrowSection::Context, body));
 
         let backend = TestBackend::new(69, 27);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = format!("{}", terminal.backend());
         assert!(
-            text.contains("quota(*)"),
+            text.contains("context(*)"),
             "zoomed section should stay active\n{text}"
         );
         assert!(
@@ -1371,7 +1278,7 @@ mod tests {
 
     #[test]
     fn desktop_click_targets_sessions_and_ports() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         for session in &mut app.sessions {
             session.children.clear();
@@ -1403,32 +1310,6 @@ mod tests {
     }
 
     #[test]
-    fn desktop_default_detail_shows_chat_instead_of_timeline() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
-        crate::demo::populate_demo(&mut app);
-        app.sessions[app.selected].children.clear();
-        app.sessions[app.selected].subagents.clear();
-
-        let backend = TestBackend::new(160, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
-        let text = format!("{}", terminal.backend());
-
-        assert!(
-            text.contains("CHAT"),
-            "chat should render by default\n{text}"
-        );
-        assert!(
-            text.contains("webhook signatures"),
-            "recent chat tail should render selected session messages\n{text}"
-        );
-        assert!(
-            !text.contains("TIMELINE"),
-            "timeline should be opt-in via l toggle\n{text}"
-        );
-    }
-
-    #[test]
     fn pi_process_only_layouts_are_truthful_at_supported_sizes() {
         for (width, height) in [(80, 24), (100, 24), (160, 40)] {
             let text = render_pi_process(width, height);
@@ -1440,17 +1321,19 @@ mod tests {
                 text.contains("process only"),
                 "missing attachment state at {width}x{height}\n{text}"
             );
-            assert!(
-                !text.contains("quota"),
-                "quota rendered in Pi mode at {width}x{height}\n{text}"
-            );
+            for removed_panel in ["quota", "mcp"] {
+                assert!(
+                    !text.to_lowercase().contains(removed_panel),
+                    "{removed_panel} rendered at {width}x{height}\n{text}"
+                );
+            }
         }
     }
 
     #[test]
     fn desktop_size_keeps_mid_panels() {
         let text = render_demo(120, 40);
-        for label in ["quota", "tokens", "projects", "ports", "sessions"] {
+        for label in ["tokens", "projects", "ports", "sessions"] {
             assert!(
                 text.contains(label),
                 "desktop should render {label}\n{text}"
@@ -1471,7 +1354,7 @@ mod tests {
                 "stale run warning is missing at {width}x{height}\n{text}"
             );
             assert!(
-                !text.contains("⁷runs"),
+                !text.contains("⁶runs"),
                 "runs panel promoted too early at {width}x{height}\n{text}"
             );
         }
@@ -1479,7 +1362,7 @@ mod tests {
         for width in [140, 160] {
             let text = render_pi_fleet(width, 40);
             assert!(
-                text.contains("⁷runs"),
+                text.contains("⁶runs"),
                 "wide layout did not promote runs at {width} columns\n{text}"
             );
             assert!(
@@ -1562,7 +1445,7 @@ mod tests {
     }
 
     fn render_demo(width: u16, height: u16) -> String {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
 
         let backend = TestBackend::new(width, height);
@@ -1572,11 +1455,10 @@ mod tests {
     }
 
     fn pi_fleet_app() -> App {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];
-        session.agent_cli = "pi";
         session.session_id = "parent-session-ＡＢ-with-a-very-long-identity".to_string();
         session.project_name = "project-ＡＢ-with-a-very-long-name".to_string();
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(123));
@@ -1638,11 +1520,10 @@ mod tests {
     }
 
     fn render_pi_process(width: u16, height: u16) -> String {
-        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];
-        session.agent_cli = "pi";
         session.pid = 42;
         session.session_id = "process-42".to_string();
         session.context_percent = 0.0;

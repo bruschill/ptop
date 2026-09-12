@@ -398,7 +398,7 @@ fn status_candidates(async_root: &Path) -> Result<StatusScan, &'static str> {
             identity: status_file_identity(&status_path_metadata),
         });
     }
-    candidates.sort_by(|left, right| right.modified_at_ms.cmp(&left.modified_at_ms));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified_at_ms));
     if candidates.len() > MAX_STATUS_FILES {
         omitted = omitted.saturating_add(candidates.len() - MAX_STATUS_FILES);
         candidates.truncate(MAX_STATUS_FILES);

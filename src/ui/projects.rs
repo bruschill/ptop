@@ -87,6 +87,6 @@ pub(crate) fn draw_projects_panel_active(
         )));
     }
 
-    let block = btop_block_active("projects", "⁴", theme.mem_box, theme, active);
+    let block = btop_block_active("projects", "³", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

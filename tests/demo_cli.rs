@@ -22,20 +22,28 @@ fn pi_demo_json_uses_the_supported_fleet_contract() {
 
     assert!(output.status.success());
     let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let fleet = &snapshot["sessions"][0]["telemetry"]["fleet"];
+    let sessions = snapshot["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 3);
+    for session in sessions {
+        assert!(session["telemetry"].is_object());
+        assert!(session.get("agent_cli").is_none());
+        assert!(session.get("chat_messages").is_none());
+        assert!(session.get("tool_calls").is_none());
+    }
+
+    let fleet = &sessions[0]["telemetry"]["fleet"];
     assert_eq!(fleet["foreground_visibility"], "unavailable");
     assert_eq!(fleet["background_visibility"], "supported");
     assert_eq!(fleet["runs"][0]["lifecycle_version"], 3);
 }
 
 #[test]
-fn legacy_demo_once_remains_available_when_explicitly_requested() {
-    let output = ptop()
-        .args(["--legacy", "--demo", "--once"])
-        .output()
-        .unwrap();
+fn removed_and_unknown_options_are_rejected() {
+    for option in ["--legacy", "--setup", "--unknown"] {
+        let output = ptop().arg(option).output().unwrap();
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with("ptop — 5 sessions"), "{stdout}");
+        assert!(!output.status.success(), "{option} unexpectedly succeeded");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(option), "{stderr}");
+    }
 }

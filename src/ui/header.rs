@@ -9,11 +9,7 @@ use ratatui::Frame;
 
 pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let session_count = app.sessions.len();
-    let active = if app.is_pi_mode() {
-        "—".to_string()
-    } else {
-        app.agent_aggregate.active_count.to_string()
-    };
+    let active = "—";
 
     let now = chrono::Local::now().format("%H:%M").to_string();
     let version = env!("CARGO_PKG_VERSION");

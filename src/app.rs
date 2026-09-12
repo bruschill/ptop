@@ -1,18 +1,14 @@
-use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::collector::Collector;
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
-use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
+use crate::model::{AgentSession, OrphanPort, SessionStatus};
 use crate::theme::Theme;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::time::Instant;
 
 /// Maximum data points kept for the live token-rate graph.
 const GRAPH_HISTORY_LEN: usize = 200;
-/// Max concurrent summary jobs.
-const MAX_SUMMARY_JOBS: usize = 3;
-/// Max summary attempts per session before giving up.
-const MAX_SUMMARY_RETRIES: u32 = 2;
 
 fn next_packaged_theme_name(theme: &Theme) -> &'static str {
     let names = crate::theme::THEME_NAMES;
@@ -24,15 +20,6 @@ fn next_packaged_theme_name(theme: &Theme) -> &'static str {
             .unwrap_or(names[0]),
         crate::theme::ThemeSource::File { .. } => names[0],
     }
-}
-
-/// Produce a terminal-safe fallback summary from a raw prompt.
-fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
-    prompt
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .take(max_len)
-        .collect()
 }
 
 /// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
@@ -80,32 +67,23 @@ pub enum NarrowSection {
     Sessions,
     Projects,
     Context,
-    Quota,
     Tokens,
     Ports,
-    Mcp,
 }
 
 impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
             Self::Sessions | Self::Projects => NarrowTab::Work,
-            Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
-            Self::Ports | Self::Mcp => NarrowTab::System,
+            Self::Context | Self::Tokens => NarrowTab::Usage,
+            Self::Ports => NarrowTab::System,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorMode {
-    Pi,
-    Legacy,
-}
-
+#[cfg(not(target_os = "windows"))]
 struct KillConfirmation {
     pid: u32,
-    agent_cli: &'static str,
     session_id: String,
     process_start_id: Option<String>,
     created_at: Instant,
@@ -119,58 +97,29 @@ pub struct App {
     pub token_rates: VecDeque<f64>,
     /// Whether the latest token-rate observation is authoritative.
     pub token_rate_known: bool,
-    /// Account-level rate limits (Claude, Codex, etc.)
-    pub rate_limits: Vec<RateLimitInfo>,
-    /// Per-session previous token totals, keyed by (agent_cli, session_id).
-    prev_tokens: HashMap<(String, String), u64>,
-    /// Rate limit poll counter (read every 5 ticks = 10s)
-    rate_limit_counter: u32,
-    collector: MultiCollector,
-    pub monitor_mode: MonitorMode,
-    /// Cached LLM-generated summaries, keyed by session_id.
-    pub summaries: HashMap<String, String>,
-    /// Session IDs currently being summarized.
-    pending_summaries: HashSet<String>,
-    /// Per-session retry count for failed summary attempts.
-    summary_retries: HashMap<String, u32>,
-    /// Channel to receive completed summaries from background threads.
-    /// Tuple: (session_id, prompt, maybe_summary).
-    summary_rx: mpsc::Receiver<(String, String, Option<String>)>,
-    summary_tx: mpsc::Sender<(String, String, Option<String>)>,
+    /// Per-session previous token totals, keyed by session ID.
+    prev_tokens: HashMap<String, u64>,
+    collector: Collector,
     /// Ports left open by processes whose parent sessions have ended.
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
     /// Stable process/session identity awaiting a second kill key press.
+    #[cfg(not(target_os = "windows"))]
     kill_confirm: Option<KillConfirmation>,
     pub theme: Theme,
     pub show_context: bool,
-    pub show_quota: bool,
-    legacy_quota_preference: bool,
     pub show_tokens: bool,
     pub show_projects: bool,
     pub show_ports: bool,
     pub show_sessions: bool,
-    pub show_mcp: bool,
-    legacy_mcp_preference: bool,
     pub narrow_tab: NarrowTab,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
-    /// MCP servers detected on the most recent tick (sourced from
-    /// MultiCollector). Populated regardless of `show_mcp` so panel
-    /// toggling doesn't cost a discovery roundtrip.
-    pub mcp_servers: Vec<McpServer>,
-    /// When true (default), mcp-server-owned rollouts are hidden from
-    /// the sessions panel. Toggle with Shift+M.
-    pub mcp_suppress_sessions: bool,
     pub config_open: bool,
     pub config_selected: usize,
-    pub tree_view: bool,
     pub filter_text: String,
     pub filter_active: bool,
-    pub show_timeline: bool,
-    pub timeline_scroll: usize,
-    pub show_file_audit: bool,
     /// Host vitals sampler (CPU% delta needs prior snapshot).
     host_sampler: HostSampler,
     /// Latest host metrics snapshot (None until first valid sample).
@@ -184,112 +133,38 @@ pub struct App {
 }
 
 impl App {
-    #[cfg(test)]
-    pub fn new_with_config(
-        theme: Theme,
-        hidden_agents: &[String],
-        panels: crate::config::PanelVisibility,
-    ) -> Self {
-        Self::new_with_config_and_claude_dirs(theme, hidden_agents, panels, &[])
-    }
-
-    pub fn new_with_config_and_claude_dirs(
-        theme: Theme,
-        hidden_agents: &[String],
-        panels: crate::config::PanelVisibility,
-        claude_config_dirs: &[PathBuf],
-    ) -> Self {
-        Self::new_with_collector(
-            theme,
-            panels,
-            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs),
-            MonitorMode::Legacy,
-        )
-    }
-
-    pub fn new_pi(
-        theme: Theme,
-        hidden_agents: &[String],
-        panels: crate::config::PanelVisibility,
-    ) -> Self {
-        Self::new_with_collector(
-            theme,
-            panels,
-            MultiCollector::pi_only(hidden_agents),
-            MonitorMode::Pi,
-        )
-    }
-
-    fn new_with_collector(
-        theme: Theme,
-        panels: crate::config::PanelVisibility,
-        mut collector: MultiCollector,
-        monitor_mode: MonitorMode,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let summaries = if monitor_mode == MonitorMode::Legacy {
-            load_summary_cache()
-        } else {
-            HashMap::new()
-        };
-        collector.set_mcp_suppress(true);
-        let pi_mode = monitor_mode == MonitorMode::Pi;
+    pub fn new(theme: Theme, panels: crate::config::PanelVisibility) -> Self {
         Self {
             sessions: Vec::new(),
             selected: 0,
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
-            token_rate_known: !pi_mode,
-            rate_limits: Vec::new(),
+            token_rate_known: false,
             prev_tokens: HashMap::new(),
-            rate_limit_counter: 5,
-            collector,
-            monitor_mode,
-            summaries,
-            pending_summaries: HashSet::new(),
-            summary_retries: HashMap::new(),
-            summary_rx: rx,
-            summary_tx: tx,
+            collector: Collector::new(),
             orphan_ports: Vec::new(),
             status_msg: None,
+            #[cfg(not(target_os = "windows"))]
             kill_confirm: None,
             theme,
             show_context: panels.context,
-            show_quota: panels.quota && !pi_mode,
-            legacy_quota_preference: panels.quota,
             show_tokens: panels.tokens,
             show_projects: panels.projects,
             show_ports: panels.ports,
             show_sessions: panels.sessions,
-            show_mcp: panels.mcp && !pi_mode,
-            legacy_mcp_preference: panels.mcp,
             narrow_tab: NarrowTab::Work,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
-            mcp_servers: Vec::new(),
-            mcp_suppress_sessions: true,
             config_open: false,
             config_selected: 0,
-            tree_view: false,
             filter_text: String::new(),
             filter_active: false,
-            show_timeline: false,
-            timeline_scroll: 0,
-            show_file_audit: false,
             host_sampler: HostSampler::new(),
             host_metrics: None,
             agent_aggregate: AgentAggregate::default(),
             help_open: false,
             view_open: false,
         }
-    }
-
-    pub fn is_pi_mode(&self) -> bool {
-        self.monitor_mode == MonitorMode::Pi
-    }
-
-    pub fn summaries_enabled(&self) -> bool {
-        self.monitor_mode == MonitorMode::Legacy
     }
 
     pub fn all_usage_known(&self) -> bool {
@@ -302,8 +177,7 @@ impl App {
         // Unknown samples are omitted instead of entering the graph as false
         // zero activity. If telemetry later attaches, its first known sample
         // establishes the baseline and contributes no fabricated delta.
-        self.token_rate_known =
-            (!self.is_pi_mode() || !self.sessions.is_empty()) && self.all_usage_known();
+        self.token_rate_known = !self.sessions.is_empty() && self.all_usage_known();
         if !self.token_rate_known {
             self.token_rates.clear();
             self.prev_tokens.clear();
@@ -312,7 +186,7 @@ impl App {
 
         let mut rate: f64 = 0.0;
         for session in &self.sessions {
-            let key = (session.agent_cli.to_string(), session.session_id.clone());
+            let key = session.session_id.clone();
             let total = session.active_tokens();
             let previous = self.prev_tokens.get(&key).copied().unwrap_or(total);
             rate += total.saturating_sub(previous) as f64;
@@ -340,66 +214,29 @@ impl App {
     }
 
     pub fn toggle_panel(&mut self, panel: u8) {
-        if self.is_pi_mode() && matches!(panel, 2 | 7) {
-            self.set_status("This panel is unavailable in Pi mode".to_string());
-            return;
-        }
         match panel {
             1 => self.show_context = !self.show_context,
-            2 => self.show_quota = !self.show_quota,
-            3 => self.show_tokens = !self.show_tokens,
-            4 => self.show_projects = !self.show_projects,
-            5 => self.show_ports = !self.show_ports,
-            6 => self.show_sessions = !self.show_sessions,
-            7 => self.show_mcp = !self.show_mcp,
+            2 => self.show_tokens = !self.show_tokens,
+            3 => self.show_projects = !self.show_projects,
+            4 => self.show_ports = !self.show_ports,
+            5 => self.show_sessions = !self.show_sessions,
             _ => return,
         }
         self.persist_panel_visibility();
         self.clamp_narrow_tab();
     }
 
-    /// Toggle whether mcp-server-owned rollouts are hidden from the
-    /// sessions panel. Default is on; turning it off restores upstream
-    /// behavior so the user can see exactly what mcp-server fd holding
-    /// produces (mostly stale "Done" rows).
-    pub fn toggle_mcp_session_suppression(&mut self) {
-        if self.is_pi_mode() {
-            return;
-        }
-        self.mcp_suppress_sessions = !self.mcp_suppress_sessions;
-        let label = if self.mcp_suppress_sessions {
-            "on"
-        } else {
-            "off"
-        };
-        self.set_status(format!("mcp session suppression: {}", label));
-    }
-
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
             context: self.show_context,
-            quota: if self.is_pi_mode() {
-                self.legacy_quota_preference
-            } else {
-                self.show_quota
-            },
             tokens: self.show_tokens,
             projects: self.show_projects,
             ports: self.show_ports,
             sessions: self.show_sessions,
-            mcp: if self.is_pi_mode() {
-                self.legacy_mcp_preference
-            } else {
-                self.show_mcp
-            },
         };
         if let Err(e) = crate::config::save_panel_visibility(&panels) {
             self.set_status(format!("panels save failed: {}", e));
         }
-    }
-
-    pub fn toggle_file_audit(&mut self) {
-        self.show_file_audit = !self.show_file_audit;
     }
 
     pub fn toggle_config(&mut self) {
@@ -410,7 +247,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        8 // theme + 7 panel toggles
+        6 // theme + 5 panel toggles
     }
 
     pub fn config_select_next(&mut self) {
@@ -424,22 +261,16 @@ impl App {
     }
 
     pub fn config_toggle_selected(&mut self) {
-        if self.is_pi_mode() && matches!(self.config_selected, 2 | 7) {
-            self.set_status("This panel is unavailable in Pi mode".to_string());
-            return;
-        }
         match self.config_selected {
             0 => {
                 self.cycle_theme();
                 return;
             }
             1 => self.show_context = !self.show_context,
-            2 => self.show_quota = !self.show_quota,
-            3 => self.show_tokens = !self.show_tokens,
-            4 => self.show_projects = !self.show_projects,
-            5 => self.show_ports = !self.show_ports,
-            6 => self.show_sessions = !self.show_sessions,
-            7 => self.show_mcp = !self.show_mcp,
+            2 => self.show_tokens = !self.show_tokens,
+            3 => self.show_projects = !self.show_projects,
+            4 => self.show_ports = !self.show_ports,
+            5 => self.show_sessions = !self.show_sessions,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -449,8 +280,8 @@ impl App {
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
             NarrowTab::Work => self.show_sessions || self.show_projects,
-            NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
-            NarrowTab::System => self.show_ports || self.show_mcp,
+            NarrowTab::Usage => self.show_context || self.show_tokens,
+            NarrowTab::System => self.show_ports,
         }
     }
 
@@ -512,22 +343,16 @@ impl App {
             NarrowSection::Sessions => self.show_sessions,
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
-            NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Ports => self.show_ports,
-            NarrowSection::Mcp => self.show_mcp,
         }
     }
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
             NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
-            NarrowTab::Usage => &[
-                NarrowSection::Context,
-                NarrowSection::Quota,
-                NarrowSection::Tokens,
-            ],
-            NarrowTab::System => &[NarrowSection::Ports, NarrowSection::Mcp],
+            NarrowTab::Usage => &[NarrowSection::Context, NarrowSection::Tokens],
+            NarrowTab::System => &[NarrowSection::Ports],
         };
         sections
             .iter()
@@ -592,11 +417,6 @@ impl App {
         }
     }
 
-    pub fn toggle_timeline(&mut self) {
-        self.show_timeline = !self.show_timeline;
-        self.timeline_scroll = 0;
-    }
-
     pub fn cycle_theme(&mut self) {
         let catalog = crate::theme::ThemeCatalog::packaged();
         let name = next_packaged_theme_name(&self.theme);
@@ -619,129 +439,18 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
-    /// Full refresh used by the TUI. Legacy mode also generates and retries
-    /// session summaries; Pi mode only performs passive collection.
+    /// Refresh Pi sessions and shared process enrichment.
     pub fn tick(&mut self) {
-        self.tick_no_summaries();
-        if self.summaries_enabled() {
-            self.drain_and_retry_summaries();
-        }
-    }
-
-    /// Refresh all monitored data WITHOUT spawning background summary jobs.
-    ///
-    /// In legacy mode, `tick` can call [`App::drain_and_retry_summaries`],
-    /// which shells out to `claude --print`. Headless consumers can call this
-    /// variant to prevent summary subprocesses. Pi mode never enables them.
-    pub fn tick_no_summaries(&mut self) {
-        self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
-        self.sessions = self.collector.collect();
-        self.orphan_ports = self.collector.orphan_ports.clone();
-        self.mcp_servers = self.collector.mcp_servers.clone();
+        let (sessions, orphan_ports) = self.collector.collect();
+        self.sessions = sessions;
+        self.orphan_ports = orphan_ports;
         self.host_metrics = self.host_sampler.sample();
         self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
         }
         self.clamp_selection_to_visible();
-
         self.update_token_rate();
-
-        // Pi has no provider-independent account quota source. Do not read or
-        // publish legacy Claude/Codex quota files in Pi mode.
-        if self.is_pi_mode() {
-            self.rate_limits.clear();
-        } else {
-            // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
-            if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
-                self.rate_limit_counter = 0;
-                let extra_dirs = self.collector.all_config_dirs();
-                self.rate_limits = read_rate_limits(&extra_dirs);
-                // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
-                self.rate_limits.extend(self.collector.agent_rate_limits());
-            } else {
-                self.rate_limit_counter += 1;
-            }
-
-            promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
-        }
-    }
-
-    /// Drain completed summary results and spawn retries. Does NOT recollect
-    /// sessions, so it is safe for `--once` mode (stable snapshot).
-    pub fn drain_and_retry_summaries(&mut self) {
-        if !self.summaries_enabled() {
-            return;
-        }
-        while let Ok((sid, prompt, maybe_summary)) = self.summary_rx.try_recv() {
-            self.pending_summaries.remove(&sid);
-            match maybe_summary {
-                Some(summary) => {
-                    self.summary_retries.remove(&sid);
-                    self.summaries.insert(sid, summary);
-                    save_summary_cache(&self.summaries);
-                }
-                None => {
-                    let count = self.summary_retries.entry(sid.clone()).or_insert(0);
-                    *count += 1;
-                    if *count >= MAX_SUMMARY_RETRIES {
-                        // Exhausted — store sanitized fallback using prompt from worker
-                        self.summaries.insert(sid, sanitize_fallback(&prompt, 80));
-                        save_summary_cache(&self.summaries);
-                    }
-                }
-            }
-        }
-
-        // Spawn summary jobs for sessions that need one
-        for s in &self.sessions {
-            let retries = self
-                .summary_retries
-                .get(&s.session_id)
-                .copied()
-                .unwrap_or(0);
-            let has_input = !s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty();
-            if has_input
-                && !self.summaries.contains_key(&s.session_id)
-                && !self.pending_summaries.contains(&s.session_id)
-                && self.pending_summaries.len() < MAX_SUMMARY_JOBS
-                && retries < MAX_SUMMARY_RETRIES
-            {
-                self.pending_summaries.insert(s.session_id.clone());
-                let sid = s.session_id.clone();
-                let prompt = s.initial_prompt.clone();
-                let assistant_text = s.first_assistant_text.clone();
-                let tx = self.summary_tx.clone();
-                std::thread::spawn(move || {
-                    let result = generate_summary(&prompt, &assistant_text);
-                    let fallback_text = if prompt.is_empty() {
-                        assistant_text
-                    } else {
-                        prompt
-                    };
-                    let _ = tx.send((sid, fallback_text, result));
-                });
-            }
-        }
-    }
-
-    pub fn has_pending_summaries(&self) -> bool {
-        !self.pending_summaries.is_empty()
-    }
-
-    /// True if any session still qualifies for a summary retry.
-    pub fn has_retryable_summaries(&self) -> bool {
-        self.sessions.iter().any(|s| {
-            (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
-                && !self.summaries.contains_key(&s.session_id)
-                && !self.pending_summaries.contains(&s.session_id)
-                && self
-                    .summary_retries
-                    .get(&s.session_id)
-                    .copied()
-                    .unwrap_or(0)
-                    < MAX_SUMMARY_RETRIES
-        })
     }
 
     /// Returns indices of sessions matching the current filter.
@@ -762,7 +471,6 @@ impl App {
         s.project_name.to_lowercase().contains(query)
             || s.model.to_lowercase().contains(query)
             || s.session_id.to_lowercase().contains(query)
-            || s.initial_prompt.to_lowercase().contains(query)
             || s.cwd.to_lowercase().contains(query)
             || format!("{:?}", s.status).to_lowercase().contains(query)
     }
@@ -828,30 +536,33 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "windows")]
     pub fn kill_selected(&mut self) {
         if self.sessions.is_empty() {
             return;
         }
         let session = &self.sessions[self.selected];
-        if matches!(session.status, SessionStatus::Done)
-            || (matches!(session.status, SessionStatus::Unknown) && session.agent_cli != "pi")
-            || session.pid == 0
-        {
+        if matches!(session.status, SessionStatus::Done) || session.pid == 0 {
             return;
         }
-        #[cfg(target_os = "windows")]
-        if session.agent_cli == "pi" {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
-            return;
-        }
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+    }
 
-        let selected_identity = (session.pid, session.agent_cli, session.session_id.clone());
+    #[cfg(not(target_os = "windows"))]
+    pub fn kill_selected(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let session = &self.sessions[self.selected];
+        if matches!(session.status, SessionStatus::Done) || session.pid == 0 {
+            return;
+        }
+        let selected_identity = (session.pid, session.session_id.clone());
 
         // Confirm against stable process/session identity, not a mutable table row.
         if let Some(target) = self.kill_confirm.take() {
-            let same_target = target.pid == selected_identity.0
-                && target.agent_cli == selected_identity.1
-                && target.session_id == selected_identity.2;
+            let same_target =
+                target.pid == selected_identity.0 && target.session_id == selected_identity.1;
             if same_target && target.created_at.elapsed().as_secs() < 2 {
                 let process_info = crate::collector::process::get_process_info();
                 let verified = process_info.get(&target.pid).is_some_and(|proc| {
@@ -859,9 +570,7 @@ impl App {
                         crate::collector::pi::process_start_id(target.pid).as_ref()
                             == Some(expected)
                     });
-                    same_start
-                        && command_matches_agent(&proc.command, target.agent_cli)
-                        && is_killable_agent_command(&proc.command)
+                    same_start && is_killable_agent_command(&proc.command)
                 });
                 if !verified {
                     self.set_status(format!(
@@ -878,14 +587,9 @@ impl App {
             }
         }
 
-        let name = self
-            .summaries
-            .get(&session.session_id)
-            .cloned()
-            .unwrap_or_else(|| format!("PID {}", session.pid));
+        let name = self.session_summary(session);
         self.kill_confirm = Some(KillConfirmation {
             pid: session.pid,
-            agent_cli: session.agent_cli,
             session_id: session.session_id.clone(),
             process_start_id: session
                 .process_start_id
@@ -899,13 +603,16 @@ impl App {
     /// Kill all orphan port processes (Shift+X).
     /// Does a fresh port scan and validates PID identity + port ownership
     /// immediately before sending any signals to avoid PID reuse / stale cache issues.
+    #[cfg(target_os = "windows")]
     pub fn kill_orphan_ports(&mut self) {
-        #[cfg(target_os = "windows")]
-        if self.is_pi_mode() {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
-            return;
-        }
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+    }
 
+    /// Kill all orphan port processes (Shift+X).
+    /// Does a fresh port scan and validates PID identity + port ownership
+    /// immediately before sending any signals to avoid PID reuse / stale cache issues.
+    #[cfg(not(target_os = "windows"))]
+    pub fn kill_orphan_ports(&mut self) {
         use crate::collector::process::get_listening_ports;
 
         // Fresh port scan right now — don't rely on cached data
@@ -944,261 +651,64 @@ impl App {
     /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
+    #[cfg(target_os = "windows")]
     pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
         let session = &self.sessions[self.selected];
-        let target_pid = session.pid;
-        let agent_cli = session.agent_cli;
-        let process_start_id = session.process_start_id.clone();
-
-        #[cfg(target_os = "windows")]
-        if agent_cli == "pi" {
-            self.set_status("Pi process controls are unavailable on Windows".to_string());
+        if session.pid == 0 {
             return JumpOutcome::NoOp;
         }
+        self.set_status("Pi process controls are unavailable on Windows".to_string());
+        JumpOutcome::NoOp
+    }
 
-        if agent_cli == "pi" {
-            let process_info = crate::collector::process::get_process_info();
-            let verified = process_info.get(&target_pid).is_some_and(|proc| {
-                let same_start = process_start_id.as_ref().is_none_or(|expected| {
-                    crate::collector::pi::process_start_id(target_pid).as_ref() == Some(expected)
-                });
-                same_start && command_matches_agent(&proc.command, agent_cli)
+    /// Jump to the terminal running the selected session's agent process.
+    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// see [`crate::jump`]. No-op when nothing is selected or no backend
+    /// recognizes the process.
+    #[cfg(not(target_os = "windows"))]
+    pub fn jump_to_session(&mut self) -> JumpOutcome {
+        if self.sessions.is_empty() {
+            return JumpOutcome::NoOp;
+        }
+        let session = &self.sessions[self.selected];
+        if session.pid == 0 {
+            return JumpOutcome::NoOp;
+        }
+        let target_pid = session.pid;
+        let process_start_id = session.process_start_id.clone();
+        let process_info = crate::collector::process::get_process_info();
+        let verified = process_info.get(&target_pid).is_some_and(|proc| {
+            let same_start = process_start_id.as_ref().is_none_or(|expected| {
+                crate::collector::pi::process_start_id(target_pid).as_ref() == Some(expected)
             });
-            if !verified {
-                self.set_status(format!(
-                    "PID {target_pid} no longer matches the selected process"
-                ));
-                return JumpOutcome::NoOp;
-            }
+            same_start && is_killable_agent_command(&proc.command)
+        });
+        if !verified {
+            self.set_status(format!(
+                "PID {target_pid} no longer matches the selected process"
+            ));
+            return JumpOutcome::NoOp;
         }
 
         crate::jump::run_jump(target_pid)
     }
 
-    /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
-    /// Done sessions skip pending state to avoid stuck "..." display.
+    /// Return the Pi telemetry attachment label shown in session tables.
     pub fn session_summary(&self, session: &AgentSession) -> String {
-        if session.agent_cli == "pi" {
-            if let Some(telemetry) = session.telemetry.as_ref() {
-                return telemetry.attachment.label().to_string();
-            }
-        }
-        if let Some(summary) = self.summaries.get(&session.session_id) {
-            summary.clone()
-        } else if matches!(session.status, SessionStatus::Done) {
-            // Done sessions: don't wait for pending summary, show fallback immediately
-            if !session.initial_prompt.is_empty() {
-                sanitize_fallback(&session.initial_prompt, 80)
-            } else if !session.first_assistant_text.is_empty() {
-                sanitize_fallback(&session.first_assistant_text, 80)
-            } else {
-                "—".to_string()
-            }
-        } else if self.pending_summaries.contains(&session.session_id) {
-            // Animate dots: . → .. → ... (cycles every ~1.5s at 2s tick)
-            let dots = match (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                / 500)
-                % 3
-            {
-                0 => ".",
-                1 => "..",
-                _ => "...",
-            };
-            dots.to_string()
-        } else if !session.initial_prompt.is_empty() {
-            sanitize_fallback(&session.initial_prompt, 80)
-        } else if !session.first_assistant_text.is_empty() {
-            sanitize_fallback(&session.first_assistant_text, 80)
-        } else {
-            "—".to_string()
-        }
+        session
+            .telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.attachment.label().to_string())
+            .unwrap_or_else(|| "process only".to_string())
     }
 }
 
-/// Call `claude --print` via stdin pipe to summarize a prompt.
-/// Returns `None` on timeout so the caller can retry later.
-fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-
-    // Build input from user prompt and/or first assistant response
-    let user_part: String = prompt.chars().take(200).collect();
-    let assistant_part: String = assistant_text.chars().take(200).collect();
-
-    let context = if !user_part.is_empty() && !assistant_part.is_empty() {
-        format!(
-            "User message: {}\n\nAssistant response: {}",
-            user_part, assistant_part
-        )
-    } else if !assistant_part.is_empty() {
-        format!("Assistant response: {}", assistant_part)
-    } else {
-        format!("User message: {}", user_part)
-    };
-
-    let request = format!(
-        "You are a conversation title generator. Given the conversation below, create a short title (3-5 words) that describes the session's main topic. Be specific and actionable. Do NOT output generic titles like 'New conversation' or 'Initial setup'. Output ONLY the title, no quotes, no explanation.\n\n{}",
-        context
-    );
-
-    let mut child = match Command::new("claude")
-        .args(["--print", "-"])
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Some(sanitize_fallback(prompt, 80)),
-    };
-
-    // Write prompt via stdin (no shell injection)
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(request.as_bytes());
-    }
-
-    // Run wait_with_output in a helper thread so we can apply a bounded timeout.
-    // This drains stdout internally, avoiding pipe-full deadlock.
-    let child_pid = child.id();
-    let (wo_tx, wo_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = wo_tx.send(child.wait_with_output());
-    });
-
-    let result = match wo_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(r) => r,
-        Err(_) => {
-            // Timeout or disconnected — kill the child so the helper thread can exit.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &child_pid.to_string()])
-                .status();
-            return None;
-        }
-    };
-
-    let fallback = sanitize_fallback(prompt, 80);
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let lower = raw.to_lowercase();
-            // Reject empty, too long, generic, or prompt-echo outputs
-            if raw.is_empty()
-                || raw.chars().count() > 80
-                || raw.contains("Summarize")
-                || raw.starts_with("- ")
-                || lower.contains("new conversation")
-                || lower.contains("initial setup")
-                || lower.contains("initial project")
-                || lower.contains("initial conversation")
-                || lower.starts_with("greeting")
-            {
-                Some(fallback)
-            } else {
-                Some(raw.trim_matches('"').trim_matches('\'').to_string())
-            }
-        }
-        _ => Some(fallback),
-    }
-}
-
-/// Cache directory: ~/.cache/ptop/
-fn cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
-        .join("ptop")
-}
-
-fn cache_path() -> std::path::PathBuf {
-    cache_dir().join("summaries.json")
-}
-
-fn load_summary_cache() -> HashMap<String, String> {
-    let path = cache_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let mut cache: HashMap<String, String> =
-                serde_json::from_str(&content).unwrap_or_default();
-            // Purge polluted or old truncated-fallback entries so they regenerate
-            let before = cache.len();
-            cache.retain(|_, v| !v.contains("You are a conversation tit") && !v.ends_with('…'));
-            if cache.len() < before {
-                // Persist cleaned cache
-                let _ = std::fs::create_dir_all(cache_dir());
-                let _ = std::fs::write(&path, serde_json::to_string(&cache).unwrap_or_default());
-            }
-            cache
-        }
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn save_summary_cache(summaries: &HashMap<String, String>) {
-    let path = cache_path();
-    let _ = std::fs::create_dir_all(cache_dir());
-    if let Ok(json) = serde_json::to_string(summaries) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-}
-
-/// Threshold above which a rate-limited bucket is surfaced as RateLimited
-/// in the session list. 90% leaves enough headroom to catch near-saturation
-/// before the account actually blocks.
-const RATE_LIMITED_PCT: f64 = 90.0;
-
-/// Promote Waiting sessions to RateLimited when a rate limit from the SAME
-/// agent CLI is over `RATE_LIMITED_PCT`. Matching on source avoids a
-/// Claude-only saturation freezing Codex sessions and vice versa.
-fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &[RateLimitInfo]) {
-    if rate_limits.is_empty() {
-        return;
-    }
-    for s in sessions.iter_mut() {
-        if s.status != SessionStatus::Waiting {
-            continue;
-        }
-        let over = rate_limits.iter().any(|rl| {
-            rl.source == s.agent_cli
-                && (rl.five_hour_pct.unwrap_or(0.0) > RATE_LIMITED_PCT
-                    || rl.seven_day_pct.unwrap_or(0.0) > RATE_LIMITED_PCT)
-        });
-        if over {
-            s.status = SessionStatus::RateLimited;
-        }
-    }
-}
-
-fn command_matches_agent(cmd: &str, agent_cli: &str) -> bool {
-    match agent_cli {
-        "claude" | "codex" | "opencode" => {
-            crate::collector::process::cmd_has_binary(cmd, agent_cli)
-        }
-        "pi" => crate::collector::pi::is_pi_command(cmd),
-        _ => false,
-    }
-}
-
-fn is_supported_agent_command(cmd: &str) -> bool {
-    command_matches_agent(cmd, "claude")
-        || command_matches_agent(cmd, "codex")
-        || command_matches_agent(cmd, "opencode")
-        || command_matches_agent(cmd, "pi")
-}
-
+#[cfg(any(not(target_os = "windows"), test))]
 fn is_killable_agent_command(cmd: &str) -> bool {
-    is_supported_agent_command(cmd)
-        && !(crate::collector::process::cmd_has_binary(cmd, "codex") && cmd.contains(" app-server"))
+    crate::collector::pi::is_pi_command(cmd)
 }
 
 #[cfg(test)]
@@ -1219,9 +729,8 @@ mod tests {
         assert_eq!(next_packaged_theme_name(&btop), "dracula");
     }
 
-    fn waiting_session(cli: &'static str) -> AgentSession {
+    fn waiting_session() -> AgentSession {
         AgentSession {
-            agent_cli: cli,
             pid: 1,
             session_id: String::new(),
             cwd: String::new(),
@@ -1244,18 +753,7 @@ mod tests {
             token_history: vec![],
             context_history: vec![],
             context_window: 0,
-            subagents: vec![],
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: vec![],
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: vec![],
-            tool_calls: vec![],
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: vec![],
-            config_root: String::new(),
             git_added: 0,
             git_modified: 0,
             telemetry: None,
@@ -1263,81 +761,25 @@ mod tests {
         }
     }
 
-    fn rate_limit(source: &str, pct: f64) -> RateLimitInfo {
-        RateLimitInfo {
-            source: source.to_string(),
-            five_hour_pct: Some(pct),
-            five_hour_resets_at: None,
-            five_hour_window_minutes: Some(300),
-            seven_day_pct: None,
-            seven_day_resets_at: None,
-            seven_day_window_minutes: None,
-            updated_at: None,
-        }
+    #[test]
+    fn kill_validation_accepts_only_pi_processes() {
+        assert!(is_killable_agent_command("pi --mode rpc"));
+        assert!(!is_killable_agent_command("/usr/local/bin/claude"));
+        assert!(!is_killable_agent_command("codex --resume abc"));
+        assert!(!is_killable_agent_command("/usr/local/bin/opencode"));
+        assert!(!is_killable_agent_command("node server.js"));
     }
 
     #[test]
-    fn test_rate_limited_promotion_is_per_agent_cli() {
-        // Claude is saturated, Codex is not. Only the Claude session should
-        // be promoted.
-        let mut sessions = vec![waiting_session("claude"), waiting_session("codex")];
-        let limits = vec![rate_limit("claude", 95.0)];
-        promote_waiting_to_rate_limited(&mut sessions, &limits);
-        assert_eq!(sessions[0].status, SessionStatus::RateLimited);
-        assert_eq!(sessions[1].status, SessionStatus::Waiting);
-    }
-
-    #[test]
-    fn test_rate_limited_promotion_ignores_below_threshold() {
-        let mut sessions = vec![waiting_session("claude")];
-        let limits = vec![rate_limit("claude", 89.9)];
-        promote_waiting_to_rate_limited(&mut sessions, &limits);
-        assert_eq!(sessions[0].status, SessionStatus::Waiting);
-    }
-
-    #[test]
-    fn test_rate_limited_promotion_skips_non_waiting_sessions() {
-        let mut sessions = vec![waiting_session("claude")];
-        sessions[0].status = SessionStatus::Thinking;
-        let limits = vec![rate_limit("claude", 99.0)];
-        promote_waiting_to_rate_limited(&mut sessions, &limits);
-        assert_eq!(sessions[0].status, SessionStatus::Thinking);
-    }
-
-    #[test]
-    fn supported_agent_command_accepts_opencode_and_pi() {
-        assert!(is_supported_agent_command("/usr/local/bin/claude"));
-        assert!(is_supported_agent_command("codex --resume abc"));
-        assert!(is_supported_agent_command("/usr/local/bin/opencode"));
-        assert!(is_supported_agent_command("pi --mode rpc"));
-        assert!(!is_supported_agent_command("node server.js"));
-        assert!(!command_matches_agent(
-            "node app.js /opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-            "pi"
-        ));
-    }
-
-    #[test]
-    fn pi_mode_disables_legacy_quota_mcp_and_summaries() {
-        let app = App::new_pi(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
-        assert_eq!(app.monitor_mode, MonitorMode::Pi);
-        assert!(!app.show_quota);
-        assert!(!app.show_mcp);
-        assert!(!app.summaries_enabled());
+    fn pi_app_starts_without_sessions() {
+        let app = App::new(Theme::default(), crate::config::PanelVisibility::default());
+        assert!(app.sessions.is_empty());
     }
 
     #[test]
     fn pi_summary_reports_attachment_state() {
-        let app = App::new_pi(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
-        let mut session = waiting_session("pi");
+        let app = App::new(Theme::default(), crate::config::PanelVisibility::default());
+        let mut session = waiting_session();
         let mut telemetry = crate::model::SessionTelemetry::process_only(1);
         session.telemetry = Some(telemetry.clone());
         assert_eq!(app.session_summary(&session), "process only");
@@ -1349,17 +791,12 @@ mod tests {
 
     #[test]
     fn unknown_pi_usage_is_not_aggregated_as_known_zero() {
-        let mut app = App::new_pi(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
-        let mut session = waiting_session("pi");
+        let mut app = App::new(Theme::default(), crate::config::PanelVisibility::default());
+        let mut session = waiting_session();
         session.telemetry = Some(crate::model::SessionTelemetry::process_only(1));
         app.sessions.push(session);
         app.token_rates.push_back(99.0);
-        app.prev_tokens
-            .insert(("pi".to_string(), "session".to_string()), 99);
+        app.prev_tokens.insert("session".to_string(), 99);
 
         app.update_token_rate();
 
@@ -1370,11 +807,7 @@ mod tests {
 
     #[test]
     fn empty_pi_fleet_keeps_token_rate_unknown() {
-        let mut app = App::new_pi(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
+        let mut app = App::new(Theme::default(), crate::config::PanelVisibility::default());
 
         app.update_token_rate();
 
@@ -1384,42 +817,14 @@ mod tests {
 
     #[test]
     fn known_zero_usage_records_a_zero_rate() {
-        let mut app = App::new_with_config(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
-        app.sessions.push(waiting_session("claude"));
+        let mut app = App::new(Theme::default(), crate::config::PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.token_rates.clear();
+        app.prev_tokens.clear();
 
         app.update_token_rate();
 
         assert!(app.token_rate_known);
         assert_eq!(app.token_rates.back(), Some(&0.0));
-    }
-
-    #[test]
-    fn pi_mode_never_queues_summary_generation() {
-        let mut app = App::new_pi(
-            Theme::default(),
-            &[],
-            crate::config::PanelVisibility::default(),
-        );
-        let mut session = waiting_session("pi");
-        session.initial_prompt = "must remain local".to_string();
-        app.sessions.push(session);
-
-        app.drain_and_retry_summaries();
-
-        assert!(!app.has_pending_summaries());
-        assert!(app.summaries.is_empty());
-    }
-
-    #[test]
-    fn killable_agent_command_rejects_codex_app_server() {
-        assert!(is_killable_agent_command("codex --resume abc"));
-        assert!(is_killable_agent_command("/usr/local/bin/claude"));
-        assert!(!is_killable_agent_command(
-            "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
-        ));
     }
 }

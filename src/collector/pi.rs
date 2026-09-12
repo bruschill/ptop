@@ -1,6 +1,6 @@
 use super::{
     pi_subagents::{pi_subagent_runner_run_id, PiSubagentParent, PiSubagentsCollector},
-    process, AgentCollector, SharedProcessData,
+    process, SharedProcessData,
 };
 use crate::model::{
     AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
@@ -409,7 +409,6 @@ impl PiCollector {
                     }
                 }
                 Some(AgentSession {
-                    agent_cli: "pi",
                     pid,
                     session_id: attachment
                         .map(|attachment| attachment.session_id.clone())
@@ -455,18 +454,7 @@ impl PiCollector {
                     context_history: data.context_history,
                     compaction_count: data.compactions,
                     context_window: data.context_window.unwrap_or(0),
-                    subagents: Vec::new(),
-                    mem_file_count: 0,
-                    mem_line_count: 0,
                     children: collect_children(pid, shared),
-                    initial_prompt: String::new(),
-                    first_assistant_text: String::new(),
-                    chat_messages: Vec::new(),
-                    tool_calls: Vec::new(),
-                    pending_since_ms: 0,
-                    thinking_since_ms: 0,
-                    file_accesses: Vec::new(),
-                    config_root: String::new(),
                     telemetry: Some(telemetry),
                     process_start_id,
                 })
@@ -945,8 +933,8 @@ impl Default for PiCollector {
     }
 }
 
-impl AgentCollector for PiCollector {
-    fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
+impl PiCollector {
+    pub(crate) fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
 }
@@ -2805,10 +2793,6 @@ mod tests {
             children_map,
             ports: HashMap::new(),
             slow_tick: false,
-            mcp_server_pids: HashSet::new(),
-            mcp_owned_rollouts: HashSet::new(),
-            mcp_suppress: true,
-            desktop_rollout_fd_map: HashMap::new(),
         }
     }
 
@@ -3229,8 +3213,7 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_ne!(sessions[0].session_id, sessions[1].session_id);
         assert!(sessions.iter().all(|session| {
-            session.agent_cli == "pi"
-                && session.status == SessionStatus::Unknown
+            session.status == SessionStatus::Unknown
                 && session.context_value().is_none()
                 && session.usage_precision() == TelemetryPrecision::Unknown
         }));

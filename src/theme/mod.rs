@@ -50,10 +50,7 @@ pub struct Theme {
     pub net_box: Color,
     pub proc_box: Color,
 
-    // agent labels
-    pub claude_agent: Color,
-    pub codex_agent: Color,
-    pub opencode_agent: Color,
+    // Pi session label
     pub pi_agent: Color,
 
     // gradients
@@ -369,9 +366,6 @@ struct ThemeColors {
     mem_box: String,
     net_box: String,
     proc_box: String,
-    claude_agent: String,
-    codex_agent: String,
-    opencode_agent: String,
     pi_agent: String,
 }
 
@@ -429,9 +423,6 @@ fn decode_validate_theme(bytes: &[u8], origin: ThemeOrigin) -> Result<Theme, The
         mem_box: parse_color("colors.mem_box", &colors.mem_box, &origin)?,
         net_box: parse_color("colors.net_box", &colors.net_box, &origin)?,
         proc_box: parse_color("colors.proc_box", &colors.proc_box, &origin)?,
-        claude_agent: parse_color("colors.claude_agent", &colors.claude_agent, &origin)?,
-        codex_agent: parse_color("colors.codex_agent", &colors.codex_agent, &origin)?,
-        opencode_agent: parse_color("colors.opencode_agent", &colors.opencode_agent, &origin)?,
         pi_agent: parse_color("colors.pi_agent", &colors.pi_agent, &origin)?,
         cpu_grad: parse_gradient("gradients.cpu", &gradients.cpu, &origin)?,
         proc_grad: parse_gradient("gradients.process", &gradients.process, &origin)?,
@@ -520,20 +511,20 @@ mod tests {
     }
 
     #[test]
-    fn packaged_palettes_match_the_constructor_era_golden_hashes() {
+    fn packaged_palettes_match_golden_hashes() {
         let expected = [
-            ("btop", 0x2bcc40106436af13),
-            ("dracula", 0x159a9830db443d68),
-            ("catppuccin", 0x0ec96fa2cc0af60a),
-            ("tokyo-night", 0xa6a39045091688ab),
-            ("gruvbox", 0x8fb2b24cca292c86),
-            ("nord", 0x14e558143a0f9f95),
-            ("light", 0xa169f04b6ba43577),
-            ("white", 0x18bade19e8a454e3),
-            ("high-contrast", 0x79589fbd481811b8),
-            ("protanopia", 0x3f76f803987d360f),
-            ("deuteranopia", 0xe3d85434482f2913),
-            ("tritanopia", 0x9d4f12f7a8c23e00),
+            ("btop", 0xf09666fd28077cf0),
+            ("dracula", 0xe76f775e8721b001),
+            ("catppuccin", 0x94e92eaa54f46523),
+            ("tokyo-night", 0x636a0be69c047804),
+            ("gruvbox", 0xd5602a0944617265),
+            ("nord", 0x743d3ce8d3e55c08),
+            ("light", 0xc19b033786a39898),
+            ("white", 0x7bfb7876668462c8),
+            ("high-contrast", 0xa2704b8e025b5601),
+            ("protanopia", 0xe8f38f64f731c316),
+            ("deuteranopia", 0x8eb8c4c4ea3c0346),
+            ("tritanopia", 0x08b450b897c2e52f),
         ];
 
         for (name, hash) in expected {
@@ -713,9 +704,6 @@ mod tests {
             theme.mem_box,
             theme.net_box,
             theme.proc_box,
-            theme.claude_agent,
-            theme.codex_agent,
-            theme.opencode_agent,
             theme.pi_agent,
         ] {
             let Color::Rgb(red, green, blue) = color else {

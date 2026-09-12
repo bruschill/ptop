@@ -103,6 +103,6 @@ pub(crate) fn draw_ports_panel_active(
         )));
     }
 
-    let block = btop_block_active("ports", "⁵", theme.net_box, theme, active);
+    let block = btop_block_active("ports", "⁴", theme.net_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

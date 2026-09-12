@@ -12,8 +12,7 @@ pub struct ProcInfo {
     pub command: String,
 }
 
-/// Resolve all symlinks in /proc/{pid}/fd, returning their targets.
-/// Used by both port discovery (socket inodes) and Codex JSONL discovery.
+/// Resolve all symlinks in /proc/{pid}/fd, returning their targets for port discovery.
 #[cfg(target_os = "linux")]
 pub fn scan_proc_fds(pid: u32) -> Vec<std::path::PathBuf> {
     let fd_dir = format!("/proc/{}/fd", pid);
@@ -147,9 +146,8 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     let mut map = HashMap::new();
     for (pid, proc_) in sys.processes() {
         let pid_u32 = pid.as_u32();
-        // cmd() can be empty on Windows (cmdline retrieval failed for this
-        // process); fall back to the executable name so cmd_has_binary still
-        // matches `claude` / `codex` for those processes.
+        // cmd() can be empty on Windows when command-line retrieval fails.
+        // Fall back to the executable name so the process remains observable.
         let command = if proc_.cmd().is_empty() {
             proc_.name().to_string_lossy().into_owned()
         } else {
@@ -223,9 +221,7 @@ pub fn get_children_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>
 }
 
 /// Walk the ppid chain from `pid` and return true if `ancestor` is reached.
-/// Used to identify processes spawned by ptop itself (e.g. `claude --print`
-/// summary children) so they can be filtered without dropping unrelated
-/// non-interactive sessions started by the user.
+/// Used for process ownership and terminal-target checks.
 pub fn is_descendant_of(pid: u32, ancestor: u32, process_info: &HashMap<u32, ProcInfo>) -> bool {
     if pid == 0 || ancestor == 0 || pid == ancestor {
         return false;
@@ -404,108 +400,6 @@ pub fn last_path_segment(s: &str) -> Option<&str> {
     segment
 }
 
-/// Check if a command string has a given binary name in executable position.
-/// Checks the first two argv tokens only (covers direct invocation and
-/// interpreter-wrapped scripts like `node /path/to/codex ...`).
-///
-/// Also matches the autoupdater layout used by Claude Code 2.x where the
-/// running binary is named after its version (e.g.
-/// `~/.local/share/claude/versions/2.1.121`) — basename equality alone would
-/// miss this, so we also accept any path of the form `<...>/<name>/versions/<filename>`.
-#[cfg(not(windows))]
-pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
-    let mut tokens = cmd.split_whitespace().take(2);
-    tokens.any(|tok| unix_token_has_binary(tok, name))
-}
-
-#[cfg(not(windows))]
-pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
-    cmd.split_whitespace()
-        .next()
-        .is_some_and(|tok| unix_token_has_binary(tok, name))
-}
-
-#[cfg(not(windows))]
-fn unix_token_has_binary(tok: &str, name: &str) -> bool {
-    let mut iter = tok.rsplit('/');
-    let base = iter.next().unwrap_or(tok);
-    if base == name {
-        return true;
-    }
-    // Strip .exe suffix for compatibility with claude.exe on non-Windows (e.g. @anthropic-ai/claude-code npm package)
-    if let Some(stripped) = base.strip_suffix(".exe") {
-        if stripped == name {
-            return true;
-        }
-    }
-    matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
-}
-
-/// Windows variant: checks executable-position tokens, splits on `\`, strips a
-/// trailing `.exe` and common script extensions (`.js`, `.sh`, `.py`), and
-/// matches case-insensitively.
-/// Kept separate from the unix impl so non-Windows matching stays exact
-/// (`Claude` must not match `claude` on linux/macOS).
-#[cfg(windows)]
-pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
-    windows_command_tokens(cmd)
-        .into_iter()
-        .take(2)
-        .any(|tok| windows_token_has_binary(&tok, name))
-}
-
-#[cfg(windows)]
-pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
-    windows_command_tokens(cmd)
-        .first()
-        .is_some_and(|tok| windows_token_has_binary(tok, name))
-}
-
-#[cfg(windows)]
-fn windows_token_has_binary(tok: &str, name: &str) -> bool {
-    let mut iter = tok.rsplit(['/', '\\']);
-    let base = iter.next().unwrap_or(tok);
-    let base = base
-        .strip_suffix(".exe")
-        .or_else(|| base.strip_suffix(".js"))
-        .or_else(|| base.strip_suffix(".sh"))
-        .or_else(|| base.strip_suffix(".py"))
-        .unwrap_or(base);
-    if base.eq_ignore_ascii_case(name) {
-        return true;
-    }
-    matches!(
-        (iter.next(), iter.next()),
-        (Some(versions), Some(parent))
-            if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
-    )
-}
-
-#[cfg(windows)]
-fn windows_command_tokens(cmd: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in cmd.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            c if c.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
-}
-
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
     // Validate cwd is an existing directory before running git
     if !std::path::Path::new(cwd).is_dir() {
@@ -555,67 +449,6 @@ mod tests {
             command,
             r#""C:\Program Files\nodejs\node.exe" C:\Users\me\pi-coding-agent\dist\cli.js"#
         );
-    }
-
-    #[test]
-    fn cmd_has_binary_basename_match() {
-        assert!(cmd_has_binary("/usr/local/bin/claude --foo", "claude"));
-        assert!(cmd_has_binary("claude", "claude"));
-        assert!(!cmd_has_binary("/usr/local/bin/claude-launch", "claude"));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn cmd_has_binary_exe_suffix_on_unix() {
-        // The @anthropic-ai/claude-code npm package ships a binary named
-        // `claude.exe` even on macOS/Linux. Ensure we still detect it.
-        assert!(cmd_has_binary(
-            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --session-id abc",
-            "claude",
-        ));
-        assert!(cmd_has_binary("claude.exe", "claude"));
-        // Must not match unrelated .exe binaries
-        assert!(!cmd_has_binary("/usr/bin/notclaude.exe", "claude"));
-    }
-
-    #[test]
-    fn cmd_has_binary_autoupdater_layout() {
-        // Claude Code 2.x: actual binary is named after its version, but the
-        // path has `<name>/versions/<file>` structure we can match on.
-        assert!(cmd_has_binary(
-            "/Users/a/.local/share/claude/versions/2.1.121 --allow-dangerously-skip-permissions",
-            "claude",
-        ));
-        assert!(cmd_has_binary("/opt/codex/versions/0.42.0 --foo", "codex",));
-    }
-
-    #[test]
-    fn cmd_has_binary_does_not_overmatch() {
-        // A sibling dir under `claude/` but not under `versions/` shouldn't match.
-        assert!(!cmd_has_binary(
-            "/Users/a/.local/share/claude/foo",
-            "claude"
-        ));
-        // A `versions/` dir not under `<name>/` shouldn't match either.
-        assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn cmd_has_binary_windows_detects_node_wrapped_codex() {
-        assert!(cmd_has_binary(
-            r#""C:\Program Files\nodejs\node.exe" C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js -m gpt-5.5"#,
-            "codex",
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn cmd_has_binary_windows_ignores_codex_in_later_args() {
-        assert!(!cmd_has_binary(
-            r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile "C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js""#,
-            "codex",
-        ));
     }
 
     fn proc(pid: u32, ppid: u32) -> ProcInfo {

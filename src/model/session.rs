@@ -1,60 +1,5 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
+use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Type of file operation performed by the agent.
-#[derive(Debug, Clone, PartialEq)]
-pub enum FileOp {
-    Read,
-    Write,
-    Edit,
-}
-
-impl fmt::Display for FileOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FileOp::Read => write!(f, "R"),
-            FileOp::Write => write!(f, "W"),
-            FileOp::Edit => write!(f, "E"),
-        }
-    }
-}
-
-/// A single file access event recorded from agent tool usage.
-#[derive(Debug, Clone)]
-pub struct FileAccess {
-    pub path: String,
-    pub operation: FileOp,
-    #[allow(dead_code)]
-    pub turn_index: u32,
-}
-
-/// Maximum file access entries kept per session to bound memory.
-pub const MAX_FILE_ACCESSES: usize = 1000;
-
-/// Account-level rate limit info (shared across all sessions).
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct RateLimitInfo {
-    /// "claude" or "codex"
-    pub source: String,
-    /// 5-hour window usage percentage (0-100)
-    pub five_hour_pct: Option<f64>,
-    /// 5-hour window reset timestamp (epoch seconds)
-    pub five_hour_resets_at: Option<u64>,
-    /// 5-hour slot duration in minutes, when reported by the source.
-    pub five_hour_window_minutes: Option<u64>,
-    /// 7-day window usage percentage (0-100)
-    ///
-    /// Historical field name kept for compatibility; Codex may use this slot
-    /// for a longer account-level window such as 30 days.
-    pub seven_day_pct: Option<f64>,
-    /// 7-day window reset timestamp (epoch seconds)
-    pub seven_day_resets_at: Option<u64>,
-    /// Long-window slot duration in minutes, when reported by the source.
-    pub seven_day_window_minutes: Option<u64>,
-    /// When this data was last updated
-    pub updated_at: Option<u64>,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SessionStatus {
@@ -66,8 +11,6 @@ pub enum SessionStatus {
     Waiting,
     /// Activity is unavailable, or process ownership is not confirmed.
     Unknown,
-    /// Waiting due to rate limit
-    RateLimited,
     /// Session finished
     Done,
 }
@@ -542,45 +485,7 @@ pub struct OrphanPort {
 }
 
 #[derive(Debug, Clone)]
-pub struct SubAgent {
-    pub name: String,
-    pub status: String,
-    pub tokens: u64,
-}
-
-/// A single tool invocation from a session transcript.
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    /// Tool name: "Read", "Edit", "Bash", "Write", "Grep", "Glob", "Agent", etc.
-    pub name: String,
-    /// Short argument (file path, command prefix, pattern).
-    pub arg: String,
-    /// Duration in milliseconds (0 if unknown).
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChatRole {
-    User,
-    Assistant,
-}
-
-/// A compact, redacted chat line from the session transcript.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    pub text: String,
-}
-
-/// Maximum chat messages kept per session to bound memory and UI noise.
-pub const MAX_CHAT_MESSAGES: usize = 12;
-
-#[derive(Debug, Clone)]
 pub struct AgentSession {
-    /// Which CLI tool this session belongs to: "claude", "codex", etc.
-    /// Also used as the identifier for the `hidden_agents` config key
-    /// (case-insensitive match).
-    pub agent_cli: &'static str,
     pub pid: u32,
     pub session_id: String,
     pub cwd: String,
@@ -588,8 +493,8 @@ pub struct AgentSession {
     pub started_at: u64,
     pub status: SessionStatus,
     pub model: String,
-    /// Reasoning effort setting (Codex CLI only: "minimal" | "low" | "medium" | "high").
-    /// Empty string when unknown or not applicable.
+    /// Reasoning effort reported by Pi's `thinkingLevel` field.
+    /// Empty when unavailable.
     pub effort: String,
     pub context_percent: f64,
     pub total_input_tokens: u64,
@@ -610,37 +515,8 @@ pub struct AgentSession {
     pub compaction_count: u32,
     /// Context window size for this session's model (e.g. 200K, 1M).
     pub context_window: u64,
-    pub subagents: Vec<SubAgent>,
-    pub mem_file_count: u32,
-    pub mem_line_count: u32,
     pub children: Vec<ChildProcess>,
-    /// First user prompt text, truncated — used as session title
-    pub initial_prompt: String,
-    /// First assistant response text (text blocks only) — used as summary fallback
-    pub first_assistant_text: String,
-    /// Recent user/assistant chat tail, excluding tool results and tool inputs.
-    pub chat_messages: Vec<ChatMessage>,
-    /// Timeline of tool calls extracted from transcript.
-    pub tool_calls: Vec<ToolCall>,
-    /// Unix-epoch ms of the assistant turn whose `tool_use` blocks are still
-    /// awaiting the matching `user` response. Zero when the latest assistant
-    /// turn has already been closed (no tools currently in flight).
-    /// Used to animate the timeline bar for the running tool(s).
-    pub pending_since_ms: u64,
-    /// Unix-epoch ms of the most recent `user` line (prompt or tool_result)
-    /// that has not yet been followed by an assistant response. Zero when
-    /// the last transcript entry was an assistant turn. Used to render a
-    /// live "Thinking" row while the model is generating its next reply.
-    pub thinking_since_ms: u64,
-    /// File access audit log: every file read/written/edited by the agent.
-    pub file_accesses: Vec<FileAccess>,
-    /// Config root directory for this session's agent (home-abbreviated, e.g. "~/.claude-work").
-    /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
-    /// For OpenCode: the data directory containing opencode.db.
-    pub config_root: String,
-    /// Structured telemetry metadata. Legacy collectors keep this as `None`;
-    /// their existing numeric fields remain authoritative. Pi sets this from
-    /// its first process-only row so unknown values are not presented as zero.
+    /// Structured Pi telemetry distinguishes unavailable values from known zero.
     pub telemetry: Option<SessionTelemetry>,
     /// Platform process-start identity used to detect PID reuse where the host
     /// exposes it. The value is opaque and only compared for equality.
@@ -739,43 +615,12 @@ impl AgentSession {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SessionFile {
-    pub pid: u32,
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    pub cwd: String,
-    #[serde(rename = "startedAt")]
-    pub started_at: u64,
-}
-
-impl SessionFile {
-    /// Truncate string fields to sane limits after deserialization.
-    pub fn sanitize(&mut self) {
-        truncate_string(&mut self.session_id, 256);
-        truncate_string(&mut self.cwd, 4096);
-    }
-}
-
-/// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
-fn truncate_string(s: &mut String, max_bytes: usize) {
-    if s.len() > max_bytes {
-        // Find the last char boundary at or before max_bytes
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
         AgentSession {
-            agent_cli: "claude",
             pid: 0,
             session_id: String::new(),
             cwd: String::new(),
@@ -800,18 +645,7 @@ mod tests {
             context_history: Vec::new(),
             compaction_count: 0,
             context_window: 0,
-            subagents: Vec::new(),
-            mem_file_count: 0,
-            mem_line_count: 0,
             children: Vec::new(),
-            initial_prompt: String::new(),
-            first_assistant_text: String::new(),
-            chat_messages: Vec::new(),
-            tool_calls: Vec::new(),
-            pending_since_ms: 0,
-            thinking_since_ms: 0,
-            file_accesses: Vec::new(),
-            config_root: String::new(),
             telemetry: None,
             process_start_id: None,
         }

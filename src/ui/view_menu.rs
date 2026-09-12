@@ -27,59 +27,29 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
     let bool_state = |b: bool| if b { On } else { Off };
     vec![
         ViewItem {
-            key: 'T',
-            label: t("view.tree_view").leak(),
-            state: bool_state(app.tree_view),
-        },
-        ViewItem {
-            key: 'l',
-            label: t("view.timeline").leak(),
-            state: bool_state(app.show_timeline),
-        },
-        ViewItem {
-            key: 'f',
-            label: t("view.file_audit").leak(),
-            state: bool_state(app.show_file_audit),
-        },
-        ViewItem {
             key: '1',
             label: t("view.context_panel").leak(),
             state: bool_state(app.show_context),
         },
         ViewItem {
             key: '2',
-            label: t("view.quota_panel").leak(),
-            state: bool_state(app.show_quota),
-        },
-        ViewItem {
-            key: '3',
             label: t("view.tokens_panel").leak(),
             state: bool_state(app.show_tokens),
         },
         ViewItem {
-            key: '4',
+            key: '3',
             label: t("view.projects_panel").leak(),
             state: bool_state(app.show_projects),
         },
         ViewItem {
-            key: '5',
+            key: '4',
             label: t("view.ports_panel").leak(),
             state: bool_state(app.show_ports),
         },
         ViewItem {
-            key: '6',
+            key: '5',
             label: t("view.sessions_panel").leak(),
             state: bool_state(app.show_sessions),
-        },
-        ViewItem {
-            key: '7',
-            label: t("view.mcp_servers_panel").leak(),
-            state: bool_state(app.show_mcp),
-        },
-        ViewItem {
-            key: 'M',
-            label: t("view.mcp_session_hide").leak(),
-            state: bool_state(app.mcp_suppress_sessions),
         },
         ViewItem {
             key: 't',

@@ -33,7 +33,7 @@ pub(crate) fn draw_tokens_panel_active(
     } else {
         "tokens".to_string()
     };
-    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
+    let block = btop_block_active(&panel_title, "²", theme.mem_box, theme, active);
 
     if selected.is_some_and(|session| session.total_tokens_value().is_none()) {
         let lines = vec![
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn process_only_usage_has_no_zero_totals_or_bars() {
-        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         let session = &mut app.sessions[0];

@@ -5,10 +5,10 @@ labels: bug
 ---
 
 **Environment**
-- OS: <!-- macOS / Linux -->
+- OS: <!-- macOS / Linux / Windows -->
 - ptop version: <!-- `ptop --version` -->
-- Claude Code version: <!-- `claude --version` -->
-- Terminal: <!-- e.g. iTerm2, Alacritty, tmux -->
+- Pi version: <!-- `pi --version` -->
+- Terminal: <!-- e.g. iTerm2, Alacritty, tmux, Herdr -->
 
 **Describe the bug**
 <!-- A clear description of what the bug is. -->

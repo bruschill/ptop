@@ -9,10 +9,9 @@
 //! # Public API for library consumers
 //!
 //! The stable surface for in-process consumers is [`app`] (notably
-//! [`App::to_snapshot`](app::App::to_snapshot) and
-//! [`App::tick_no_summaries`](app::App::tick_no_summaries)), [`snapshot`],
-//! [`config`], [`demo`], [`host_info`], and the data types in [`model`]. The
-//! [`collector`], [`locale`], [`setup`], [`theme`], and [`ui`] modules are
+//! [`App::to_snapshot`](app::App::to_snapshot) and [`App::tick`](app::App::tick)),
+//! [`snapshot`], [`config`], [`demo`], [`host_info`], and the data types in
+//! [`model`]. The [`collector`], [`locale`], [`theme`], and [`ui`] modules are
 //! published mainly to support the bundled TUI binary and may change without a
 //! semver-major bump — depend on them at your own risk.
 //!
@@ -36,9 +35,9 @@
 //! use ptop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_pi(Theme::default(), &cfg.hidden_agents, cfg.panels);
+//! let mut app = App::new(Theme::default(), cfg.panels);
 //! loop {
-//!     app.tick_no_summaries();                // refresh without spawning `claude --print`
+//!     app.tick();                             // refresh Pi process and telemetry data
 //!     let snap = app.to_snapshot(2_000);      // pure read → JSON-friendly DTO
 //!     let json = serde_json::to_string(&snap).unwrap();
 //!     // ... serve `json`, sleep for the interval, repeat ...
@@ -54,7 +53,6 @@ pub mod host_info;
 pub mod jump;
 pub mod locale;
 pub mod model;
-pub mod setup;
 pub mod snapshot;
 pub mod theme;
 pub mod ui;
@@ -75,19 +73,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Construct a headless `App` from loaded config + theme. Shared by the
-/// `--json` and `--once` entry points. The product path is Pi-only; `--legacy`
-/// retains the previous multi-agent collector during stabilization.
-fn build_app(theme: theme::Theme, cfg: &config::AppConfig, legacy_mode: bool) -> App {
-    if legacy_mode {
-        App::new_with_config_and_claude_dirs(
-            theme,
-            &cfg.hidden_agents,
-            cfg.panels,
-            &cfg.claude_config_dirs,
-        )
-    } else {
-        App::new_pi(theme, &cfg.hidden_agents, cfg.panels)
-    }
+/// `--json` and `--once` entry points.
+fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
+    App::new(theme, cfg.panels)
 }
 
 fn has_flag(args: &[OsString], flag: &str) -> bool {
@@ -195,6 +183,10 @@ fn exit_with_message(message: &str) -> ! {
 
 pub fn run() -> io::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
+    let options = match runtime_options_from_args(&args) {
+        Ok(options) => options,
+        Err(message) => exit_with_message(&message),
+    };
 
     // Keep theme-independent commands ahead of config and theme resolution.
     if has_flag(&args, "--version") || has_flag(&args, "-V") {
@@ -203,10 +195,6 @@ pub fn run() -> io::Result<()> {
     }
     if has_flag(&args, "--update") {
         return run_update();
-    }
-    if has_flag(&args, "--setup") {
-        setup::run_setup();
-        return Ok(());
     }
 
     let explicit_theme = match theme_request_from_args(&args) {
@@ -232,24 +220,19 @@ pub fn run() -> io::Result<()> {
         Err(message) => exit_with_message(&message),
     };
 
-    let options = runtime_options_from_args(&args);
     let demo_mode = options.demo_mode;
-    // Demo follows the selected monitor mode. Only an explicit --legacy opts
-    // into legacy collectors; all demo paths populate fixtures without a tick.
-    let legacy_mode = options.legacy_mode;
     let exit_on_jump = options.exit_on_jump;
     let mouse_capture = options.mouse_capture;
 
     // --json flag: print a machine-readable JSON snapshot and exit.
-    // Single tick, no summary subprocesses. Useful for scripting and as a
-    // manual check of the web snapshot API; the web tool uses the library
-    // `App::to_snapshot` directly rather than shelling out to this.
+    // Useful for scripting and as a manual check of the web snapshot API; the
+    // web tool uses the library `App::to_snapshot` directly.
     if has_flag(&args, "--json") {
-        let mut app = build_app(initial_theme, &cfg, legacy_mode);
+        let mut app = build_app(initial_theme, &cfg);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
-            app.tick_no_summaries();
+            app.tick();
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
             Ok(json) => {
@@ -265,22 +248,11 @@ pub fn run() -> io::Result<()> {
 
     // --once flag: print snapshot and exit
     if has_flag(&args, "--once") {
-        let mut app = build_app(initial_theme, &cfg, legacy_mode);
+        let mut app = build_app(initial_theme, &cfg);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
             app.tick();
-            if app.summaries_enabled() {
-                // Retry-aware budget: two 10s attempts plus slack.
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                while std::time::Instant::now() < deadline {
-                    app.drain_and_retry_summaries();
-                    if !app.has_pending_summaries() && !app.has_retryable_summaries() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
         }
         print_snapshot(&app);
         return Ok(());
@@ -294,14 +266,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        legacy_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -319,38 +284,58 @@ pub fn run() -> io::Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimeOptions {
     demo_mode: bool,
-    legacy_mode: bool,
     exit_on_jump: bool,
     mouse_capture: bool,
 }
 
-fn runtime_options_from_args(args: &[OsString]) -> RuntimeOptions {
-    RuntimeOptions {
-        demo_mode: has_flag(args, "--demo"),
-        legacy_mode: has_flag(args, "--legacy"),
-        exit_on_jump: has_flag(args, "--exit-on-jump"),
-        mouse_capture: has_flag(args, "--mouse"),
+fn runtime_options_from_args(args: &[OsString]) -> Result<RuntimeOptions, String> {
+    let mut options = RuntimeOptions {
+        demo_mode: false,
+        exit_on_jump: false,
+        mouse_capture: false,
+    };
+    let mut index = 1;
+
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == OsStr::new("--theme") || argument == OsStr::new("--theme-file") {
+            let option = argument.to_string_lossy();
+            args.get(index + 1)
+                .filter(|value| !value.to_string_lossy().starts_with('-'))
+                .ok_or_else(|| format!("{option} requires a value"))?;
+            index += 2;
+            continue;
+        }
+
+        if argument == OsStr::new("--demo") {
+            options.demo_mode = true;
+        } else if argument == OsStr::new("--exit-on-jump") {
+            options.exit_on_jump = true;
+        } else if argument == OsStr::new("--mouse") {
+            options.mouse_capture = true;
+        } else if !matches!(
+            argument.to_str(),
+            Some("--json" | "--once" | "--update" | "--version" | "-V")
+        ) {
+            return Err(format!(
+                "unknown option or argument: {}",
+                argument.to_string_lossy()
+            ));
+        }
+        index += 1;
     }
+
+    Ok(options)
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     demo_mode: bool,
-    legacy_mode: bool,
     theme: theme::Theme,
     exit_on_jump: bool,
     config: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = if legacy_mode {
-        App::new_with_config_and_claude_dirs(
-            theme,
-            &config.hidden_agents,
-            config.panels,
-            &config.claude_config_dirs,
-        )
-    } else {
-        App::new_pi(theme, &config.hidden_agents, config.panels)
-    };
+    let mut app = App::new(theme, config.panels);
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -416,11 +401,7 @@ fn handle_key_press(
     } else if app.view_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
-            KeyCode::Char('T') => app.tree_view = !app.tree_view,
-            KeyCode::Char('l') => app.toggle_timeline(),
-            KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
-            KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
+            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
         }
@@ -458,16 +439,12 @@ fn handle_key_press(
             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
             KeyCode::Char('t') => app.cycle_theme(),
-            KeyCode::Char('T') => app.tree_view = !app.tree_view,
-            KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
-            KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
+            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
             KeyCode::Char('?') => app.toggle_help(),
             KeyCode::Char('/') => app.filter_active = true,
             KeyCode::Esc if !app.filter_text.is_empty() => app.clear_filter(),
-            KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_file_audit(),
             KeyCode::Enter if !demo_mode => match jump_to_session(app) {
                 JumpOutcome::Jumped if exit_on_jump => app.quit(),
                 JumpOutcome::Failed(msg) => app.set_status(msg),
@@ -562,48 +539,13 @@ fn format_token_value(session: &model::AgentSession) -> String {
 }
 
 fn print_snapshot(app: &App) {
-    if app.is_pi_mode() {
-        println!("ptop — {} Pi processes\n", app.sessions.len());
-    } else {
-        println!(
-            "ptop — {} sessions, {} mcp servers\n",
-            app.sessions.len(),
-            app.mcp_servers.len()
-        );
-    }
-    if !app.mcp_servers.is_empty() {
-        let now = std::time::SystemTime::now();
-        for server in &app.mcp_servers {
-            let active = server.active_count(now, collector::mcp::ACTIVE_MTIME_SECS);
-            let total = server.rollouts.len();
-            let last_age = server
-                .latest_mtime()
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|d| {
-                    if d.as_secs() < 60 {
-                        format!("{}s", d.as_secs())
-                    } else if d.as_secs() < 3600 {
-                        format!("{}m", d.as_secs() / 60)
-                    } else {
-                        format!("{}h", d.as_secs() / 3600)
-                    }
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let profile = server.profile.as_deref().unwrap_or("default");
-            println!(
-                "  mcp pid={} parent={} profile={:<16} active={}/{} last={}",
-                server.pid, server.parent_cli, profile, active, total, last_age
-            );
-        }
-        println!();
-    }
+    println!("ptop — {} Pi processes\n", app.sessions.len());
     for session in &app.sessions {
         let status = match &session.status {
             model::SessionStatus::Thinking => "◉ Think",
             model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
             model::SessionStatus::Unknown => "? Unknown",
-            model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };
         let sid_short = if session.session_id.len() >= 7 {
@@ -616,15 +558,11 @@ fn print_snapshot(app: &App) {
         let model = if session.model.is_empty() {
             "—".to_string()
         } else {
-            session.model.replace("claude-", "")
+            session.model.clone()
         };
         let context = format_context_value(session);
         let tokens = format_token_value(session);
-        let age = if session.agent_cli == "pi" {
-            format!("seen:{}", session.elapsed_display())
-        } else {
-            session.elapsed_display()
-        };
+        let age = format!("seen:{}", session.elapsed_display());
         println!(
             "  {} {:<20} {} {} {:<10} CTX:{} Tok:{} Mem:{}M {}",
             session.pid,
@@ -732,21 +670,12 @@ fn print_snapshot(app: &App) {
                 }
             }
         }
-        if session.agent_cli == "pi" && session.process_start_id.is_none() {
+        if session.process_start_id.is_none() {
             println!("       identity: PID only (reuse not guarded)");
         }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
-            let command = if session.agent_cli == "pi" {
-                model::safe_process_label(&child.command)
-            } else {
-                child
-                    .command
-                    .split_whitespace()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
+            let command = model::safe_process_label(&child.command);
             println!(
                 "       {} {} {}K {}",
                 child.pid,
@@ -838,53 +767,53 @@ mod tests {
 
     #[test]
     fn mouse_capture_is_opt_in() {
-        assert!(!runtime_options_from_args(&[OsString::from("ptop")]).mouse_capture);
+        assert!(
+            !runtime_options_from_args(&[OsString::from("ptop")])
+                .unwrap()
+                .mouse_capture
+        );
         assert!(
             runtime_options_from_args(&[OsString::from("ptop"), OsString::from("--mouse")])
+                .unwrap()
                 .mouse_capture
         );
     }
 
     #[test]
-    fn runtime_options_keep_pi_as_default_and_allow_legacy_demo_with_mouse() {
+    fn runtime_options_accept_pi_demo_with_mouse() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
 
         assert_eq!(
             runtime_options_from_args(&args(&["ptop"])),
-            RuntimeOptions {
+            Ok(RuntimeOptions {
                 demo_mode: false,
-                legacy_mode: false,
                 exit_on_jump: false,
                 mouse_capture: false,
-            }
+            })
         );
         assert_eq!(
             runtime_options_from_args(&args(&["ptop", "--demo", "--mouse"])),
-            RuntimeOptions {
+            Ok(RuntimeOptions {
                 demo_mode: true,
-                legacy_mode: false,
                 exit_on_jump: false,
                 mouse_capture: true,
-            }
-        );
-        assert_eq!(
-            runtime_options_from_args(&args(&["ptop", "--legacy", "--demo"])),
-            RuntimeOptions {
-                demo_mode: true,
-                legacy_mode: true,
-                exit_on_jump: false,
-                mouse_capture: false,
-            }
+            })
         );
     }
 
     #[test]
+    fn runtime_options_reject_removed_and_unknown_options() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        for option in ["--legacy", "--setup", "--unknown"] {
+            let error = runtime_options_from_args(&args(&["ptop", option])).unwrap_err();
+            assert!(error.contains(option), "{error}");
+        }
+    }
+
+    #[test]
     fn demo_mouse_orphan_click_does_not_tick_collectors() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let area = Rect::new(0, 0, 120, 40);
         let (column, row) = (0..area.width)
@@ -926,11 +855,7 @@ mod tests {
 
     #[test]
     fn pi_demo_renders_attached_telemetry() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1081,24 +1006,17 @@ mod tests {
     }
 
     #[test]
-    fn product_entry_uses_pi_collector_unless_legacy_is_requested() {
+    fn product_entry_uses_the_pi_only_app_constructor() {
         let cfg = config::AppConfig::default();
-        let pi = build_app(theme::Theme::default(), &cfg, false);
-        let legacy = build_app(theme::Theme::default(), &cfg, true);
-        assert!(pi.is_pi_mode());
-        assert_eq!(legacy.monitor_mode, app::MonitorMode::Legacy);
+        let app = build_app(theme::Theme::default(), &cfg);
+        assert!(app.sessions.is_empty());
     }
 
     #[test]
     fn text_values_distinguish_unknown_exact_inferred_estimated_and_partial() {
-        let mut app = App::new_pi(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
         let session = app.sessions.first_mut().unwrap();
-        session.agent_cli = "pi";
         session.context_percent = 0.0;
         session.context_window = 0;
         session.total_input_tokens = 0;
@@ -1138,11 +1056,7 @@ mod tests {
 
     #[test]
     fn enter_jump_failure_renders_footer_status() {
-        let mut app = App::new_with_config(
-            theme::Theme::default(),
-            &[],
-            config::PanelVisibility::default(),
-        );
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
         demo::populate_demo(&mut app);
 
         handle_key_press(
