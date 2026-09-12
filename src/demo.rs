@@ -81,7 +81,7 @@ fn healthy_fleet(now: u64) -> FleetTelemetry {
     FleetTelemetry {
         source_health: SourceHealth::Healthy,
         provenance: "pi-subagents status.json".into(),
-        foreground_visibility: FleetVisibility::Supported,
+        foreground_visibility: FleetVisibility::Unavailable,
         background_visibility: FleetVisibility::Supported,
         observed_at_ms: now,
         source_updated_at_ms: Some(now - 2_000),
@@ -92,7 +92,7 @@ fn healthy_fleet(now: u64) -> FleetTelemetry {
         unsupported_statuses: 0,
         omitted_statuses: 0,
         runs: vec![FleetRun {
-            lifecycle_version: Some(1),
+            lifecycle_version: Some(3),
             run_id: "checkout-review".into(),
             parent_run_id: None,
             nested: false,
@@ -966,7 +966,16 @@ mod tests {
         );
         let fleet = &app.sessions[0].telemetry.as_ref().unwrap().fleet;
         assert_eq!(fleet.scanned_statuses, 1);
+        assert_eq!(
+            fleet.foreground_visibility,
+            crate::model::FleetVisibility::Unavailable
+        );
+        assert_eq!(
+            fleet.background_visibility,
+            crate::model::FleetVisibility::Supported
+        );
         let run = fleet.runs.first().unwrap();
+        assert_eq!(run.lifecycle_version, Some(3));
         let child = run.children.first().unwrap();
         assert_ne!(child.run_id.as_deref(), Some(run.run_id.as_str()));
         assert_eq!(child.name, "reviewer");
