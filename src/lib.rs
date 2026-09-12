@@ -232,12 +232,13 @@ pub fn run() -> io::Result<()> {
         Err(message) => exit_with_message(&message),
     };
 
-    let demo_mode = has_flag(&args, "--demo");
+    let options = runtime_options_from_args(&args);
+    let demo_mode = options.demo_mode;
     // Demo follows the selected monitor mode. Only an explicit --legacy opts
     // into legacy collectors; all demo paths populate fixtures without a tick.
-    let legacy_mode = has_flag(&args, "--legacy");
-    let exit_on_jump = has_flag(&args, "--exit-on-jump");
-    let mouse_capture = should_enable_mouse_capture(&args);
+    let legacy_mode = options.legacy_mode;
+    let exit_on_jump = options.exit_on_jump;
+    let mouse_capture = options.mouse_capture;
 
     // --json flag: print a machine-readable JSON snapshot and exit.
     // Single tick, no summary subprocesses. Useful for scripting and as a
@@ -315,13 +316,21 @@ pub fn run() -> io::Result<()> {
     app_result.and(r1).and(r2).and(r3)
 }
 
-fn should_enable_mouse_capture<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    args.into_iter()
-        .any(|argument| argument.as_ref() == OsStr::new("--mouse"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeOptions {
+    demo_mode: bool,
+    legacy_mode: bool,
+    exit_on_jump: bool,
+    mouse_capture: bool,
+}
+
+fn runtime_options_from_args(args: &[OsString]) -> RuntimeOptions {
+    RuntimeOptions {
+        demo_mode: has_flag(args, "--demo"),
+        legacy_mode: has_flag(args, "--legacy"),
+        exit_on_jump: has_flag(args, "--exit-on-jump"),
+        mouse_capture: has_flag(args, "--mouse"),
+    }
 }
 
 fn run_app(
@@ -366,7 +375,7 @@ fn run_app(
                 Event::Mouse(mouse) => {
                     let size = terminal.size()?;
                     let area = Rect::new(0, 0, size.width, size.height);
-                    handle_mouse_event(&mut app, mouse, area);
+                    handle_mouse_event(&mut app, mouse, area, demo_mode);
                 }
                 _ => {}
             }
@@ -469,7 +478,7 @@ fn handle_key_press(
     }
 }
 
-fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect, demo_mode: bool) {
     if app.help_open || app.view_open || app.config_open || app.filter_active {
         return;
     }
@@ -491,7 +500,9 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
                     }
                     ui::ClickTarget::KillOrphanPorts => {
                         app.set_active_narrow_section(app::NarrowSection::Ports);
-                        app.kill_orphan_ports();
+                        if !demo_mode {
+                            app.kill_orphan_ports();
+                        }
                     }
                 }
             }
@@ -827,8 +838,113 @@ mod tests {
 
     #[test]
     fn mouse_capture_is_opt_in() {
-        assert!(!should_enable_mouse_capture(["ptop"]));
-        assert!(should_enable_mouse_capture(["ptop", "--mouse"]));
+        assert!(!runtime_options_from_args(&[OsString::from("ptop")]).mouse_capture);
+        assert!(
+            runtime_options_from_args(&[OsString::from("ptop"), OsString::from("--mouse")])
+                .mouse_capture
+        );
+    }
+
+    #[test]
+    fn runtime_options_keep_pi_as_default_and_allow_legacy_demo_with_mouse() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        assert_eq!(
+            runtime_options_from_args(&args(&["ptop"])),
+            RuntimeOptions {
+                demo_mode: false,
+                legacy_mode: false,
+                exit_on_jump: false,
+                mouse_capture: false,
+            }
+        );
+        assert_eq!(
+            runtime_options_from_args(&args(&["ptop", "--demo", "--mouse"])),
+            RuntimeOptions {
+                demo_mode: true,
+                legacy_mode: false,
+                exit_on_jump: false,
+                mouse_capture: true,
+            }
+        );
+        assert_eq!(
+            runtime_options_from_args(&args(&["ptop", "--legacy", "--demo"])),
+            RuntimeOptions {
+                demo_mode: true,
+                legacy_mode: true,
+                exit_on_jump: false,
+                mouse_capture: false,
+            }
+        );
+    }
+
+    #[test]
+    fn demo_mouse_orphan_click_does_not_tick_collectors() {
+        let mut app = App::new_pi(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        demo::populate_demo(&mut app);
+        let area = Rect::new(0, 0, 120, 40);
+        let (column, row) = (0..area.width)
+            .flat_map(|column| (0..area.height).map(move |row| (column, row)))
+            .find(|&(column, row)| {
+                ui::click_target(&app, area, column, row) == Some(ui::ClickTarget::KillOrphanPorts)
+            })
+            .expect("Pi demo exposes an orphan-port kill target");
+        let session_ids = app
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
+        let token_rates = app.token_rates.clone();
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            true,
+        );
+
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>(),
+            session_ids,
+            "demo orphan click must not invoke the collector-refreshing kill action"
+        );
+        assert_eq!(app.token_rates, token_rates);
+        assert_eq!(app.orphan_ports.len(), 1);
+    }
+
+    #[test]
+    fn pi_demo_renders_attached_telemetry() {
+        let mut app = App::new_pi(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        demo::populate_demo(&mut app);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("storefront"),
+            "missing Pi demo session\n{text}"
+        );
+        assert!(
+            text.contains("context"),
+            "missing Pi telemetry panel\n{text}"
+        );
     }
 
     #[test]

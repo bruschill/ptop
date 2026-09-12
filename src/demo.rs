@@ -31,11 +31,17 @@ pub fn populate_demo(app: &mut App) {
 
 fn pi_telemetry(
     now: u64,
-    context_precision: TelemetryPrecision,
-    usage_precision: TelemetryPrecision,
-    context_tokens: u64,
+    provider: &str,
+    baseline_tokens: u64,
+    trailing_tokens: u64,
     fleet: FleetTelemetry,
 ) -> SessionTelemetry {
+    let context_tokens = baseline_tokens + trailing_tokens;
+    let context_precision = if trailing_tokens == 0 {
+        TelemetryPrecision::Inferred
+    } else {
+        TelemetryPrecision::Estimated
+    };
     let metadata = |precision: TelemetryPrecision, provenance: &str| TelemetryMetadata {
         precision,
         completeness: TelemetryCompleteness::Complete,
@@ -51,12 +57,15 @@ fn pi_telemetry(
         source_health: SourceHealth::Healthy,
         error: None,
         context: metadata(context_precision, "owned Pi session JSONL"),
-        usage: metadata(usage_precision, "owned Pi session JSONL"),
+        usage: metadata(
+            TelemetryPrecision::Exact,
+            "observed Pi session JSONL entries",
+        ),
         context_details: ContextTelemetryDetails {
             tokens: Some(context_tokens),
-            provider: Some("Pi session usage".into()),
-            baseline_tokens: Some(context_tokens.saturating_sub(4_800)),
-            trailing_tokens: Some(4_800),
+            provider: Some(provider.into()),
+            baseline_tokens: Some(baseline_tokens),
+            trailing_tokens: Some(trailing_tokens),
             active_leaf_id: Some("leaf-demo".into()),
             reason: None,
         },
@@ -78,7 +87,7 @@ fn healthy_fleet(now: u64) -> FleetTelemetry {
         source_updated_at_ms: Some(now - 2_000),
         stale: false,
         retention_days: 30,
-        scanned_statuses: 2,
+        scanned_statuses: 1,
         malformed_statuses: 0,
         unsupported_statuses: 0,
         omitted_statuses: 0,
@@ -109,14 +118,14 @@ fn healthy_fleet(now: u64) -> FleetTelemetry {
             },
             children: vec![FleetChild {
                 id: "security-pass".into(),
-                run_id: Some("checkout-review".into()),
+                run_id: None,
                 identity_source: FleetIdentitySource::ChildId,
-                name: "security review".into(),
+                name: "reviewer".into(),
                 state: FleetRunState::Running,
                 execution: FleetExecution::Background,
                 model: Some("claude-sonnet-4-6".into()),
                 current_tool: Some("Read".into()),
-                activity: Some("reviewing payment boundary".into()),
+                activity: Some("active".into()),
                 started_at_ms: Some(now - 10 * 60 * 1_000),
                 updated_at_ms: Some(now - 2_000),
                 ended_at_ms: None,
@@ -188,9 +197,9 @@ fn populate_pi_demo(app: &mut App) {
             config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
-                TelemetryPrecision::Exact,
-                TelemetryPrecision::Exact,
-                128_000,
+                "anthropic",
+                123_200,
+                4_800,
                 healthy_fleet(now),
             )),
             process_start_id: Some("pi-demo-7301".into()),
@@ -240,9 +249,9 @@ fn populate_pi_demo(app: &mut App) {
             config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
-                TelemetryPrecision::Inferred,
-                TelemetryPrecision::Inferred,
+                "openai",
                 174_000,
+                0,
                 unavailable_fleet(now),
             )),
             process_start_id: Some("pi-demo-7402".into()),
@@ -287,9 +296,9 @@ fn populate_pi_demo(app: &mut App) {
             config_root: String::new(),
             telemetry: Some(pi_telemetry(
                 now,
-                TelemetryPrecision::Estimated,
-                TelemetryPrecision::Exact,
-                58_000,
+                "anthropic",
+                53_000,
+                5_000,
                 unavailable_fleet(now),
             )),
             process_start_id: Some("pi-demo-7520".into()),
@@ -303,9 +312,14 @@ fn populate_pi_demo(app: &mut App) {
         command: "node abandoned-preview.js --token private".into(),
         project_name: "old-preview".into(),
     }];
-    app.token_rates = [0.0, 240.0, 480.0, 760.0, 530.0, 910.0, 680.0]
-        .into_iter()
-        .collect();
+    // Thirty two-second intervals give the rate label a complete minute.
+    app.token_rates = [
+        420.0, 480.0, 510.0, 540.0, 570.0, 600.0, 630.0, 660.0, 690.0, 720.0, 750.0, 780.0, 810.0,
+        780.0, 750.0, 720.0, 690.0, 660.0, 630.0, 600.0, 570.0, 540.0, 510.0, 480.0, 450.0, 420.0,
+        450.0, 480.0, 510.0, 600.0,
+    ]
+    .into_iter()
+    .collect();
     app.token_rate_known = true;
     app.host_metrics = Some(crate::host_info::HostMetrics {
         cpu_pct: 31.0,
@@ -900,6 +914,7 @@ mod tests {
     use super::populate_demo;
     use crate::app::App;
     use crate::config::PanelVisibility;
+    use crate::model::TelemetryPrecision;
     use crate::theme::Theme;
 
     #[test]
@@ -915,14 +930,48 @@ mod tests {
             session.telemetry.as_ref().is_some_and(|telemetry| {
                 telemetry.attachment == crate::model::AttachmentState::Attached
                     && telemetry.usage.completeness == crate::model::TelemetryCompleteness::Complete
+                    && telemetry.usage.precision == TelemetryPrecision::Exact
+                    && telemetry.context_details.tokens
+                        == Some(
+                            telemetry.context_details.baseline_tokens.unwrap()
+                                + telemetry.context_details.trailing_tokens.unwrap(),
+                        )
+                    && telemetry.context.precision
+                        == if telemetry.context_details.trailing_tokens == Some(0) {
+                            TelemetryPrecision::Inferred
+                        } else {
+                            TelemetryPrecision::Estimated
+                        }
             })
         }));
-        assert!(app.sessions.iter().any(|session| {
-            session
+        assert_eq!(
+            app.sessions[0]
                 .telemetry
                 .as_ref()
-                .is_some_and(|telemetry| !telemetry.fleet.runs.is_empty())
-        }));
+                .unwrap()
+                .context_details
+                .provider
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            app.sessions[1]
+                .telemetry
+                .as_ref()
+                .unwrap()
+                .context_details
+                .provider
+                .as_deref(),
+            Some("openai")
+        );
+        let fleet = &app.sessions[0].telemetry.as_ref().unwrap().fleet;
+        assert_eq!(fleet.scanned_statuses, 1);
+        let run = fleet.runs.first().unwrap();
+        let child = run.children.first().unwrap();
+        assert_ne!(child.run_id.as_deref(), Some(run.run_id.as_str()));
+        assert_eq!(child.name, "reviewer");
+        assert_eq!(app.token_rates.len(), 30);
+        assert_eq!(app.token_rates.iter().sum::<f64>(), 18_000.0);
         assert!(app.host_metrics.is_some());
         assert!(app.agent_aggregate.active_count >= 2);
     }
@@ -939,6 +988,8 @@ mod tests {
         assert!(!json.contains("--checkout"));
         assert!(!json.contains("private"));
         assert!(!json.contains("initial_prompt"));
+        assert!(!json.contains("security review"));
+        assert!(!json.contains("payment boundary"));
     }
 
     #[test]
