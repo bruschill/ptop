@@ -289,6 +289,7 @@ mod tests {
         session.context_percent = 0.0;
         session.context_window = 0;
         session.telemetry = Some(SessionTelemetry::process_only(1));
+        app.token_rate_known = false;
 
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();

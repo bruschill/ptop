@@ -233,7 +233,9 @@ pub fn run() -> io::Result<()> {
     };
 
     let demo_mode = has_flag(&args, "--demo");
-    let legacy_mode = demo_mode || has_flag(&args, "--legacy");
+    // Demo follows the selected monitor mode. Only an explicit --legacy opts
+    // into legacy collectors; all demo paths populate fixtures without a tick.
+    let legacy_mode = has_flag(&args, "--legacy");
     let exit_on_jump = has_flag(&args, "--exit-on-jump");
     let mouse_capture = should_enable_mouse_capture(&args);
 

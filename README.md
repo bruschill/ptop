@@ -55,6 +55,8 @@ ptop                    # Launch the ptop TUI
 ptop --once             # Print a ptop snapshot and exit
 ptop --json             # Print one ptop JSON snapshot and exit
 ptop --legacy           # Use Claude/Codex/OpenCode collection
+ptop --demo             # Show collector-free Pi demo data
+ptop --legacy --demo    # Show the collector-free legacy demo data
 ptop --setup            # Install the legacy Claude rate-limit hook
 ptop --theme dracula    # Launch with a packaged theme
 ptop --theme-file ./my-theme.toml  # Launch with a user theme
@@ -93,6 +95,8 @@ ptop is the default Pi monitor. Run `ptop --legacy` to monitor Claude Code, Code
 | Children / ports | ✅ | ✅ | ✅ | ✅ |
 | Subagent run metadata | `status.json` | ✅ | ❌ | ❌ |
 | Memory status | — | ✅ | ❌ | ❌ |
+
+`ptop --demo` uses attached, privacy-safe Pi fixtures with multiple sessions, known token rates, ports, host metrics, and a fleet run. It does not scan local processes or files. Add `--legacy` to keep the previous Claude/Codex/OpenCode demo fixtures.
 
 Pi telemetry requires unambiguous ownership. Windows stays process-only. See [Pi support and release gates](docs/pi-support.md) for platform boundaries, privacy rules, parser limits, compatibility policy, and validation commands.
 

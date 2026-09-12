@@ -1,7 +1,11 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
-    RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    AgentSession, AttachmentConfidence, AttachmentState, ChatMessage, ChatRole, ChildProcess,
+    ContextTelemetryDetails, FileAccess, FileOp, FleetChild, FleetExecution, FleetIdentitySource,
+    FleetProcessTerminal, FleetProcessTerminalState, FleetRun, FleetRunMode, FleetRunState,
+    FleetTelemetry, FleetUsage, FleetVisibility, OrphanPort, RateLimitInfo, SessionStatus,
+    SessionTelemetry, SourceHealth, SubAgent, TelemetryCompleteness, TelemetryMetadata,
+    TelemetryPrecision, ToolCall, UsageTelemetryDetails,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +20,302 @@ fn now_secs() -> u64 {
     now_ms() / 1000
 }
 
+/// Populate deterministic, collector-free fixtures for the active monitor mode.
 pub fn populate_demo(app: &mut App) {
+    if app.is_pi_mode() {
+        populate_pi_demo(app);
+    } else {
+        populate_legacy_demo(app);
+    }
+}
+
+fn pi_telemetry(
+    now: u64,
+    context_precision: TelemetryPrecision,
+    usage_precision: TelemetryPrecision,
+    context_tokens: u64,
+    fleet: FleetTelemetry,
+) -> SessionTelemetry {
+    let metadata = |precision: TelemetryPrecision, provenance: &str| TelemetryMetadata {
+        precision,
+        completeness: TelemetryCompleteness::Complete,
+        provenance: provenance.to_string(),
+        source_updated_at_ms: Some(now - 1_000),
+        observed_at_ms: now,
+        last_successful_parse_at_ms: Some(now - 1_000),
+        stale: false,
+    };
+    SessionTelemetry {
+        attachment: AttachmentState::Attached,
+        attachment_confidence: AttachmentConfidence::High,
+        source_health: SourceHealth::Healthy,
+        error: None,
+        context: metadata(context_precision, "owned Pi session JSONL"),
+        usage: metadata(usage_precision, "owned Pi session JSONL"),
+        context_details: ContextTelemetryDetails {
+            tokens: Some(context_tokens),
+            provider: Some("Pi session usage".into()),
+            baseline_tokens: Some(context_tokens.saturating_sub(4_800)),
+            trailing_tokens: Some(4_800),
+            active_leaf_id: Some("leaf-demo".into()),
+            reason: None,
+        },
+        usage_details: UsageTelemetryDetails {
+            reported_cost: Some(0.42),
+            reason: None,
+        },
+        fleet,
+    }
+}
+
+fn healthy_fleet(now: u64) -> FleetTelemetry {
+    FleetTelemetry {
+        source_health: SourceHealth::Healthy,
+        provenance: "pi-subagents status.json".into(),
+        foreground_visibility: FleetVisibility::Supported,
+        background_visibility: FleetVisibility::Supported,
+        observed_at_ms: now,
+        source_updated_at_ms: Some(now - 2_000),
+        stale: false,
+        retention_days: 30,
+        scanned_statuses: 2,
+        malformed_statuses: 0,
+        unsupported_statuses: 0,
+        omitted_statuses: 0,
+        runs: vec![FleetRun {
+            lifecycle_version: Some(1),
+            run_id: "checkout-review".into(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Workflow,
+            state: FleetRunState::Running,
+            execution: FleetExecution::Background,
+            runner_pid: Some(7310),
+            started_at_ms: Some(now - 12 * 60 * 1_000),
+            updated_at_ms: Some(now - 2_000),
+            ended_at_ms: None,
+            source_updated_at_ms: now - 2_000,
+            stale: false,
+            process_terminal: Some(FleetProcessTerminal {
+                state: FleetProcessTerminalState::Pending,
+                observed_at_ms: Some(now - 2_000),
+            }),
+            usage: FleetUsage {
+                input_tokens: Some(18_400),
+                output_tokens: Some(5_900),
+                total_tokens: Some(24_300),
+                reported_cost: Some(0.18),
+                accounting: crate::model::FleetUsageAccounting::SeparateRunAggregate,
+            },
+            children: vec![FleetChild {
+                id: "security-pass".into(),
+                run_id: Some("checkout-review".into()),
+                identity_source: FleetIdentitySource::ChildId,
+                name: "security review".into(),
+                state: FleetRunState::Running,
+                execution: FleetExecution::Background,
+                model: Some("claude-sonnet-4-6".into()),
+                current_tool: Some("Read".into()),
+                activity: Some("reviewing payment boundary".into()),
+                started_at_ms: Some(now - 10 * 60 * 1_000),
+                updated_at_ms: Some(now - 2_000),
+                ended_at_ms: None,
+                usage: FleetUsage {
+                    input_tokens: Some(7_600),
+                    output_tokens: Some(2_100),
+                    total_tokens: Some(9_700),
+                    reported_cost: Some(0.07),
+                    accounting: crate::model::FleetUsageAccounting::SeparateRunAggregate,
+                },
+                children: vec![],
+            }],
+            omitted_children: 0,
+            reason: None,
+        }],
+        reason: None,
+    }
+}
+
+fn unavailable_fleet(now: u64) -> FleetTelemetry {
+    FleetTelemetry::unavailable(now, "no Pi subagent runs discovered")
+}
+
+fn populate_pi_demo(app: &mut App) {
+    let now = now_ms();
+    app.sessions = vec![
+        AgentSession {
+            agent_cli: "pi",
+            pid: 7301,
+            session_id: "pi-demo-checkout".into(),
+            cwd: "/Users/demo/storefront".into(),
+            project_name: "storefront".into(),
+            started_at: now - 42 * 60 * 1_000,
+            status: SessionStatus::Executing,
+            model: "claude-sonnet-4-6".into(),
+            effort: String::new(),
+            context_percent: 64.0,
+            total_input_tokens: 52_400,
+            total_output_tokens: 14_800,
+            total_cache_read: 320_000,
+            total_cache_create: 18_600,
+            turn_count: 27,
+            current_tasks: vec![],
+            mem_mb: 286,
+            version: "pi 0.45.0".into(),
+            git_branch: "feat/checkout".into(),
+            git_added: 3,
+            git_modified: 7,
+            token_history: vec![12_000, 18_400, 22_000, 19_600, 28_000],
+            context_history: vec![48_000, 72_000, 98_000, 128_000],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![ChildProcess {
+                pid: 7310,
+                command: "node worker.js --checkout".into(),
+                mem_kb: 82_000,
+                port: Some(4173),
+            }],
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            config_root: String::new(),
+            telemetry: Some(pi_telemetry(
+                now,
+                TelemetryPrecision::Exact,
+                TelemetryPrecision::Exact,
+                128_000,
+                healthy_fleet(now),
+            )),
+            process_start_id: Some("pi-demo-7301".into()),
+        },
+        AgentSession {
+            agent_cli: "pi",
+            pid: 7402,
+            session_id: "pi-demo-metrics".into(),
+            cwd: "/Users/demo/observability".into(),
+            project_name: "observability".into(),
+            started_at: now - 18 * 60 * 1_000,
+            status: SessionStatus::Waiting,
+            model: "gpt-5.4".into(),
+            effort: String::new(),
+            context_percent: 87.0,
+            total_input_tokens: 31_200,
+            total_output_tokens: 8_900,
+            total_cache_read: 145_000,
+            total_cache_create: 9_400,
+            turn_count: 16,
+            current_tasks: vec![],
+            mem_mb: 154,
+            version: "pi 0.45.0".into(),
+            git_branch: "main".into(),
+            git_added: 0,
+            git_modified: 2,
+            token_history: vec![9_000, 15_000, 21_000, 17_000],
+            context_history: vec![94_000, 132_000, 174_000],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![ChildProcess {
+                pid: 7414,
+                command: "python metrics_server.py --debug".into(),
+                mem_kb: 44_000,
+                port: Some(9090),
+            }],
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            config_root: String::new(),
+            telemetry: Some(pi_telemetry(
+                now,
+                TelemetryPrecision::Inferred,
+                TelemetryPrecision::Inferred,
+                174_000,
+                unavailable_fleet(now),
+            )),
+            process_start_id: Some("pi-demo-7402".into()),
+        },
+        AgentSession {
+            agent_cli: "pi",
+            pid: 7520,
+            session_id: "pi-demo-release".into(),
+            cwd: "/Users/demo/release-tools".into(),
+            project_name: "release-tools".into(),
+            started_at: now - 7 * 60 * 1_000,
+            status: SessionStatus::Thinking,
+            model: "claude-opus-4-6".into(),
+            effort: String::new(),
+            context_percent: 29.0,
+            total_input_tokens: 18_900,
+            total_output_tokens: 6_300,
+            total_cache_read: 98_000,
+            total_cache_create: 6_100,
+            turn_count: 9,
+            current_tasks: vec![],
+            mem_mb: 198,
+            version: "pi 0.45.0".into(),
+            git_branch: "release/validation".into(),
+            git_added: 1,
+            git_modified: 4,
+            token_history: vec![8_000, 13_000, 16_000],
+            context_history: vec![22_000, 41_000, 58_000],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            config_root: String::new(),
+            telemetry: Some(pi_telemetry(
+                now,
+                TelemetryPrecision::Estimated,
+                TelemetryPrecision::Exact,
+                58_000,
+                unavailable_fleet(now),
+            )),
+            process_start_id: Some("pi-demo-7520".into()),
+        },
+    ];
+    app.summaries.clear();
+    app.rate_limits.clear();
+    app.orphan_ports = vec![OrphanPort {
+        port: 8088,
+        pid: 7298,
+        command: "node abandoned-preview.js --token private".into(),
+        project_name: "old-preview".into(),
+    }];
+    app.token_rates = [0.0, 240.0, 480.0, 760.0, 530.0, 910.0, 680.0]
+        .into_iter()
+        .collect();
+    app.token_rate_known = true;
+    app.host_metrics = Some(crate::host_info::HostMetrics {
+        cpu_pct: 31.0,
+        mem_pct: 46.0,
+        load1: 2.1,
+    });
+    app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+}
+
+fn populate_legacy_demo(app: &mut App) {
     let now = now_ms();
 
     // --- Sessions ---
@@ -594,4 +893,62 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::populate_demo;
+    use crate::app::App;
+    use crate::config::PanelVisibility;
+    use crate::theme::Theme;
+
+    #[test]
+    fn pi_demo_has_attached_sessions_with_authoritative_token_rate_and_runs() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        populate_demo(&mut app);
+
+        assert!(app.is_pi_mode());
+        assert!(app.token_rate_known);
+        assert!(app.sessions.len() >= 3);
+        assert!(app.sessions.iter().all(|session| session.agent_cli == "pi"));
+        assert!(app.sessions.iter().all(|session| {
+            session.telemetry.as_ref().is_some_and(|telemetry| {
+                telemetry.attachment == crate::model::AttachmentState::Attached
+                    && telemetry.usage.completeness == crate::model::TelemetryCompleteness::Complete
+            })
+        }));
+        assert!(app.sessions.iter().any(|session| {
+            session
+                .telemetry
+                .as_ref()
+                .is_some_and(|telemetry| !telemetry.fleet.runs.is_empty())
+        }));
+        assert!(app.host_metrics.is_some());
+        assert!(app.agent_aggregate.active_count >= 2);
+    }
+
+    #[test]
+    fn pi_demo_snapshot_uses_pi_privacy_suppression() {
+        let mut app = App::new_pi(Theme::default(), &[], PanelVisibility::default());
+        populate_demo(&mut app);
+        let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
+
+        assert!(json.contains("\"monitor_mode\":\"pi\""));
+        assert!(json.contains("\"token_rate_value\":"));
+        assert!(json.contains("\"command\":\"node\""));
+        assert!(!json.contains("--checkout"));
+        assert!(!json.contains("private"));
+        assert!(!json.contains("initial_prompt"));
+    }
+
+    #[test]
+    fn legacy_demo_remains_legacy_fixture_set() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        populate_demo(&mut app);
+
+        assert!(!app.is_pi_mode());
+        assert_eq!(app.sessions.len(), 5);
+        assert!(app.sessions.iter().all(|session| session.agent_cli != "pi"));
+        assert!(app.token_rate_known);
+    }
 }
