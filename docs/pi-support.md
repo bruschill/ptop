@@ -82,6 +82,8 @@ ptop makes no network request while monitoring. It reads local files, process me
 
 The parent session tailer is stateful. It scans an attached file once, then reads only appended bytes. It handles incomplete lines, truncation, replacement, deletion, malformed records, and oversized lines without retaining raw transcript content.
 
+Token history contains the latest 64 persisted assistant entries with complete component usage, in file order across all branches. Each point is the checked sum of input, output, cache-read, and cache-write tokens for one assistant turn. Entries with unavailable or overflowing component usage are omitted rather than represented as zero. The lifetime turn count still includes every persisted assistant entry.
+
 Current limits:
 
 - 2 MiB of Pi session JSONL per collection tick.

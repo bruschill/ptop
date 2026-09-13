@@ -207,6 +207,36 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
+    fn positive_input_and_output_have_visible_meter_cells() {
+        let theme = Theme::by_name("catppuccin").unwrap();
+        let mut app = App::new(theme, PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let session = &mut app.sessions[0];
+        session.total_input_tokens = 123_700;
+        session.total_output_tokens = 18_500;
+        session.total_cache_read = 3_000_000;
+        session.total_cache_create = 0;
+
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_tokens_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for (row, label) in [(2, "input"), (3, "output")] {
+            let has_visible_cell = (9..24).any(|column| {
+                let cell = &buffer[(column, row)];
+                cell.symbol() == "■"
+                    && cell.fg != app.theme.meter_bg
+                    && cell.fg != app.theme.main_bg
+            });
+            assert!(has_visible_cell, "positive {label} meter is invisible");
+        }
+    }
+
+    #[test]
     fn process_only_usage_has_no_zero_totals_or_bars() {
         let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);

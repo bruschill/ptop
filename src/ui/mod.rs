@@ -76,10 +76,11 @@ pub(crate) fn meter_bar(
     }
     let clamped = pct.clamp(0.0, 100.0);
     let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let filled = if clamped > 0.0 { filled.max(1) } else { 0 };
     let mut spans = Vec::new();
     for i in 0..width {
         if i < filled {
-            let cell_pct = (i as f64 / width as f64) * 100.0;
+            let cell_pct = ((i + 1) as f64 / width as f64) * 100.0;
             spans.push(Span::styled(
                 "■",
                 Style::default().fg(grad_at(gradient, cell_pct)),
@@ -400,6 +401,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     const CONTEXT_MIN: u16 = 5;
     const FIXED: u16 = 2; // header + footer
     const MID_MIN: u16 = 6;
+    const TOKENS_MIN: u16 = 9;
 
     let mut mid_sections = Vec::new();
     if app.show_tokens {
@@ -416,7 +418,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     }
 
     let any_mid = !mid_sections.is_empty();
-    let mid_h_ideal: u16 = 8;
+    let mid_h_ideal: u16 = 9;
     let sessions_ideal: u16 = if app.show_sessions {
         let base = (app.sessions.len() as u16 * 2 + 7).max(8);
         if area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
@@ -430,7 +432,8 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let context_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
 
     let available = area.height.saturating_sub(FIXED);
-    let mid_reserved = if any_mid { MID_MIN.min(available) } else { 0 };
+    let mid_min = if app.show_tokens { TOKENS_MIN } else { MID_MIN };
+    let mid_reserved = if any_mid { mid_min.min(available) } else { 0 };
     let sessions_budget = available.saturating_sub(mid_reserved);
     let sessions_h = if app.show_sessions {
         sessions_ideal
@@ -1337,6 +1340,39 @@ mod tests {
             assert!(
                 text.contains(label),
                 "desktop should render {label}\n{text}"
+            );
+        }
+        assert!(
+            text.contains("Turns:") && text.contains("Avg:"),
+            "desktop token panel should show turn statistics\n{text}"
+        );
+    }
+
+    #[test]
+    fn token_turn_stats_fit_desktop_and_compact_layouts() {
+        for (width, height) in [(100, 18), (100, 24), (120, 40)] {
+            let text = render_demo(width, height);
+            assert!(
+                text.contains("Turns:") && text.contains("Avg:"),
+                "desktop token panel clipped turn statistics at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("sessions") && text.contains("πPI"),
+                "desktop layout hid session rows at {width}x{height}\n{text}"
+            );
+        }
+
+        for (width, height) in [(69, 27), (80, 24)] {
+            let mut app = App::new(Theme::default(), PanelVisibility::default());
+            crate::demo::populate_demo(&mut app);
+            app.set_narrow_tab(NarrowTab::Usage);
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("Turns:") && text.contains("Avg:"),
+                "compact token panel clipped turn statistics at {width}x{height}\n{text}"
             );
         }
     }
