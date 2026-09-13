@@ -53,6 +53,7 @@ fn capabilities(version: Option<u64>) -> Option<StatusCapabilities> {
 pub(crate) struct PiSubagentParent {
     pub(crate) session_id: String,
     pub(crate) session_file: PathBuf,
+    pub(crate) cwd: PathBuf,
 }
 
 pub(crate) struct PiSubagentsCollector {
@@ -79,6 +80,18 @@ impl PiSubagentsCollector {
         observed_at_ms: u64,
     ) -> HashMap<String, FleetTelemetry> {
         let aliases = parent_aliases(parents);
+        let availability: HashMap<String, crate::model::FleetAvailability> = parents
+            .iter()
+            .map(|parent| {
+                (
+                    parent.session_id.clone(),
+                    crate::collector::pi_subagents_availability::detect(
+                        &parent.session_file,
+                        &parent.cwd,
+                    ),
+                )
+            })
+            .collect();
         let mut by_session: HashMap<String, FleetTelemetry> = parents
             .iter()
             .map(|parent| {
@@ -91,6 +104,12 @@ impl PiSubagentsCollector {
                 )
             })
             .collect();
+        for (session_id, telemetry) in &mut by_session {
+            telemetry.availability = availability
+                .get(session_id)
+                .copied()
+                .unwrap_or(crate::model::FleetAvailability::Unknown);
+        }
         if parents.is_empty() {
             return by_session;
         }
@@ -106,6 +125,8 @@ impl PiSubagentsCollector {
         };
 
         for telemetry in by_session.values_mut() {
+            // A readable lifecycle root is affirmative extension evidence.
+            telemetry.availability = crate::model::FleetAvailability::Installed;
             telemetry.source_health = SourceHealth::Healthy;
             telemetry.reason = None;
             telemetry.omitted_statuses = scan.omitted as u32;
@@ -1000,6 +1021,7 @@ mod tests {
                 &[PiSubagentParent {
                     session_id: "parent-session".to_string(),
                     session_file: root.join("parent-session.jsonl"),
+                    cwd: root.to_path_buf(),
                 }],
                 &live_pids,
                 &verified_runner_runs,
@@ -1097,6 +1119,10 @@ mod tests {
 
         let fleet = collect_one(&root, 2_100);
         assert_eq!(fleet.source_health, SourceHealth::Healthy);
+        assert_eq!(
+            fleet.availability,
+            crate::model::FleetAvailability::Installed
+        );
         assert_eq!(fleet.runs.len(), 1);
         let run = &fleet.runs[0];
         assert_eq!(run.mode, FleetRunMode::Workflow);
@@ -1162,6 +1188,7 @@ mod tests {
             &[PiSubagentParent {
                 session_id: "parent-session".to_string(),
                 session_file: PathBuf::from(&long_session_path),
+                cwd: PathBuf::from("/tmp"),
             }],
             &HashSet::new(),
             &HashMap::new(),
@@ -1177,10 +1204,12 @@ mod tests {
             PiSubagentParent {
                 session_id: "session-a".to_string(),
                 session_file: PathBuf::from("/tmp/shared-session.jsonl"),
+                cwd: PathBuf::from("/tmp"),
             },
             PiSubagentParent {
                 session_id: "/tmp/shared-session.jsonl".to_string(),
                 session_file: PathBuf::from("/tmp/other-session.jsonl"),
+                cwd: PathBuf::from("/tmp"),
             },
         ]);
 
@@ -1690,6 +1719,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fleet = collect_one(&temp.path().join("missing"), 2_000);
         assert_eq!(fleet.source_health, SourceHealth::Unavailable);
+        assert_eq!(fleet.availability, crate::model::FleetAvailability::Unknown);
         assert!(fleet.runs.is_empty());
     }
 }

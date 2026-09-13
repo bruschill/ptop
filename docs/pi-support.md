@@ -64,6 +64,8 @@ Safety limits include:
 
 Unknown lifecycle versions do not become trusted run telemetry.
 
+Fleet telemetry also reports conservative `pi-subagents` availability: `Installed`, `NotInstalled`, or `Unknown`. ptop reads bounded (256 KiB) global `settings.json` plus an existing project `.pi/settings.json`, and examines at most 128 documented `packages` entries per file. Exact `npm:pi-subagents` names (with any nonempty version/range) and canonical GitHub `nicobailon/pi-subagents` Git/URL sources with an optional valid `@` ref prove `Installed`; a complete scan where every package is clearly different proves `NotInstalled`. Local, bare, unfamiliar, malformed, symlinked, replaced, oversized, or structurally ambiguous declarations produce `Unknown`. Negative package evidence is available only for owned session files lexically beneath the default `~/.pi/agent/sessions/` root; custom agent or session directories remain `Unknown`. A readable lifecycle status root also proves `Installed`. Process-only parent identity remains separate from extension availability.
+
 ## Privacy boundary
 
 The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. It does not retain or publish:

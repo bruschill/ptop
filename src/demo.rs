@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
     AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
-    FleetChild, FleetExecution, FleetIdentitySource, FleetProcessTerminal,
+    FleetAvailability, FleetChild, FleetExecution, FleetIdentitySource, FleetProcessTerminal,
     FleetProcessTerminalState, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
     FleetVisibility, OrphanPort, SessionStatus, SessionTelemetry, SourceHealth,
     TelemetryCompleteness, TelemetryMetadata, TelemetryPrecision, UsageTelemetryDetails,
@@ -70,6 +70,7 @@ fn pi_telemetry(
 
 fn healthy_fleet(now: u64) -> FleetTelemetry {
     FleetTelemetry {
+        availability: FleetAvailability::Installed,
         source_health: SourceHealth::Healthy,
         provenance: "pi-subagents status.json".into(),
         foreground_visibility: FleetVisibility::Unavailable,

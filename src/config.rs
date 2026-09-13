@@ -8,6 +8,7 @@ pub struct PanelVisibility {
     pub projects: bool,
     pub ports: bool,
     pub sessions: bool,
+    pub runs: bool,
 }
 
 impl Default for PanelVisibility {
@@ -18,6 +19,7 @@ impl Default for PanelVisibility {
             projects: true,
             ports: true,
             sessions: true,
+            runs: true,
         }
     }
 }
@@ -179,6 +181,7 @@ fn parse_config_body_checked(
             "show_projects" => config.panels.projects = parse_bool(value).unwrap_or(true),
             "show_ports" => config.panels.ports = parse_bool(value).unwrap_or(true),
             "show_sessions" => config.panels.sessions = parse_bool(value).unwrap_or(true),
+            "show_runs" => config.panels.runs = parse_bool(value).unwrap_or(true),
             _ => {}
         }
     }
@@ -280,6 +283,7 @@ pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
         ("show_projects", panels.projects.to_string()),
         ("show_ports", panels.ports.to_string()),
         ("show_sessions", panels.sessions.to_string()),
+        ("show_runs", panels.runs.to_string()),
     ])
 }
 
@@ -450,7 +454,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_bool_round_trips_visibility_keys() {
+    fn panel_visibility_round_trips_runs_and_preserves_unknown_keys() {
+        let before = "future_setting = 42\nshow_runs = false\n";
+        let config = parse_config_body(before);
+        assert!(!config.panels.runs);
+
+        let after =
+            rewrite_config_lines(before, &[("show_runs", Some("true".to_string()))]).unwrap();
+        assert!(after.contains("future_setting = 42"));
+        assert!(after.contains("show_runs = true"));
+
         assert_eq!(parse_bool("true"), Some(true));
         assert_eq!(parse_bool("False"), Some(false));
         assert_eq!(parse_bool("nope"), None);

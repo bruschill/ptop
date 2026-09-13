@@ -103,7 +103,7 @@ ptop always discovers live Pi processes first. It attaches a Pi JSONL session on
 
 Model and provider names come from Pi metadata. A value such as `claude-opus-4-6` identifies the model used by Pi, not another monitored agent.
 
-Fleet data comes from supported `pi-subagents` `status.json` files. Parent usage and run usage remain separate to prevent double counting. See [Pi support and release gates](docs/pi-support.md) for the full telemetry, platform, parser, and privacy contracts.
+Fleet data comes from supported `pi-subagents` `status.json` files. Parent usage and run usage remain separate to prevent double counting. The Runs panel distinguishes no runs from unavailable or stale telemetry and unsupported lifecycle files; it reports that `pi-subagents` is not installed only when collection has affirmative local package evidence. See [Pi support and release gates](docs/pi-support.md) for the full telemetry, platform, parser, and privacy contracts.
 
 ## Themes
 
@@ -159,9 +159,10 @@ show_tokens = true
 show_projects = true
 show_ports = true
 show_sessions = true
+show_runs = true
 ```
 
-Unknown keys are ignored and preserved when ptop rewrites known settings. This keeps obsolete configuration keys harmless.
+Unknown keys are ignored and preserved when ptop rewrites known settings. This keeps obsolete configuration keys harmless. Runs uses `show_runs` and key `6`; the existing panel numbers `1`–`5` remain unchanged. On compact terminals, Sessions remains visible even if `show_sessions = false`, so small layouts never hide every Pi session.
 
 ### Supported languages
 
@@ -181,7 +182,7 @@ Unknown keys are ignored and preserved when ptop rewrites known settings. This k
 | `X` | Kill verified orphan-port processes |
 | `/` | Filter sessions |
 | `Esc` | Clear the filter or close an overlay |
-| `1`–`5` | Toggle context, tokens, projects, ports, or sessions |
+| `1`–`6` | Toggle context, tokens, projects, ports, sessions, or Runs (`6`) |
 | `t` | Cycle the theme |
 | `v` | Open the view menu |
 | `c` | Open configuration |

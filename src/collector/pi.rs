@@ -339,6 +339,7 @@ impl PiCollector {
                     .map(|attachment| PiSubagentParent {
                         session_id: attachment.session_id.clone(),
                         session_file: attachment.path.clone(),
+                        cwd: PathBuf::from(&attachment.header_cwd),
                     })
             })
             .collect();
