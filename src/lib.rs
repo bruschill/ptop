@@ -266,6 +266,7 @@ pub fn run() -> io::Result<()> {
         stdout().execute(EnableMouseCapture)?;
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let _workspace_presence = herdr::start_workspace_presence(!demo_mode);
 
     let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 

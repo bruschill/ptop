@@ -12,11 +12,14 @@ ptop monitors local Pi coding-agent processes only. Process discovery is indepen
 | `pi-subagents` fleet status | Yes | Yes | Unavailable |
 | Git working-tree enrichment | Yes | Yes | Yes |
 | Terminal jump | Herdr, cmux, tmux, iTerm2 | Herdr, cmux, tmux | Disabled |
+| Herdr workspace presence | Yes | Yes | Disabled |
 | Pi process kill | Yes | Yes | Disabled |
 
 Windows uses `sysinfo` and `netstat -ano`. It reports load average as 0. Jump and kill controls remain disabled until ptop can apply the same trusted process-identity checks used on Unix.
 
 On macOS and Linux, ptop checks that a controlled PID still belongs to a Pi process. Where available, it also compares an opaque process-start identity to prevent PID reuse from targeting another process. Herdr jumps use the selected Pi process's pane ID and server socket, and apply only when ptop is attached to the same Herdr server.
+
+The interactive non-demo TUI reports workspace presence only when its inherited `HERDR_ENV`, socket, workspace ID, and pane ID are present and valid. Before each report, ptop asks the owning Herdr server for the exact pane and requires its pane and workspace IDs to match. It then publishes only the display token `ptop=running` with a 30-second TTL, refreshed every 10 seconds on a background thread. A missing server, timeout, malformed response, or identity mismatch suppresses the report. Pane validation and workspace reporting are separate Herdr commands, so a pane moved between them can refresh the old workspace once. Later mismatches suppress refreshes, and the TTL removes that stale presence. ptop does not clear the shared token on exit because another ptop process may still be refreshing it. This local metadata path is outside `Collector::collect` and does not change snapshots, agent state, waits, notifications, or rollups.
 
 ## Telemetry attachment contract
 

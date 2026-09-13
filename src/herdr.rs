@@ -21,6 +21,38 @@ use std::time::{Duration, Instant};
 const MAX_HERDR_JSON_BYTES: usize = 256 * 1024;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const MAX_HERDR_ENV_BYTES: usize = 256 * 1024;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const HERDR_PRESENCE_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_000);
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const HERDR_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const HERDR_PRESENCE_TTL_MS: u64 = 30_000;
+
+#[derive(Default)]
+pub(crate) struct WorkspacePresence {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WorkspacePresence {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspacePresenceTarget {
+    binary: std::ffi::OsString,
+    socket_path: String,
+    workspace_id: String,
+    pane_id: String,
+}
 
 #[cfg(any(target_os = "linux", target_vendor = "apple", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +68,27 @@ pub(crate) fn run_bounded_herdr_json(
     args: &[String],
     timeout: Duration,
 ) -> Option<Value> {
+    let bytes = run_bounded_herdr(binary, socket_path, args, timeout)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn run_bounded_herdr_command(
+    binary: &std::ffi::OsStr,
+    socket_path: &str,
+    args: &[String],
+    timeout: Duration,
+) -> bool {
+    run_bounded_herdr(binary, socket_path, args, timeout).is_some()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn run_bounded_herdr(
+    binary: &std::ffi::OsStr,
+    socket_path: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -44,6 +97,7 @@ pub(crate) fn run_bounded_herdr_json(
         .args(args)
         .env("HERDR_SOCKET_PATH", socket_path)
         .process_group(0)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
@@ -113,7 +167,161 @@ pub(crate) fn run_bounded_herdr_json(
     if failed || status.is_none_or(|status| !status.success()) {
         return None;
     }
-    serde_json::from_slice(&bytes).ok()
+    Some(bytes)
+}
+
+pub(crate) fn start_workspace_presence(enabled: bool) -> WorkspacePresence {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        if enabled {
+            if let Some(target) =
+                current_workspace_presence_target_from(|name| std::env::var_os(name))
+            {
+                return start_workspace_presence_with(target, HERDR_PRESENCE_REFRESH_INTERVAL);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let _ = enabled;
+
+    WorkspacePresence::default()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn start_workspace_presence_with(
+    target: WorkspacePresenceTarget,
+    refresh_interval: Duration,
+) -> WorkspacePresence {
+    let (stop, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("ptop-herdr-presence".to_string())
+        .spawn(move || {
+            run_workspace_presence_worker(receiver, refresh_interval, || {
+                report_workspace_presence(&target);
+            });
+        })
+        .ok();
+
+    if worker.is_some() {
+        WorkspacePresence {
+            stop: Some(stop),
+            worker,
+        }
+    } else {
+        WorkspacePresence::default()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn run_workspace_presence_worker(
+    receiver: std::sync::mpsc::Receiver<()>,
+    refresh_interval: Duration,
+    mut report: impl FnMut(),
+) {
+    report();
+    while matches!(
+        receiver.recv_timeout(refresh_interval),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ) {
+        report();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn report_workspace_presence(target: &WorkspacePresenceTarget) {
+    let _ = report_workspace_presence_with(
+        target,
+        |args| {
+            run_bounded_herdr_json(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+        |args| {
+            run_bounded_herdr_command(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+    );
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn report_workspace_presence_with(
+    target: &WorkspacePresenceTarget,
+    mut get_pane: impl FnMut(&[String]) -> Option<Value>,
+    mut report: impl FnMut(&[String]) -> bool,
+) -> bool {
+    let pane_args = vec![
+        "pane".to_string(),
+        "get".to_string(),
+        target.pane_id.clone(),
+    ];
+    let Some(pane) = get_pane(&pane_args) else {
+        return false;
+    };
+    let pane_matches = pane.pointer("/result/pane").is_some_and(|pane| {
+        pane.get("pane_id").and_then(Value::as_str) == Some(target.pane_id.as_str())
+            && pane.get("workspace_id").and_then(Value::as_str)
+                == Some(target.workspace_id.as_str())
+    });
+    if !pane_matches {
+        return false;
+    }
+
+    report(&workspace_presence_report_args(&target.workspace_id))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn workspace_presence_report_args(workspace_id: &str) -> Vec<String> {
+    vec![
+        "workspace".to_string(),
+        "report-metadata".to_string(),
+        workspace_id.to_string(),
+        "--source".to_string(),
+        "ptop:presence".to_string(),
+        "--token".to_string(),
+        "ptop=running".to_string(),
+        "--ttl-ms".to_string(),
+        HERDR_PRESENCE_TTL_MS.to_string(),
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn current_workspace_presence_target_from(
+    mut env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Option<WorkspacePresenceTarget> {
+    if env("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+
+    let socket_path = env("HERDR_SOCKET_PATH")?.into_string().ok()?;
+    if socket_path.is_empty() || socket_path.len() > 4096 || !Path::new(&socket_path).is_absolute()
+    {
+        return None;
+    }
+    let workspace_id = bounded_herdr_id(env("HERDR_WORKSPACE_ID")?)?;
+    let pane_id = bounded_herdr_id(env("HERDR_PANE_ID")?)?;
+    let binary = env("HERDR_BIN_PATH")
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| "herdr".into());
+
+    Some(WorkspacePresenceTarget {
+        binary,
+        socket_path,
+        workspace_id,
+        pane_id,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn bounded_herdr_id(value: std::ffi::OsString) -> Option<String> {
+    let value = value.into_string().ok()?;
+    (!value.is_empty() && value.len() <= 128).then_some(value)
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple", test))]
@@ -264,7 +472,7 @@ mod tests {
         let script = dir.path().join("fake-herdr");
         fs::write(
             &script,
-            "#!/bin/sh\nif [ \"$1\" = sleep ]; then sleep 2; printf '{}\\n'; exit; fi\nprintf '{\"padding\":\"'\ndd if=/dev/zero bs=1024 count=300 2>/dev/null | tr '\\000' x\nprintf '\"}\\n'\n",
+            "#!/bin/sh\nif [ \"$1\" = ok ]; then exit 0; fi\nif [ \"$1\" = fail ]; then exit 1; fi\nif [ \"$1\" = stdin ]; then [ /dev/fd/0 -ef /dev/null ]; exit; fi\nif [ \"$1\" = sleep ]; then sleep 2; printf '{}\\n'; exit; fi\nprintf '{\"padding\":\"'\ndd if=/dev/zero bs=1024 count=300 2>/dev/null | tr '\\000' x\nprintf '\"}\\n'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -287,5 +495,163 @@ mod tests {
             Duration::from_secs(1),
         )
         .is_none());
+        assert!(run_bounded_herdr_command(
+            script.as_os_str(),
+            "/tmp/herdr.sock",
+            &["ok".to_string()],
+            Duration::from_secs(1),
+        ));
+        assert!(!run_bounded_herdr_command(
+            script.as_os_str(),
+            "/tmp/herdr.sock",
+            &["fail".to_string()],
+            Duration::from_secs(1),
+        ));
+        assert!(run_bounded_herdr_command(
+            script.as_os_str(),
+            "/tmp/herdr.sock",
+            &["stdin".to_string()],
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn disabled_presence_does_not_start_a_worker() {
+        let presence = start_workspace_presence(false);
+
+        assert!(presence.stop.is_none());
+        assert!(presence.worker.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn current_presence_target_requires_exact_herdr_location() {
+        let valid = |name: &str| match name {
+            "HERDR_ENV" => Some("1".into()),
+            "HERDR_SOCKET_PATH" => Some("/tmp/herdr socket/server.sock".into()),
+            "HERDR_WORKSPACE_ID" => Some("w1X".into()),
+            "HERDR_PANE_ID" => Some("w1X:p2".into()),
+            "HERDR_BIN_PATH" => Some("/opt/herdr/bin/herdr".into()),
+            _ => None,
+        };
+        let target = current_workspace_presence_target_from(valid).unwrap();
+        assert_eq!(target.socket_path, "/tmp/herdr socket/server.sock");
+        assert_eq!(target.workspace_id, "w1X");
+        assert_eq!(target.pane_id, "w1X:p2");
+        assert_eq!(target.binary, std::ffi::OsStr::new("/opt/herdr/bin/herdr"));
+
+        for missing in [
+            "HERDR_ENV",
+            "HERDR_SOCKET_PATH",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_PANE_ID",
+        ] {
+            assert!(current_workspace_presence_target_from(|name| {
+                (name != missing).then(|| valid(name)).flatten()
+            })
+            .is_none());
+        }
+        assert!(current_workspace_presence_target_from(|name| match name {
+            "HERDR_ENV" => Some("1".into()),
+            "HERDR_SOCKET_PATH" => Some("relative.sock".into()),
+            "HERDR_WORKSPACE_ID" => Some("w1X".into()),
+            "HERDR_PANE_ID" => Some("w1X:p2".into()),
+            _ => None,
+        })
+        .is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn presence_request_is_display_only_and_expires() {
+        assert_eq!(
+            workspace_presence_report_args("w1X"),
+            vec![
+                "workspace",
+                "report-metadata",
+                "w1X",
+                "--source",
+                "ptop:presence",
+                "--token",
+                "ptop=running",
+                "--ttl-ms",
+                "30000",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn presence_requires_the_reported_pane_to_remain_in_its_workspace() {
+        let target = WorkspacePresenceTarget {
+            binary: "herdr".into(),
+            socket_path: "/tmp/herdr.sock".to_string(),
+            workspace_id: "w1X".to_string(),
+            pane_id: "w1X:p2".to_string(),
+        };
+        let mut pane_args = Vec::new();
+        let mut report_args = Vec::new();
+        assert!(report_workspace_presence_with(
+            &target,
+            |args| {
+                pane_args.push(args.to_vec());
+                Some(serde_json::json!({
+                    "result": { "pane": { "pane_id": "w1X:p2", "workspace_id": "w1X" } }
+                }))
+            },
+            |args| {
+                report_args.push(args.to_vec());
+                true
+            },
+        ));
+        assert_eq!(pane_args, [vec!["pane", "get", "w1X:p2"]]);
+        assert_eq!(report_args, [workspace_presence_report_args("w1X")]);
+
+        let report_called = std::cell::Cell::new(false);
+        assert!(!report_workspace_presence_with(
+            &target,
+            |_| {
+                Some(serde_json::json!({
+                    "result": { "pane": { "pane_id": "w1X:p2", "workspace_id": "w2" } }
+                }))
+            },
+            |_| {
+                report_called.set(true);
+                true
+            },
+        ));
+        assert!(!report_called.get());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn presence_worker_reports_once_before_stopping() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(()).unwrap();
+        let mut reports = 0;
+
+        run_workspace_presence_worker(receiver, Duration::from_secs(60), || reports += 1);
+
+        assert_eq!(reports, 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn presence_worker_refreshes_until_its_sender_disconnects() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut sender = Some(sender);
+        let mut reports = 0;
+
+        run_workspace_presence_worker(receiver, Duration::ZERO, || {
+            reports += 1;
+            if reports == 3 {
+                sender.take();
+            }
+        });
+
+        assert_eq!(reports, 3);
     }
 }
