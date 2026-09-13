@@ -57,7 +57,7 @@ fn pi_telemetry(
             provider: Some(provider.into()),
             baseline_tokens: Some(baseline_tokens),
             trailing_tokens: Some(trailing_tokens),
-            active_leaf_id: Some("leaf-demo".into()),
+            active_leaf_id: None,
             reason: None,
         },
         usage_details: UsageTelemetryDetails {
@@ -314,6 +314,7 @@ mod tests {
                         } else {
                             TelemetryPrecision::Estimated
                         }
+                    && telemetry.context_details.active_leaf_id.is_none()
             })
         }));
         assert_eq!(
@@ -371,5 +372,7 @@ mod tests {
         assert!(!json.contains("initial_prompt"));
         assert!(!json.contains("security review"));
         assert!(!json.contains("payment boundary"));
+        assert!(json.contains("\"active_leaf_id\":null"));
+        assert!(!json.contains("leaf-demo"));
     }
 }

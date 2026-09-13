@@ -347,7 +347,45 @@ mod tests {
 
         for session in &snap.sessions {
             assert!(session.token_history.len() <= 64);
+            assert_eq!(
+                session
+                    .telemetry
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .details
+                    .active_leaf_id,
+                None
+            );
         }
+        let json = serde_json::to_value(&snap).unwrap();
+        let context_details = json["sessions"][0]["telemetry"]["context"]
+            .as_object()
+            .unwrap();
+        assert!(context_details.contains_key("active_leaf_id"));
+        assert!(context_details["active_leaf_id"].is_null());
+        let mut context_keys = context_details.keys().cloned().collect::<Vec<_>>();
+        context_keys.sort();
+        assert_eq!(
+            context_keys,
+            vec![
+                "active_leaf_id",
+                "baseline_tokens",
+                "completeness",
+                "last_successful_parse_at_ms",
+                "observed_at_ms",
+                "percent",
+                "precision",
+                "provenance",
+                "provider",
+                "reason",
+                "source_updated_at_ms",
+                "stale",
+                "tokens",
+                "trailing_tokens",
+                "window_tokens",
+            ]
+        );
     }
 
     #[test]
@@ -443,6 +481,11 @@ mod tests {
                 "snapshot exposed {excluded_field}"
             );
         }
+        let context_details = json["sessions"][0]["telemetry"]["context"]
+            .as_object()
+            .unwrap();
+        assert!(context_details.contains_key("active_leaf_id"));
+        assert!(context_details["active_leaf_id"].is_null());
         assert!(json["sessions"][0]["telemetry"]["context"]["percent"].is_null());
         assert_eq!(
             json["sessions"][0]["telemetry"]["fleet"]["runs"][0]["usage"]["accounting"],
