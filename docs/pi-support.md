@@ -47,7 +47,7 @@ Model and provider values are Pi metadata. Their names do not select another col
 
 ptop reads supported `pi-subagents` lifecycle `status.json` files and associates them with an owned Pi parent session. Lifecycle schema version 3 can expose run state, execution mode, usage, child state, and process-terminal metadata.
 
-Parent session usage and run usage use separate accounting. Consumers must not add them together as if they were one token total.
+Parent session usage and run usage use separate accounting. Consumers must not add them together as if they were one token total. Panel 2, Total Tokens, aggregates only the input, output, cache-read, and cache-write usage of currently live parent sessions. It excludes fleet runs and sessions that are no longer live. Known partial usage remains a lower-bound subtotal and turn count marked with `+`; unavailable-only usage remains `—`, never zero. Per-turn averages require complete usage for every live session.
 
 Safety limits include:
 
