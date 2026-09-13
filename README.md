@@ -103,6 +103,8 @@ ptop always discovers live Pi processes first. It attaches a Pi JSONL session on
 
 Model and provider names come from Pi metadata. A value such as `claude-opus-4-6` identifies the model used by Pi, not another monitored agent.
 
+Parent usage includes every persisted branch entry once. Missing assistant usage still counts a turn and marks component totals partial. Missing usage on optional tool-result, compaction, and branch-summary records makes no contribution, while present invalid usage marks totals partial. A partial total with no complete component observation is unavailable, not zero; clean sessions with only a header or absent optional usage remain known zero. Token history keeps the latest 64 complete assistant component totals. Reported cost is independent of component completeness and appears only when every expected cost is valid and the attached session scan is complete. `totalTokens` is used only for the context baseline; it does not repair component totals. Parent usage and cost remain separate from fleet-run accounting.
+
 Fleet data comes from supported `pi-subagents` `status.json` files. Parent usage and run usage remain separate to prevent double counting. The Runs panel distinguishes no runs from unavailable or stale telemetry and unsupported lifecycle files; it reports that `pi-subagents` is not installed only when collection has affirmative local package evidence. See [Pi support and release gates](docs/pi-support.md) for the full telemetry, platform, parser, and privacy contracts.
 
 ## Themes
