@@ -52,6 +52,11 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
             state: bool_state(app.show_sessions),
         },
         ViewItem {
+            key: '6',
+            label: t("view.runs_panel").leak(),
+            state: bool_state(app.show_runs),
+        },
+        ViewItem {
             key: 't',
             label: t("view.cycle_theme").leak(),
             state: Action,

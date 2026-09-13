@@ -32,6 +32,7 @@ pub(crate) fn draw_sessions_panel_active(
     theme: &Theme,
     active: bool,
 ) {
+    // Runs has its own compact section, so do not duplicate fleet details here.
     draw_sessions_panel_impl(f, app, area, theme, active, false);
 }
 
@@ -73,14 +74,26 @@ fn draw_sessions_panel_impl(
         ])
         .split(inner);
 
-    // Draw separator line between session list and detail
+    // On short desktop layouts, use the separator row for the embedded Runs
+    // state rather than allocating a zero-height detail panel.
     {
         let sep_area = panel_chunks[1];
-        let sep_line = "─".repeat(sep_area.width as usize);
-        f.render_widget(
-            Paragraph::new(Span::styled(sep_line, Style::default().fg(theme.proc_box))),
-            sep_area,
-        );
+        if panel_chunks[2].height == 0 && app.show_runs && !runs_promoted {
+            let lines = super::runs::runs_lines(
+                app.sessions.get(app.selected),
+                sep_area.width,
+                1,
+                theme,
+                false,
+            );
+            f.render_widget(Paragraph::new(lines), sep_area);
+        } else {
+            let sep_line = "─".repeat(sep_area.width as usize);
+            f.render_widget(
+                Paragraph::new(Span::styled(sep_line, Style::default().fg(theme.proc_box))),
+                sep_area,
+            );
+        }
     }
 
     // ── Session list table ──
@@ -426,6 +439,11 @@ fn draw_sessions_panel_impl(
     if let Some(session) = app.sessions.get(app.selected) {
         let detail_area = panel_chunks[2];
         if detail_area.height < 2 {
+            if app.show_runs && !runs_promoted {
+                let lines =
+                    super::runs::runs_lines(Some(session), panel_chunks[1].width, 1, theme, false);
+                f.render_widget(Paragraph::new(lines), panel_chunks[1]);
+            }
             return;
         }
         let parts = Layout::default()
@@ -458,7 +476,16 @@ fn draw_sessions_panel_impl(
             ))),
             parts[0],
         );
-        draw_pi_metadata(f, session, parts[1], theme, !runs_promoted);
+        draw_pi_metadata(f, session, parts[1], theme, app.show_runs && !runs_promoted);
+    } else if app.show_runs && !runs_promoted {
+        let detail_area = panel_chunks[2];
+        let area = if detail_area.height > 0 {
+            detail_area
+        } else {
+            panel_chunks[1]
+        };
+        let lines = super::runs::runs_lines(None, area.width, area.height as usize, theme, false);
+        f.render_widget(Paragraph::new(lines), area);
     }
 }
 
@@ -632,18 +659,21 @@ fn draw_pi_metadata(
         }
     }
 
-    if lines.len() < area.height as usize {
-        let fleet = &telemetry.fleet;
-        if show_runs {
-            lines.extend(super::runs::fleet_detail_lines(
-                fleet,
-                area.width,
-                (area.height as usize).saturating_sub(lines.len()),
-                theme,
-            ));
-        } else {
-            lines.push(super::runs::fleet_summary_line(fleet, theme));
+    if show_runs {
+        // Preserve at least one Runs state line at compact desktop heights.
+        let height = area.height as usize;
+        if height > 0 && lines.len() >= height {
+            lines.truncate(height - 1);
         }
+        lines.extend(super::runs::runs_lines(
+            Some(session),
+            area.width,
+            height.saturating_sub(lines.len()),
+            theme,
+            false,
+        ));
+    } else if lines.len() < area.height as usize {
+        lines.push(super::runs::fleet_summary_line(&telemetry.fleet, theme));
     }
 
     if !session.children.is_empty() && lines.len() < area.height as usize {

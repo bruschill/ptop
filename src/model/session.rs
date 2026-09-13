@@ -330,8 +330,20 @@ pub struct FleetRun {
     pub reason: Option<String>,
 }
 
+/// Conservative local availability of the pi-subagents extension.
+///
+/// `NotInstalled` requires affirmative package evidence. A missing or unreadable
+/// lifecycle directory remains `Unknown` because it does not prove removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FleetAvailability {
+    Installed,
+    NotInstalled,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FleetTelemetry {
+    pub availability: FleetAvailability,
     pub source_health: SourceHealth,
     pub provenance: String,
     pub foreground_visibility: FleetVisibility,
@@ -351,6 +363,7 @@ pub struct FleetTelemetry {
 impl FleetTelemetry {
     pub fn unavailable(observed_at_ms: u64, reason: &str) -> Self {
         Self {
+            availability: FleetAvailability::Unknown,
             source_health: SourceHealth::Unavailable,
             provenance: "pi-subagents status.json".to_string(),
             foreground_visibility: FleetVisibility::Unavailable,

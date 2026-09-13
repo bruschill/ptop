@@ -69,6 +69,7 @@ pub enum NarrowSection {
     Context,
     Tokens,
     Ports,
+    Runs,
 }
 
 impl NarrowSection {
@@ -77,6 +78,7 @@ impl NarrowSection {
             Self::Sessions | Self::Projects => NarrowTab::Work,
             Self::Context | Self::Tokens => NarrowTab::Usage,
             Self::Ports => NarrowTab::System,
+            Self::Runs => NarrowTab::Work,
         }
     }
 }
@@ -113,6 +115,7 @@ pub struct App {
     pub show_projects: bool,
     pub show_ports: bool,
     pub show_sessions: bool,
+    pub show_runs: bool,
     pub narrow_tab: NarrowTab,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
@@ -152,6 +155,7 @@ impl App {
             show_projects: panels.projects,
             show_ports: panels.ports,
             show_sessions: panels.sessions,
+            show_runs: panels.runs,
             narrow_tab: NarrowTab::Work,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
@@ -220,6 +224,7 @@ impl App {
             3 => self.show_projects = !self.show_projects,
             4 => self.show_ports = !self.show_ports,
             5 => self.show_sessions = !self.show_sessions,
+            6 => self.show_runs = !self.show_runs,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -233,7 +238,11 @@ impl App {
             projects: self.show_projects,
             ports: self.show_ports,
             sessions: self.show_sessions,
+            runs: self.show_runs,
         };
+        #[cfg(test)]
+        let _ = panels;
+        #[cfg(not(test))]
         if let Err(e) = crate::config::save_panel_visibility(&panels) {
             self.set_status(format!("panels save failed: {}", e));
         }
@@ -247,7 +256,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        6 // theme + 5 panel toggles
+        7 // theme + 6 panel toggles
     }
 
     pub fn config_select_next(&mut self) {
@@ -271,6 +280,7 @@ impl App {
             3 => self.show_projects = !self.show_projects,
             4 => self.show_ports = !self.show_ports,
             5 => self.show_sessions = !self.show_sessions,
+            6 => self.show_runs = !self.show_runs,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -279,7 +289,9 @@ impl App {
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
-            NarrowTab::Work => self.show_sessions || self.show_projects,
+            // Narrow layouts always retain Sessions, even when it is hidden on
+            // desktop, so a small terminal cannot hide every Pi session.
+            NarrowTab::Work => true,
             NarrowTab::Usage => self.show_context || self.show_tokens,
             NarrowTab::System => self.show_ports,
         }
@@ -340,8 +352,9 @@ impl App {
 
     pub fn narrow_section_visible(&self, section: NarrowSection) -> bool {
         match section {
-            NarrowSection::Sessions => self.show_sessions,
+            NarrowSection::Sessions => true,
             NarrowSection::Projects => self.show_projects,
+            NarrowSection::Runs => self.show_runs,
             NarrowSection::Context => self.show_context,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Ports => self.show_ports,
@@ -350,7 +363,11 @@ impl App {
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
-            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Work => &[
+                NarrowSection::Sessions,
+                NarrowSection::Projects,
+                NarrowSection::Runs,
+            ],
             NarrowTab::Usage => &[NarrowSection::Context, NarrowSection::Tokens],
             NarrowTab::System => &[NarrowSection::Ports],
         };

@@ -1,5 +1,6 @@
 pub mod pi;
 mod pi_subagents;
+mod pi_subagents_availability;
 pub mod process;
 
 use crate::model::{AgentSession, OrphanPort, SessionStatus};
