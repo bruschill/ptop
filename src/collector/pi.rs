@@ -5612,6 +5612,188 @@ mod tests {
     }
 
     #[test]
+    fn rich_v3_fixture_keeps_private_telemetry_out_of_snapshot_and_text_output() {
+        const CONTENT_SENTINEL: &str = "RICH-CONTENT-SECRET-92fd";
+        const ERROR_SENTINEL: &str = "RICH-ERROR-SECRET-1a7e";
+        const FUTURE_SENTINEL: &str = "RICH-FUTURE-STOP-SECRET-5c44";
+        const SUMMARY_SENTINEL: &str = "RICH-SUMMARY-SECRET-6b91";
+        const DETAILS_SENTINEL: &str = "RICH-DETAILS-SECRET-2d08";
+        const RETAINED_TAIL_SENTINEL: &str = "RICH-RETAINED-TAIL-SECRET-4ef3";
+        const FIRST_KEPT_SENTINEL: &str = "RICH-FIRST-KEPT-SECRET-81a6";
+        const FROM_ID_SENTINEL: &str = "RICH-FROM-ID-SECRET-3f70";
+        const DEBUG_LABEL_SENTINEL: &str = "RICH-DEBUG-LABEL-SECRET-8be2";
+        let private_strings = [
+            CONTENT_SENTINEL,
+            ERROR_SENTINEL,
+            FUTURE_SENTINEL,
+            SUMMARY_SENTINEL,
+            DETAILS_SENTINEL,
+            RETAINED_TAIL_SENTINEL,
+            FIRST_KEPT_SENTINEL,
+            FROM_ID_SENTINEL,
+            DEBUG_LABEL_SENTINEL,
+            "ParentHarnessTelemetry",
+            "AssistantOutcomeCounts",
+            "BoundedAttributionBreakdown",
+            "assistant_outcomes",
+            "assistant_points",
+            "summary_events",
+            "attribution",
+            "attribution.unavailable",
+            "attribution.overflow",
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = session_file(&dir, "rich-private", &cwd);
+        let attachment = PiAttachment {
+            path: path.clone(),
+            session_id: "rich-private".to_string(),
+            start_id: None,
+            version: 3,
+            header_cwd: cwd,
+            identity: file_identity(&path).unwrap(),
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for index in 0..65 {
+            let stop_reason = if index == 63 {
+                serde_json::json!(FUTURE_SENTINEL)
+            } else {
+                serde_json::json!("stop")
+            };
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "message", "id": format!("named-{index}"), "parentId": null,
+                    "debugLabel": DEBUG_LABEL_SENTINEL,
+                    "message": {
+                        "role": "assistant", "provider": format!("provider-{index}"),
+                        "model": format!("model-{index}"), "stopReason": stop_reason,
+                        "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "cost": {"total": 1.0}},
+                        "content": [{"type": "text", "text": CONTENT_SENTINEL}],
+                        "errorMessage": ERROR_SENTINEL,
+                    },
+                })
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "message", "id": "unavailable", "parentId": null,
+                "message": {
+                    "role": "assistant", "provider": "provider", "model": "model",
+                    "responseModel": {"raw": "invalid"}, "stopReason": "error",
+                    "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "cost": {"total": 1.0}},
+                    "content": [{"type": "text", "text": CONTENT_SENTINEL}],
+                    "errorMessage": ERROR_SENTINEL,
+                },
+            })
+        )
+        .unwrap();
+        for entry in [
+            serde_json::json!({
+                "type": "compaction", "id": "compaction", "parentId": "named-0",
+                "tokensBefore": 50, "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "cost": {"total": 1.0}},
+                "summary": SUMMARY_SENTINEL, "details": DETAILS_SENTINEL,
+                "retainedTail": RETAINED_TAIL_SENTINEL,
+                "firstKeptEntryId": FIRST_KEPT_SENTINEL, "fromId": FROM_ID_SENTINEL,
+                "debugLabel": DEBUG_LABEL_SENTINEL,
+            }),
+            serde_json::json!({
+                "type": "branch_summary", "id": "branch-summary", "parentId": "compaction",
+                "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "cost": {"total": 1.0}},
+                "summary": SUMMARY_SENTINEL, "details": DETAILS_SENTINEL,
+                "retainedTail": RETAINED_TAIL_SENTINEL,
+                "firstKeptEntryId": FIRST_KEPT_SENTINEL, "fromId": FROM_ID_SENTINEL,
+                "debugLabel": DEBUG_LABEL_SENTINEL,
+            }),
+        ] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        drop(file);
+
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let (telemetry, data) = collector
+            .telemetry_for_attachment(&attachment, 1, &mut budget)
+            .unwrap();
+        let semantic = &collector.tails[&path].semantic;
+        let parent = semantic.parent_harness_telemetry(true);
+        assert_eq!(parent.attribution.named.len(), MAX_NAMED_ATTRIBUTION_KEYS);
+        assert_eq!(parent.attribution.unavailable.input, 1);
+        assert_eq!(parent.attribution.overflow.input, 1);
+        assert_eq!(parent.assistant_outcomes.counts.error, 1);
+        assert_eq!(parent.assistant_outcomes.counts.unknown, 1);
+        assert_eq!(parent.summary_events.len(), 2);
+        assert_eq!(parent.summary_events[0].kind, SummaryKind::Compaction);
+        assert_eq!(parent.summary_events[1].kind, SummaryKind::BranchSummary);
+
+        let mut app = crate::app::App::new(
+            crate::theme::Theme::default(),
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions.push(session_from_data(&data, telemetry));
+        let snapshot = serde_json::to_value(app.to_snapshot(2_000)).unwrap();
+        let snapshot_text = snapshot.to_string();
+        let mut text_output = Vec::new();
+        crate::write_snapshot(&mut text_output, &app).unwrap();
+        let text_output = String::from_utf8(text_output).unwrap();
+        for private in private_strings {
+            assert!(
+                !snapshot_text.contains(private),
+                "snapshot exposed private rich telemetry {private}"
+            );
+            assert!(
+                !text_output.contains(private),
+                "text output exposed private rich telemetry {private}"
+            );
+        }
+
+        let usage = &snapshot["sessions"][0]["telemetry"]["usage"];
+        for field in [
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_create_tokens",
+        ] {
+            assert!(
+                usage[field].as_u64().is_some(),
+                "usage field {field} changed type"
+            );
+        }
+        let context = &snapshot["sessions"][0]["telemetry"]["context"];
+        for field in [
+            "percent",
+            "window_tokens",
+            "tokens",
+            "baseline_tokens",
+            "trailing_tokens",
+        ] {
+            assert!(
+                context.get(field).is_some(),
+                "context field {field} was removed"
+            );
+        }
+        assert!(context["percent"].is_null() || context["percent"].is_f64());
+        for field in [
+            "window_tokens",
+            "tokens",
+            "baseline_tokens",
+            "trailing_tokens",
+        ] {
+            assert!(
+                context[field].is_null() || context[field].as_u64().is_some(),
+                "context field {field} changed type"
+            );
+        }
+        assert!(context["active_leaf_id"].is_null());
+    }
+
+    #[test]
     fn summary_observations_are_bounded_private_and_version_gated() {
         let mut semantic = PiSemantic::default();
         let usage = serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4});

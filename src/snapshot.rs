@@ -388,6 +388,142 @@ mod tests {
         );
     }
 
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("serialized DTO is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert!(
+            !keys.is_empty(),
+            "serialized DTO key set is unexpectedly empty"
+        );
+        keys
+    }
+
+    #[test]
+    fn pi_snapshot_serialized_dto_key_sets_remain_stable() {
+        let json = serde_json::to_value(demo_app().to_snapshot(2_000)).unwrap();
+        let session = &json["sessions"][0];
+        let telemetry = &session["telemetry"];
+
+        assert_eq!(
+            sorted_keys(&json),
+            vec![
+                "aggregate",
+                "generated_at_ms",
+                "host",
+                "interval_ms",
+                "orphan_ports",
+                "sessions",
+                "token_rate",
+                "token_rate_value",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(session),
+            vec![
+                "cache_create_tokens",
+                "cache_read_tokens",
+                "children",
+                "compaction_count",
+                "context_percent",
+                "context_window",
+                "current_task",
+                "cwd",
+                "effort",
+                "elapsed_secs",
+                "git_added",
+                "git_branch",
+                "git_modified",
+                "input_tokens",
+                "mem_mb",
+                "model",
+                "output_tokens",
+                "pid",
+                "process_start_id",
+                "project_name",
+                "session_id",
+                "started_at_ms",
+                "status",
+                "summary",
+                "telemetry",
+                "token_history",
+                "total_tokens",
+                "turn_count",
+                "version",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(telemetry),
+            vec![
+                "attachment",
+                "attachment_confidence",
+                "context",
+                "error",
+                "fleet",
+                "source_health",
+                "usage",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&telemetry["context"]),
+            vec![
+                "active_leaf_id",
+                "baseline_tokens",
+                "completeness",
+                "last_successful_parse_at_ms",
+                "observed_at_ms",
+                "percent",
+                "precision",
+                "provenance",
+                "provider",
+                "reason",
+                "source_updated_at_ms",
+                "stale",
+                "tokens",
+                "trailing_tokens",
+                "window_tokens",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&telemetry["usage"]),
+            vec![
+                "cache_create_tokens",
+                "cache_read_tokens",
+                "completeness",
+                "input_tokens",
+                "last_successful_parse_at_ms",
+                "observed_at_ms",
+                "output_tokens",
+                "precision",
+                "provenance",
+                "reason",
+                "reported_cost",
+                "source_updated_at_ms",
+                "stale",
+                "total_tokens",
+            ]
+        );
+        assert!(telemetry["context"].get("active_leaf_id").is_some());
+        assert!(telemetry["context"]["active_leaf_id"].is_null());
+        let context = &telemetry["context"];
+        assert!(context["percent"].as_f64().is_some());
+        for field in [
+            "window_tokens",
+            "tokens",
+            "baseline_tokens",
+            "trailing_tokens",
+        ] {
+            assert!(
+                context[field].as_u64().is_some(),
+                "populated demo context field {field} must serialize as a number"
+            );
+        }
+    }
+
     #[test]
     fn pi_snapshot_uses_structured_unknowns_instead_of_numeric_placeholders() {
         let mut app = demo_app();

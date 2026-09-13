@@ -2,9 +2,9 @@
 
 ## Status
 
-The owner approved the defaults. Phase 0 and its acceptance gate are complete.
-Phase 1 Changes 1.1 through 1.4 are implemented and verified. Change 1.5 has
-not started.
+The owner approved the defaults. Phase 0 and Phase 1 Changes 0.1 through 1.5
+are implemented and verified. Both phase acceptance gates and the final smoke
+checks pass.
 
 This plan turns Phase 0 and Phase 1 from
 [`pi-harness-telemetry.md`](pi-harness-telemetry.md) into ordered,
@@ -667,5 +667,5 @@ Stop execution and ask the owner if any of these occurs:
 ## Approval gate
 
 The owner confirmed the defaults in **Approved-by-execution defaults** before
-implementation began. Phase 0 and Phase 1 Changes 1.1 through 1.4 are complete.
-The next implementation step is Phase 1 Change 1.5.
+implementation began. Phase 0 and Phase 1 are complete. Any public rich
+telemetry consumer remains deferred to a separately approved Phase 2.
