@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::locale::t;
+use crate::model::aggregate_live_usage;
 use crate::theme::Theme;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -7,10 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{
-    braille_sparkline, btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar,
-    styled_label, truncate_str,
-};
+use super::{btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar, styled_label};
 
 pub(crate) fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_tokens_panel_active(f, app, area, theme, false);
@@ -23,53 +21,15 @@ pub(crate) fn draw_tokens_panel_active(
     theme: &Theme,
     active: bool,
 ) {
-    let selected = app.sessions.get(app.selected);
-    let panel_title = if let Some(session) = selected {
-        format!(
-            "tokens ({}/{})",
-            truncate_str(&session.project_name, 12),
-            truncate_str(&session.session_id, 8)
-        )
+    let aggregate = aggregate_live_usage(&app.sessions);
+    let panel_title = if area.width < 38 {
+        t("tokens.title_short")
     } else {
-        "tokens".to_string()
+        t("tokens.title")
     };
     let block = btop_block_active(&panel_title, "²", theme.mem_box, theme, active);
-
-    if selected.is_some_and(|session| session.total_tokens_value().is_none()) {
-        let lines = vec![
-            Line::from(vec![
-                styled_label(" Total: ", theme.graph_text),
-                Span::styled("—", Style::default().fg(theme.inactive_fg)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                " Session telemetry unavailable",
-                Style::default().fg(theme.inactive_fg),
-            )),
-        ];
-        f.render_widget(Paragraph::new(lines).block(block), area);
-        return;
-    }
-
-    let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
-    let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
-    let cache_read: u64 = selected.map(|s| s.total_cache_read).unwrap_or(0);
-    let cache_write: u64 = selected.map(|s| s.total_cache_create).unwrap_or(0);
-    let total: u64 = total_in + total_out + cache_read + cache_write;
-    let turns: u32 = selected.map(|s| s.turn_count).unwrap_or(0);
-    let avg = if turns > 0 { total / turns as u64 } else { 0 };
-
-    // Compute percentages for mini meter bars
-    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if total > 0 {
-        (
-            total_in as f64 / total as f64 * 100.0,
-            total_out as f64 / total as f64 * 100.0,
-            cache_read as f64 / total as f64 * 100.0,
-            cache_write as f64 / total as f64 * 100.0,
-        )
-    } else {
-        (0.0, 0.0, 0.0, 0.0)
-    };
+    let total = aggregate.total_tokens;
+    let has_displayable_usage = total.is_some();
 
     let free_grad = make_gradient(
         theme.free_grad.start,
@@ -86,112 +46,162 @@ pub(crate) fn draw_tokens_panel_active(
         theme.cached_grad.mid,
         theme.cached_grad.end,
     );
-
     let bar_w = (area.width as usize).saturating_sub(20).clamp(5, 15);
 
     let total_label = t("tokens.total");
-    let partial_suffix = if selected.is_some_and(|session| session.usage_is_partial()) {
-        "+"
-    } else {
-        ""
-    };
+    let total_value = total
+        .map(|value| {
+            format!(
+                "{}{}",
+                fmt_tokens(value),
+                if aggregate.is_lower_bound() { "+" } else { "" }
+            )
+        })
+        .unwrap_or_else(|| "—".to_string());
     let total_line = vec![
         styled_label(format!(" {}: ", total_label).as_str(), theme.graph_text),
         Span::styled(
-            format!("{}{}", fmt_tokens(total), partial_suffix),
+            total_value,
             Style::default()
-                .fg(theme.title)
+                .fg(if has_displayable_usage {
+                    theme.title
+                } else {
+                    theme.inactive_fg
+                })
                 .add_modifier(Modifier::BOLD),
         ),
     ];
 
-    let input_label = t("tokens.input");
-    let mut input_line = vec![styled_label(
-        format!(" {} :", input_label).as_str(),
-        theme.graph_text,
-    )];
-    input_line.extend(meter_bar(in_pct, bar_w, &free_grad, theme.meter_bg));
-    input_line.push(Span::styled(
-        format!(" {}", fmt_tokens(total_in)),
-        Style::default().fg(grad_at(&free_grad, 80.0)),
-    ));
+    let usage_line =
+        |label: String, value: Option<u64>, gradient: &[ratatui::style::Color; 101]| {
+            let mut line = vec![styled_label(
+                format!(" {}:", label).as_str(),
+                theme.graph_text,
+            )];
+            if let (Some(value), Some(total)) = (value, total) {
+                let percentage = if total > 0 {
+                    value as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                line.extend(meter_bar(percentage, bar_w, gradient, theme.meter_bg));
+                line.push(Span::styled(
+                    format!(" {}", fmt_tokens(value)),
+                    Style::default().fg(grad_at(gradient, 80.0)),
+                ));
+            } else {
+                line.push(Span::styled(" —", Style::default().fg(theme.inactive_fg)));
+            }
+            line
+        };
 
-    let output_label = t("tokens.output");
-    let mut output_line = vec![styled_label(
-        format!(" {}:", output_label).as_str(),
-        theme.graph_text,
-    )];
-    output_line.extend(meter_bar(out_pct, bar_w, &used_grad, theme.meter_bg));
-    output_line.push(Span::styled(
-        format!(" {}", fmt_tokens(total_out)),
-        Style::default().fg(grad_at(&used_grad, 80.0)),
-    ));
+    let coverage_line = if area.width < 52 {
+        vec![
+            styled_label(" L:", theme.graph_text),
+            Span::styled(
+                aggregate.live_sessions().to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(" C:", theme.graph_text),
+            Span::styled(
+                aggregate.complete_sessions.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(" P:", theme.graph_text),
+            Span::styled(
+                aggregate.partial_sessions.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(" U:", theme.graph_text),
+            Span::styled(
+                aggregate.unavailable_sessions.to_string(),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]
+    } else {
+        vec![
+            styled_label(
+                format!(" {}: ", t("tokens.live")).as_str(),
+                theme.graph_text,
+            ),
+            Span::styled(
+                aggregate.live_sessions().to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(
+                format!("  {}: ", t("tokens.complete")).as_str(),
+                theme.graph_text,
+            ),
+            Span::styled(
+                aggregate.complete_sessions.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(
+                format!("  {}: ", t("tokens.partial")).as_str(),
+                theme.graph_text,
+            ),
+            Span::styled(
+                aggregate.partial_sessions.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            styled_label(
+                format!("  {}: ", t("tokens.unavailable")).as_str(),
+                theme.graph_text,
+            ),
+            Span::styled(
+                aggregate.unavailable_sessions.to_string(),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]
+    };
 
-    let cache_r_label = t("tokens.cache_r");
-    let mut cache_r_line = vec![styled_label(
-        format!(" {}:", cache_r_label).as_str(),
-        theme.graph_text,
-    )];
-    cache_r_line.extend(meter_bar(cache_r_pct, bar_w, &cached_grad, theme.meter_bg));
-    cache_r_line.push(Span::styled(
-        format!(" {}", fmt_tokens(cache_read)),
-        Style::default().fg(grad_at(&cached_grad, 80.0)),
-    ));
-
-    let cache_w_label = t("tokens.cache_w");
-    let mut cache_w_line = vec![styled_label(
-        format!(" {}:", cache_w_label).as_str(),
-        theme.graph_text,
-    )];
-    cache_w_line.extend(meter_bar(cache_w_pct, bar_w, &cached_grad, theme.meter_bg));
-    cache_w_line.push(Span::styled(
-        format!(" {}", fmt_tokens(cache_write)),
-        Style::default().fg(grad_at(&cached_grad, 80.0)),
-    ));
-
-    // Per-turn sparkline from selected session's token_history
-    let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
-    let all_history: Vec<u64> = app
-        .sessions
-        .get(app.selected)
-        .map(|s| s.token_history.clone())
-        .unwrap_or_default();
-    let spark_w = (area.width as usize).saturating_sub(16).clamp(5, 20);
-    let max_val = all_history.iter().copied().max().unwrap_or(1).max(1);
-    let normalized: Vec<f64> = all_history
-        .iter()
-        .map(|&v| v as f64 / max_val as f64)
-        .collect();
-    let mut spark_line_spans = vec![styled_label(" ", theme.graph_text)];
-    spark_line_spans.extend(braille_sparkline(
-        &normalized,
-        spark_w,
-        &cpu_grad,
-        theme.graph_text,
-    ));
-    let tokens_turn_label = t("tokens.tokens_turn");
-    spark_line_spans.push(Span::styled(
-        format!(" {}", tokens_turn_label),
-        Style::default().fg(theme.graph_text),
-    ));
-
-    let turns_label = t("tokens.turns");
-    let avg_label = t("tokens.avg");
+    let average = aggregate
+        .average_tokens_per_turn()
+        .map(|value| format!("{}/t", fmt_tokens(value)))
+        .unwrap_or_else(|| "—".to_string());
+    let turns = aggregate.turn_count.map_or_else(
+        || "—".to_string(),
+        |value| {
+            format!(
+                "{value}{}",
+                if aggregate.is_lower_bound() { "+" } else { "" }
+            )
+        },
+    );
     let lines = vec![
         Line::from(total_line),
-        Line::from(input_line),
-        Line::from(output_line),
-        Line::from(cache_r_line),
-        Line::from(cache_w_line),
-        Line::from(spark_line_spans),
+        Line::from(usage_line(
+            t("tokens.input"),
+            aggregate.input_tokens,
+            &free_grad,
+        )),
+        Line::from(usage_line(
+            t("tokens.output"),
+            aggregate.output_tokens,
+            &used_grad,
+        )),
+        Line::from(usage_line(
+            t("tokens.cache_r"),
+            aggregate.cache_read_tokens,
+            &cached_grad,
+        )),
+        Line::from(usage_line(
+            t("tokens.cache_w"),
+            aggregate.cache_write_tokens,
+            &cached_grad,
+        )),
+        Line::from(coverage_line),
         Line::from(vec![
-            styled_label(format!(" {}: ", turns_label).as_str(), theme.graph_text),
-            Span::styled(format!("{}", turns), Style::default().fg(theme.main_fg)),
-            styled_label(format!("  {}: ", avg_label).as_str(), theme.graph_text),
-            Span::styled(
-                format!("{}/t", fmt_tokens(avg)),
-                Style::default().fg(theme.graph_text),
+            styled_label(
+                format!(" {}: ", t("tokens.turns")).as_str(),
+                theme.graph_text,
             ),
+            Span::styled(turns, Style::default().fg(theme.main_fg)),
+            styled_label(
+                format!("  {}: ", t("tokens.avg")).as_str(),
+                theme.graph_text,
+            ),
+            Span::styled(average, Style::default().fg(theme.graph_text)),
         ]),
     ];
 
@@ -202,62 +212,148 @@ pub(crate) fn draw_tokens_panel_active(
 mod tests {
     use super::*;
     use crate::config::PanelVisibility;
-    use crate::model::SessionTelemetry;
+    use crate::model::{SessionTelemetry, TelemetryCompleteness};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    #[test]
-    fn positive_input_and_output_have_visible_meter_cells() {
-        let theme = Theme::by_name("catppuccin").unwrap();
-        let mut app = App::new(theme, PanelVisibility::default());
-        crate::demo::populate_demo(&mut app);
-        app.sessions.truncate(1);
-        let session = &mut app.sessions[0];
-        session.total_input_tokens = 123_700;
-        session.total_output_tokens = 18_500;
-        session.total_cache_read = 3_000_000;
-        session.total_cache_create = 0;
-
-        let backend = TestBackend::new(50, 10);
+    fn rendered_tokens(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_tokens_panel(f, &app, f.area(), &app.theme))
+            .draw(|f| draw_tokens_panel(f, app, f.area(), &app.theme))
             .unwrap();
+        format!("{}", terminal.backend())
+    }
 
-        let buffer = terminal.backend().buffer();
-        for (row, label) in [(2, "input"), (3, "output")] {
-            let has_visible_cell = (9..24).any(|column| {
-                let cell = &buffer[(column, row)];
-                cell.symbol() == "■"
-                    && cell.fg != app.theme.meter_bg
-                    && cell.fg != app.theme.main_bg
-            });
-            assert!(has_visible_cell, "positive {label} meter is invisible");
-        }
+    #[test]
+    fn aggregate_is_selection_independent_and_shows_coverage() {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.selected = 2;
+        let text = rendered_tokens(&app, 100, 18);
+        assert!(
+            text.contains("Total Tokens / all live sessions"),
+            "missing aggregate title\n{text}"
+        );
+        assert!(
+            text.contains("Total: 729.6k"),
+            "token total should not follow the selected session\n{text}"
+        );
+        assert!(text.contains("Live: 3"), "missing live coverage\n{text}");
+        assert!(
+            text.contains("Complete: 3"),
+            "missing complete coverage\n{text}"
+        );
+        assert!(
+            !text.contains("tokens/turn"),
+            "selected sparkline remains\n{text}"
+        );
+    }
+
+    fn mixed_coverage_app() -> App {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(3);
+        app.sessions[1]
+            .telemetry
+            .as_mut()
+            .unwrap()
+            .usage
+            .completeness = TelemetryCompleteness::Partial;
+        app.sessions[2].telemetry = Some(SessionTelemetry::process_only(1));
+        app
+    }
+
+    #[test]
+    fn compact_coverage_and_lower_bounds_fit_a_narrow_panel() {
+        let app = mixed_coverage_app();
+        let text = rendered_tokens(&app, 33, 10);
+        assert!(
+            text.contains("L:3 C:1 P:1 U:1"),
+            "missing compact coverage\n{text}"
+        );
+        assert!(
+            text.contains("Total:") && text.contains('+'),
+            "missing lower-bound total\n{text}"
+        );
+        assert!(
+            text.contains("Turns: 43+"),
+            "missing lower-bound turns\n{text}"
+        );
+    }
+
+    #[test]
+    fn empty_known_zero_and_partial_usage_render_distinctly() {
+        let empty = App::new(Theme::default(), PanelVisibility::default());
+        let text = rendered_tokens(&empty, 100, 18);
+        assert!(text.contains("Total: 0"), "empty total is not zero\n{text}");
+        assert!(
+            text.contains("Turns: 0"),
+            "empty turns are not zero\n{text}"
+        );
+        assert!(
+            text.contains("Live: 0"),
+            "empty coverage is missing\n{text}"
+        );
+
+        let mut known_zero = App::new(Theme::default(), PanelVisibility::default());
+        crate::demo::populate_demo(&mut known_zero);
+        known_zero.sessions.truncate(1);
+        let session = &mut known_zero.sessions[0];
+        session.total_input_tokens = 0;
+        session.total_output_tokens = 0;
+        session.total_cache_read = 0;
+        session.total_cache_create = 0;
+        let text = rendered_tokens(&known_zero, 100, 18);
+        assert!(
+            text.contains("Total: 0"),
+            "known zero became unavailable\n{text}"
+        );
+        assert!(
+            text.contains("Turns: 27"),
+            "known turns are missing\n{text}"
+        );
+        assert!(
+            text.contains("Complete: 1"),
+            "known coverage is missing\n{text}"
+        );
+
+        known_zero.sessions[0]
+            .telemetry
+            .as_mut()
+            .unwrap()
+            .usage
+            .completeness = TelemetryCompleteness::Partial;
+        let text = rendered_tokens(&known_zero, 100, 18);
+        assert!(
+            text.contains("Total: 0+"),
+            "partial total lacks marker\n{text}"
+        );
+        assert!(
+            text.contains("Turns: 27+"),
+            "partial turns lack marker\n{text}"
+        );
+        assert!(
+            text.contains("Partial: 1"),
+            "partial coverage is missing\n{text}"
+        );
     }
 
     #[test]
     fn process_only_usage_has_no_zero_totals_or_bars() {
         let mut app = App::new(Theme::default(), PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
-        app.sessions.truncate(1);
-        let session = &mut app.sessions[0];
-        session.total_input_tokens = 0;
-        session.total_output_tokens = 0;
-        session.total_cache_read = 0;
-        session.total_cache_create = 0;
-        session.telemetry = Some(SessionTelemetry::process_only(1));
-
-        let backend = TestBackend::new(50, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| draw_tokens_panel(f, &app, f.area(), &app.theme))
-            .unwrap();
-        let text = format!("{}", terminal.backend());
-
+        for session in &mut app.sessions {
+            session.total_input_tokens = 0;
+            session.total_output_tokens = 0;
+            session.total_cache_read = 0;
+            session.total_cache_create = 0;
+            session.telemetry = Some(SessionTelemetry::process_only(1));
+        }
+        let text = rendered_tokens(&app, 100, 18);
         assert!(text.contains("Total: —"), "missing unknown total\n{text}");
         assert!(
-            text.contains("Session telemetry unavailable"),
+            text.contains("Unavailable: 3"),
             "missing source state\n{text}"
         );
         assert!(

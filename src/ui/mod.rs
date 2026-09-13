@@ -20,13 +20,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-// ── braille graph symbols — from btop_draw.cpp ──────────────────────────────
-// 5x5 lookup: [prev_val * 5 + cur_val], values 0-4
-pub(crate) const BRAILLE_UP: [&str; 25] = [
-    " ", "⢀", "⢠", "⢰", "⢸", "⡀", "⣀", "⣠", "⣰", "⣸", "⡄", "⣄", "⣤", "⣴", "⣼", "⡆", "⣆", "⣦", "⣶",
-    "⣾", "⡇", "⣇", "⣧", "⣷", "⣿",
-];
-
 // ── gradient interpolation (btop-faithful: linear RGB, 101 steps) ────────────
 
 /// Generate 101-step gradient from start→mid→end, matching btop's generateGradients().
@@ -88,48 +81,6 @@ pub(crate) fn meter_bar(
         } else {
             spans.push(Span::styled("■", Style::default().fg(meter_bg)));
         }
-    }
-    spans
-}
-
-// ── braille sparkline ────────────────────────────────────────────────────────
-
-/// Render a braille sparkline from data points (0.0–1.0), colored with gradient.
-pub(crate) fn braille_sparkline(
-    data: &[f64],
-    width: usize,
-    gradient: &[Color; 101],
-    graph_text: Color,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if data.is_empty() || width == 0 {
-        for _ in 0..width {
-            spans.push(Span::styled(" ", Style::default().fg(graph_text)));
-        }
-        return spans;
-    }
-
-    // We need pairs of data points per braille char (prev, cur)
-    // Pad or sample data to fit width * 2 points
-    let needed = width * 2;
-    let sampled: Vec<f64> = if data.len() >= needed {
-        data[data.len() - needed..].to_vec()
-    } else {
-        let mut v = vec![0.0; needed - data.len()];
-        v.extend_from_slice(data);
-        v
-    };
-
-    for i in 0..width {
-        let prev = (sampled[i * 2].clamp(0.0, 1.0) * 4.0).round() as usize;
-        let cur = (sampled[i * 2 + 1].clamp(0.0, 1.0) * 4.0).round() as usize;
-        let idx = prev * 5 + cur;
-        let pct = (sampled[i * 2 + 1] * 100.0).round() as usize;
-        let color = grad_at(gradient, pct as f64);
-        spans.push(Span::styled(
-            BRAILLE_UP[idx.min(24)].to_string(),
-            Style::default().fg(color),
-        ));
     }
     spans
 }
@@ -951,7 +902,7 @@ mod tests {
     use crate::config::PanelVisibility;
     use crate::model::{
         FleetChild, FleetExecution, FleetIdentitySource, FleetRun, FleetRunMode, FleetRunState,
-        FleetTelemetry, FleetUsage, SourceHealth,
+        FleetTelemetry, FleetUsage, SessionTelemetry, SourceHealth, TelemetryCompleteness,
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1074,8 +1025,8 @@ mod tests {
             "usage tab should render context panel\n{text}"
         );
         assert!(
-            text.contains("tokens"),
-            "usage tab should render tokens panel\n{text}"
+            text.contains("Total Tokens"),
+            "usage tab should render total tokens panel\n{text}"
         );
         assert!(
             !text.contains("SESSION"),
@@ -1336,7 +1287,7 @@ mod tests {
     #[test]
     fn desktop_size_keeps_mid_panels() {
         let text = render_demo(120, 40);
-        for label in ["tokens", "projects", "ports", "sessions"] {
+        for label in ["Total Tokens", "projects", "ports", "sessions"] {
             assert!(
                 text.contains(label),
                 "desktop should render {label}\n{text}"
@@ -1349,12 +1300,50 @@ mod tests {
     }
 
     #[test]
+    fn full_desktop_compact_token_panel_shows_mixed_coverage_and_lower_bounds() {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(3);
+        app.sessions[1]
+            .telemetry
+            .as_mut()
+            .unwrap()
+            .usage
+            .completeness = TelemetryCompleteness::Partial;
+        app.sessions[2].telemetry = Some(SessionTelemetry::process_only(1));
+
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("L:3 C:1 P:1 U:1"),
+            "missing compact coverage\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("Total:") && line.contains('+')),
+            "missing lower-bound total\n{text}"
+        );
+        assert!(
+            text.contains("Turns: 43+"),
+            "missing lower-bound turns\n{text}"
+        );
+    }
+
+    #[test]
     fn token_turn_stats_fit_desktop_and_compact_layouts() {
         for (width, height) in [(100, 18), (100, 24), (120, 40)] {
             let text = render_demo(width, height);
             assert!(
                 text.contains("Turns:") && text.contains("Avg:"),
                 "desktop token panel clipped turn statistics at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("Total Tokens")
+                    && (text.contains("L:3 C:3 P:0 U:0")
+                        || text.contains("Live: 3  Complete: 3  Partial: 0  Unavailable: 0")),
+                "desktop token panel lost aggregate coverage at {width}x{height}\n{text}"
             );
             assert!(
                 text.contains("sessions") && text.contains("πPI"),
@@ -1373,6 +1362,10 @@ mod tests {
             assert!(
                 text.contains("Turns:") && text.contains("Avg:"),
                 "compact token panel clipped turn statistics at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("Total Tokens / all live sessions") && text.contains("Live: 3"),
+                "compact Usage panel lost aggregate title or coverage at {width}x{height}\n{text}"
             );
         }
     }

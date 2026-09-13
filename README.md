@@ -11,7 +11,7 @@ The demo uses the user-created [madeofcode](https://github.com/bruschill/madeofc
 ## What ptop shows
 
 - Pi sessions with status, model, thinking level, context, tokens, memory, and current telemetry state.
-- The token panel shows lifetime totals, per-turn averages, and the latest 64 known assistant-turn samples. Nonzero meters remain visible when cache usage dominates.
+- Panel 2, Total Tokens, aggregates parent-session input, output, cache-read, and cache-write usage across all live Pi sessions. It excludes fleet runs. Coverage shows complete, partial, and unavailable sessions; a `+` marks known lower-bound totals and turns, and unavailable-only usage shows `—`. Per-turn averages appear only when all live usage is complete.
 - `pi-subagents` fleet runs and child lifecycle metadata.
 - Per-project Git branch and working-tree counts, refreshed on the slower polling interval.
 - Child processes, listening ports, port conflicts, and orphan ports.
