@@ -38,6 +38,7 @@ const MAX_LSOF_RECORD_BYTES: usize = 4096;
 const HEADER_READ_CHUNK_BYTES: usize = 4096;
 const MAX_TELEMETRY_ERROR_BYTES: usize = 160;
 const MAX_SEMANTIC_ENTRIES: usize = 8_192;
+const MAX_TOKEN_HISTORY_POINTS: usize = 64;
 const MAX_SEMANTIC_ID_BYTES: usize = 256;
 const MAX_SEMANTIC_PARENT_BYTES: usize = 256;
 const MAX_SEMANTIC_METADATA_BYTES: usize = 256;
@@ -1283,6 +1284,22 @@ impl PiSemantic {
             }
             if entry.kind == PiEntryKind::Assistant {
                 data.turns = data.turns.saturating_add(1);
+                if let Some(total) = entry
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.components)
+                    .and_then(|(input, output, cache_read, cache_write)| {
+                        input
+                            .checked_add(output)
+                            .and_then(|total| total.checked_add(cache_read))
+                            .and_then(|total| total.checked_add(cache_write))
+                    })
+                {
+                    if data.token_history.len() == MAX_TOKEN_HISTORY_POINTS {
+                        data.token_history.remove(0);
+                    }
+                    data.token_history.push(total);
+                }
             }
         }
         if data.usage_available
@@ -1404,18 +1421,6 @@ impl PiSemantic {
             TelemetryPrecision::Estimated
         };
         data.context_history.push(data.context_tokens.unwrap());
-        if let Some((input, output, cache_read, cache_write)) = self.entries[&branch[index]]
-            .usage
-            .as_ref()
-            .and_then(|u| u.components)
-        {
-            data.token_history.push(
-                input
-                    .saturating_add(output)
-                    .saturating_add(cache_read)
-                    .saturating_add(cache_write),
-            );
-        }
         data
     }
 }
@@ -1475,10 +1480,7 @@ fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
     } else {
         value.get("usage")
     };
-    let usage = match usage_value {
-        Some(value) => Some(parse_usage(value)?),
-        None => None,
-    };
+    let usage = usage_value.map(|value| parse_usage(value).unwrap_or_default());
     let provider_value = message
         .and_then(|m| m.get("provider"))
         .or_else(|| value.get("provider"));
@@ -3602,8 +3604,40 @@ mod tests {
             (15, 9, 2, 1)
         );
         assert_eq!(data.context_tokens, Some(20));
+        assert_eq!(data.token_history, vec![18, 7]);
         assert_eq!(data.active_leaf_id.as_deref(), Some("other"));
         assert_eq!(data.context_precision, TelemetryPrecision::Estimated);
+    }
+
+    #[test]
+    fn semantic_token_history_keeps_the_latest_64_assistant_turns() {
+        let mut semantic = PiSemantic::default();
+        for index in 0..66 {
+            let id = format!("turn-{index}");
+            let parent_id = (index > 0).then(|| format!("turn-{}", index - 1));
+            let entry = serde_json::json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent_id,
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input": index + 1,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0
+                    },
+                    "content": []
+                }
+            });
+            assert!(semantic.add(&entry));
+        }
+
+        let data = semantic.session_data(true);
+        assert_eq!(data.turns, 66);
+        assert_eq!(data.token_history.len(), 64);
+        assert_eq!(data.token_history.first(), Some(&3));
+        assert_eq!(data.token_history.last(), Some(&66));
     }
 
     #[test]
@@ -3632,6 +3666,8 @@ mod tests {
         }
         let data = semantic.session_data(true);
         assert_eq!(data.baseline_tokens, Some(14));
+        assert_eq!(data.turns, 2);
+        assert_eq!(data.token_history, vec![14]);
     }
 
     #[test]
@@ -3689,6 +3725,29 @@ mod tests {
         );
         assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
         assert!(data.baseline_tokens.is_none());
+    }
+
+    #[test]
+    fn malformed_usage_keeps_the_assistant_turn_without_a_history_sample() {
+        for usage in [serde_json::Value::Null, serde_json::json!("bad")] {
+            let mut semantic = PiSemantic::default();
+            let entry = serde_json::json!({
+                "type": "message",
+                "id": "a",
+                "parentId": null,
+                "message": {
+                    "role": "assistant",
+                    "usage": usage,
+                    "content": []
+                }
+            });
+            assert!(semantic.add(&entry));
+
+            let data = semantic.session_data(true);
+            assert_eq!(data.turns, 1);
+            assert!(data.token_history.is_empty());
+            assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        }
     }
 
     #[test]
@@ -3812,6 +3871,7 @@ mod tests {
         let data = cross_component.session_data(true);
         assert!(!data.usage_available);
         assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(data.token_history.is_empty());
         assert!(data
             .usage_reason
             .as_deref()
