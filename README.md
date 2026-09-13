@@ -78,6 +78,22 @@ tmux new -s work
 # Enter on a session in ptop jumps to its pane
 ```
 
+### Herdr workspace presence
+
+On macOS and Linux with Herdr 0.9.0 or newer, the interactive ptop TUI publishes a display-only `ptop=running` token to its verified Herdr workspace. The token expires within 30 seconds after the last ptop instance exits or loses access to Herdr. One-shot, JSON, update, version, and demo modes do not publish presence.
+
+Add the token to Herdr's Space sidebar rows:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace", "$ptop"],
+  ["branch", "git_status"],
+]
+```
+
+Reload a running Herdr server with `herdr server reload-config`. ptop does not report itself as an agent, so it does not affect Herdr agent state, waits, notifications, or workspace rollups.
+
 ## Pi telemetry
 
 ptop always discovers live Pi processes first. It attaches a Pi JSONL session only when ownership is unambiguous and the session identity and working directory match. A process remains visible as `process only` when attachment is missing, stale, unsupported, or ambiguous.
@@ -199,7 +215,7 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 
 ptop does not retain or publish prompt text, assistant text, tool arguments, tool results, or child transcripts. Pi session parsing keeps identity, safe metadata, and structured numeric telemetry only. Fleet collection reads supported lifecycle status metadata, not child output logs or transcript files.
 
-TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. Package installation and `ptop --update` are separate user-requested operations.
+TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. When the interactive TUI runs inside Herdr on macOS or Linux, it sends only the display token `ptop=running` and exact Herdr resource IDs back to the same local Herdr socket. Package installation and `ptop --update` are separate user-requested operations.
 
 ## Acknowledgements
 
