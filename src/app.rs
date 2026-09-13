@@ -648,7 +648,7 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's agent process.
-    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// Delegates to the terminal-jumper registry (Herdr / cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
     #[cfg(target_os = "windows")]
@@ -665,7 +665,7 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's agent process.
-    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// Delegates to the terminal-jumper registry (Herdr / cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
     #[cfg(not(target_os = "windows"))]

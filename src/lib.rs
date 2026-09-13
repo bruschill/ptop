@@ -49,6 +49,7 @@ pub mod app;
 pub mod collector;
 pub mod config;
 pub mod demo;
+mod herdr;
 pub mod host_info;
 pub mod jump;
 pub mod locale;

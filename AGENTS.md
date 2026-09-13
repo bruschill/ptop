@@ -35,6 +35,7 @@ src/
 ├── config.rs                  # Theme, language, and five panel settings
 ├── demo.rs                    # Collector-free Pi demo fixtures
 ├── host_info.rs               # Host and aggregate metrics
+├── herdr.rs                   # Shared Herdr process location and bounded CLI calls
 ├── locale.rs                  # UI strings
 ├── snapshot.rs                # JSON-safe snapshot DTOs
 ├── collector/
@@ -44,6 +45,7 @@ src/
 │   └── process.rs             # Process tree, ports, and Git status
 ├── jump/
 │   ├── mod.rs                 # Ordered terminal-jumper registry
+│   ├── herdr.rs
 │   ├── cmux.rs
 │   ├── tmux.rs
 │   └── iterm2.rs
@@ -139,9 +141,10 @@ Before killing an orphan, perform a fresh port scan and require an exact current
 
 `jumpers()` is the ordered source of truth:
 
-1. cmux, using `CMUX_WORKSPACE_ID` from the process environment.
-2. tmux, using pane process-tree ownership.
-3. iTerm2 on macOS, using controlling TTY and AppleScript.
+1. Herdr, using the selected Pi process's pane ID when ptop shares its server socket.
+2. cmux, using `CMUX_WORKSPACE_ID` from the process environment.
+3. tmux, using pane process-tree ownership.
+4. iTerm2 on macOS, using controlling TTY and AppleScript.
 
 Each adapter returns:
 
