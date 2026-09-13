@@ -1,224 +1,224 @@
 # ptop
 
-Local terminal monitor for Pi coding-agent processes, sessions, and `pi-subagents` runs.
+Local terminal monitor for Pi processes, sessions, and `pi-subagents` runs.
 
-## Language policy
+## Product rules
 
-English is mandatory for all project-facing work and communication.
+These rules are non-negotiable:
 
-- Write source code, comments, tests, fixtures, documentation, examples, configuration, scripts, and user-facing strings in English.
-- Use English for GitHub issues, comments, pull requests, reviews, commits, branches, releases, labels, milestones, discussions, and CI messages.
-- Preserve non-English text only when it is an exact external identifier, protocol value, or short direct quote with an English explanation.
+- Monitor Pi only. Do not add another top-level coding-agent collector, mode,
+  label, quota source, or transcript view.
+- Treat model and provider names such as Claude or Codex as Pi session
+  metadata, not as separate monitored agents.
+- Discover live Pi processes first. Keep a process-only row when telemetry is
+  missing, stale, unsupported, or ambiguous.
+- Fail closed when attaching telemetry or targeting a process. Never guess
+  ownership from a path, session ID, PID, or display label.
+- Preserve unknown values as unknown. Authoritative snapshot fields use `null`
+  when unavailable, never a fabricated zero.
+- Do not retain or publish prompt text, assistant text, tool arguments, tool
+  results, child transcripts, or child output logs.
+- Do not add network requests to monitoring paths. Installation and explicit
+  update operations are outside the monitoring path.
+- Keep `--demo` collector-free.
 
-## Product boundary
+## Language and compatibility
 
-ptop monitors Pi only. Do not add another top-level coding-agent collector, mode, label, quota source, or transcript view.
+Use English for code, comments, tests, fixtures, documentation, configuration,
+scripts, UI strings, and repository communication. Preserve non-English text
+only when it is an exact external identifier, protocol value, or short quote
+with an English explanation.
 
-Model and provider metadata reported by Pi may contain names such as Claude or Codex. Treat those values as Pi session metadata, not as separate monitored agents.
+Keep compatibility with the `rust-version` in `Cargo.toml`; do not use newer
+standard-library APIs. Keep platform-specific code and imports behind narrow
+`cfg` gates. CI must continue to compile Linux, macOS, and Windows process-only
+support.
 
-Keep:
+## Sources of truth
 
-- Pi process and session discovery.
-- Safe Pi JSONL attachment and numeric telemetry.
-- `pi-subagents` fleet and run telemetry.
-- Process trees, child commands, ports, orphan detection, Git state, host metrics, and terminal jump.
-- Process-only rows when telemetry attachment is unavailable or ambiguous.
-- The privacy contract: no prompt text, assistant text, tool arguments, tool results, or child transcripts in product output.
+Read the relevant source before changing behavior:
 
-## Architecture
+- `README.md`: user-visible behavior, flags, key bindings, configuration, and
+  privacy summary.
+- `docs/pi-support.md`: platform, attachment, parser, fleet, polling, snapshot,
+  privacy, validation, and compatibility contracts.
+- `docs/themes.md`: Theme Format v1 and packaged theme requirements.
+- `jump::jumpers()`: terminal backend order and fallback behavior.
+
+Update `README.md` with every user-visible behavior change. Update the detailed
+contract document when a parser, telemetry, platform, snapshot, or theme
+contract changes. Do not let `AGENTS.md` become a second copy of those specs.
+
+## Code ownership map
 
 ```text
-src/
-├── main.rs                    # Binary entry
-├── lib.rs                     # CLI parsing, terminal lifecycle, input loop, text snapshot
-├── app.rs                     # Application state, polling, selection, kill/jump controls
-├── config.rs                  # Theme, language, and five panel settings
-├── demo.rs                    # Collector-free Pi demo fixtures
-├── host_info.rs               # Host and aggregate metrics
-├── herdr.rs                   # Shared Herdr process location and bounded CLI calls
-├── locale.rs                  # UI strings
-├── snapshot.rs                # JSON-safe snapshot DTOs
-├── collector/
-│   ├── mod.rs                 # Concrete Pi Collector and shared enrichment
-│   ├── pi.rs                  # Pi process discovery, attachment, JSONL tailing
-│   ├── pi_subagents.rs        # Fleet lifecycle status parser
-│   └── process.rs             # Process tree, ports, and Git status
-├── jump/
-│   ├── mod.rs                 # Ordered terminal-jumper registry
-│   ├── herdr.rs
-│   ├── cmux.rs
-│   ├── tmux.rs
-│   └── iterm2.rs
-├── model/
-│   ├── mod.rs
-│   └── session.rs             # Pi sessions and structured telemetry
-├── theme/
-│   ├── mod.rs
-│   └── builtins/*.toml
-└── ui/
-    ├── mod.rs                 # Layout, compact tabs, click targets
-    ├── context.rs
-    ├── tokens.rs
-    ├── projects.rs
-    ├── ports.rs
-    ├── sessions.rs
-    ├── runs.rs
-    ├── header.rs
-    ├── footer.rs
-    ├── help.rs
-    ├── config.rs
-    └── view_menu.rs
+src/main.rs                 Binary entry
+src/lib.rs                  CLI, terminal lifecycle, input loop, text output
+src/app.rs                  State, polling, selection, kill and jump controls
+src/collector/pi.rs         Pi discovery, session attachment, JSONL tailing
+src/collector/pi_subagents.rs
+                            Extension-owned fleet status parsing
+src/collector/process.rs    Process trees, ports, and Git status
+src/model/                  Internal session and telemetry model
+src/snapshot.rs             Public JSON-safe snapshot DTOs
+src/ui/                     Layout, panels, menus, help, and click targets
+src/jump/                   Ordered terminal jump adapters
+src/herdr.rs                Shared Herdr process location and bounded CLI calls
+src/config.rs               Theme, language, and five panel settings
+src/theme/                  Theme decoder and packaged palettes
+src/demo.rs                 Collector-free deterministic fixtures
+src/host_info.rs            Host and aggregate metrics
+src/locale.rs               UI strings
 ```
 
-## UI layout
+Keep tests close to the implementation unless they exercise the compiled CLI;
+CLI integration tests belong in `tests/`.
 
-Desktop panel order:
+## Collection and safety invariants
 
-1. **Sessions** stays visible when enabled and receives priority height.
-2. **Tokens, projects, and ports** share the middle row.
-3. **Context** appears when the sessions panel has enough height and surplus space remains.
-4. **Runs** is embedded in session detail, or promoted beside sessions on wide layouts.
-5. **Header and footer** use one row each.
-
-Compact layouts use Work, Usage, and System tabs. The five configurable panels are numbered consecutively:
-
-1. context
-2. tokens
-3. projects
-4. ports
-5. sessions
-
-## Pi process discovery
+### Pi processes and parent sessions
 
 `collector::pi::is_pi_command` accepts only executable-position Pi launches:
 
-- the `pi` wrapper
-- supported `env` wrapping
-- Node, Node.js, or Bun running the installed Pi package entry point
+- the `pi` wrapper,
+- supported `env` wrapping, or
+- Node, Node.js, or Bun running the installed Pi package entry point.
 
-Do not match arbitrary `pi` substrings, later arguments, or unrelated `cli.js` files. Nested Pi processes are not top-level rows.
+Do not match arbitrary `pi` substrings, later arguments, or unrelated `cli.js`
+files. Nested Pi processes are not top-level rows.
 
-A process row exists without a session file. `PiCollector` attaches JSONL telemetry only after ownership, header identity, working directory, and file identity checks agree. Shared path or session-ID claims are ambiguous and must fail closed to a process-only row.
+Attach JSONL only after ownership, header identity, working directory, and file
+identity checks agree. Shared paths or session-ID claims are ambiguous and
+must remain process-only. On supported Unix platforms, use process-start
+identity to detect PID reuse. Windows remains process-only.
 
-On supported Unix platforms, use process-start identity to detect PID reuse. Windows remains process-only.
+The tailer is stateful. It must:
 
-## Pi parent telemetry
+- scan an attached file once and then read appended bytes,
+- carry incomplete lines across reads,
+- reset after truncation, replacement, or deletion,
+- bound bytes, line size, candidate count, descriptors, semantic entries, and
+  model catalogs, and
+- report partial, stale, malformed, or unavailable data explicitly.
 
-The JSONL tailer is stateful:
+Structured telemetry must preserve precision, completeness, provenance,
+source health, and observation time. Retain only identity, model/provider
+metadata, thinking level, numeric usage, context size, compaction state, and
+safe activity labels. Treat session and status files as potentially secret.
 
-- Scan an attached file once, then read appended bytes.
-- Carry incomplete lines between reads.
-- Reset safely after truncation, replacement, or deletion.
-- Bound total work, line size, candidate count, descriptor count, semantic entries, and model catalogs.
-- Mark partial, stale, malformed, or unavailable data explicitly.
+### Fleet runs
 
-Structured telemetry records precision, completeness, provenance, source health, and observation time. Authoritative snapshot fields use `null` when unavailable. Do not turn unknown values into known zero.
+Read only supported extension-owned lifecycle `status.json` files. Do not read
+child transcripts, prompts, events, output logs, or handoff content. Unknown
+lifecycle versions expose no trusted lifecycle details until support is added
+explicitly.
 
-The parent parser may retain identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. It must not retain or publish prompt text, assistant text, tool arguments, or tool results.
+Keep parent transcript usage separate from run usage. Preserve parser limits,
+completed-run retention, bounded labels, source health, stale detection, child
+depth, and process-terminal verification.
 
-## Fleet telemetry
+### Shared enrichment and controls
 
-`collector/pi_subagents.rs` reads supported extension-owned lifecycle `status.json` files. Keep run usage separate from parent transcript usage to prevent double counting.
+`Collector::collect` returns Pi sessions and orphan ports together. Refresh
+process data every tick. Poll ports and Git on the slower interval, normally
+ten seconds, and invalidate the port cache when the PID set changes.
 
-Do not read child transcript, prompt, event, or output-log files. Unknown lifecycle versions expose no trusted lifecycle details until explicitly supported.
+Git counts come from `git -C {cwd} status --porcelain`. Track child ports across
+ticks. A port becomes orphaned only while the child remains alive and listening
+after its parent Pi session disappears. Process and port sources can race with
+process exit; keep stale or unavailable state explicit instead of guessing.
 
-Preserve parser limits, completed-run retention, bounded labels, source health, stale detection, child depth, and process-terminal verification.
+Before killing an orphan, run a fresh port scan and require an exact current
+command match. Before killing or jumping to a Pi session, revalidate the Pi
+command and process-start identity. Reduce child and orphan commands to safe
+executable labels before they reach TUI, text, or JSON output.
 
-## Shared process enrichment
+## UI and terminal behavior
 
-`Collector::collect` returns Pi sessions and orphan ports together.
+Desktop panel order is:
 
-- Process data is refreshed every tick.
-- Port and Git polling use the slower interval, normally every ten seconds.
-- A changed PID set invalidates the port cache.
-- Git counts come from `git -C {cwd} status --porcelain`.
-- Child ports are tracked across ticks.
-- A port becomes orphaned only while the child remains alive and listening after its parent Pi session disappears.
+1. Sessions, with priority height.
+2. Tokens, projects, and ports in the middle row.
+3. Context when sessions has enough height and surplus space remains.
+4. Runs inside session detail, or beside sessions on wide layouts.
+5. One-row header and footer.
 
-Before killing an orphan, perform a fresh port scan and require an exact current-command match. Before killing or jumping to a Pi session, revalidate the Pi command and process-start identity.
+Compact layouts use Work, Usage, and System tabs. The configurable panels keep
+this numbering: context, tokens, projects, ports, sessions. Narrow terminals
+must degrade without hiding all sessions.
 
-## Terminal jump
+Terminal jump order is Herdr, cmux, tmux, then iTerm2 on macOS. Each adapter
+returns `NotApplicable`, `Jumped`, or `Failed(message)`. Try the next adapter
+only for `NotApplicable`; stop on success or failure. Herdr jumps require the
+same server socket and the exact selected pane. Windows jump and kill controls
+remain disabled.
 
-`jumpers()` is the ordered source of truth:
+## Themes
 
-1. Herdr, using the selected Pi process's pane ID when ptop shares its server socket.
-2. cmux, using `CMUX_WORKSPACE_ID` from the process environment.
-3. tmux, using pane process-tree ownership.
-4. iTerm2 on macOS, using controlling TTY and AppleScript.
+Theme Format v1 has one Pi session color, `pi_agent`. Do not restore per-agent
+colors. A schema change must update:
 
-Each adapter returns:
+- every file under `src/theme/builtins/`,
+- `examples/themes/low-glare.toml`,
+- `docs/themes.md`,
+- decoder and CLI tests, and
+- palette hashes.
 
-- `NotApplicable`: try the next adapter.
-- `Jumped`: stop successfully.
-- `Failed(message)`: stop and show the backend error.
+## Change checklist
 
-Windows jump and kill controls are disabled.
+- Parser changes: add malformed, partial, oversized, replacement, ambiguity,
+  and privacy tests as applicable.
+- Snapshot changes: preserve JSON compatibility where possible, use `null` for
+  unavailable authoritative values, and update JSON tests and docs.
+- UI changes: test wide, compact, and narrow layouts. Keep selection and click
+  targets aligned with rendered rows.
+- CLI or configuration changes: update help, README examples, parsing tests,
+  and config round-trip tests. Preserve unknown configuration keys.
+- Demo changes: keep fixtures deterministic and prove no collector runs.
+- Platform changes: test the affected target and confirm other `cfg` branches
+  still compile.
+- Dependency changes: justify the dependency and keep the supported Rust floor.
 
-## Privacy
+## Verification
 
-All monitoring is local and read-only except explicit kill actions, terminal focus, configuration writes, and user-requested update/install operations.
-
-- Never include prompt text, assistant text, tool arguments, tool results, or child transcripts in the TUI, text snapshot, or JSON snapshot.
-- Reduce child and orphan commands to executable labels in output.
-- Treat session files and status files as potentially secret.
-- Keep `--demo` collector-free.
-- Do not add network calls to monitoring paths.
-
-## Theme contract
-
-Theme Format v1 has one Pi session color, `pi_agent`. Do not restore per-agent colors. Update all packaged themes, `examples/themes/low-glare.toml`, `docs/themes.md`, decoder tests, and palette hashes when the schema changes.
-
-## Commands
+Run the narrowest relevant test while iterating. Before completing a material
+change, match the CI checks:
 
 ```bash
-cargo build
-cargo run
-cargo run -- --once
-cargo run -- --json
-cargo run -- --demo --once
-cargo run -- --exit-on-jump
-cargo test
-cargo clippy -- -D warnings
 ./scripts/check-rustfmt.sh
+cargo clippy --all-targets -- -D warnings -A clippy::uninlined-format-args
+cargo test --all-targets
+cargo build --release
 ```
 
-Parser benchmark:
+For parent parser work, also run:
 
 ```bash
 cargo test --release pi_parser_release_benchmark -- --ignored --nocapture
 ```
 
-## Commit convention
+Useful smoke checks:
 
-```text
-<type>: <description>
+```bash
+cargo run -- --once
+cargo run -- --json
+cargo run -- --demo --once
+cargo run -- --exit-on-jump
 ```
 
-Types: `feat`, `fix`, `refactor`, `docs`, `chore`.
+## Commits and releases
 
-## Release process
+Commit subjects use `<type>: <description>` with `feat`, `fix`, `refactor`,
+`docs`, or `chore`.
 
-1. Update the same semver in `Cargo.toml` and `Cargo.lock`.
-2. Run:
-   ```bash
-   cargo test
-   cargo clippy -- -D warnings
-   cargo build --release
-   cargo publish --dry-run
-   ```
+For a release:
+
+1. Set the same semver in `Cargo.toml` and `Cargo.lock`.
+2. Run the full checks above, then `cargo publish --dry-run`.
 3. Commit and push the version bump to `main`.
 4. From a clean, current `main`, create and push an annotated `vX.Y.Z` tag.
 5. Watch the `Release` and `Publish to crates.io` workflows.
 
-Do not run `cargo publish` or `gh release create` manually. CI handles both. Do not tag before the version bump reaches `main`. Do not reuse a release tag after a failed publish; use a new patch version.
-
-## Common failure modes
-
-- Pi session and fleet files are implementation details. Parse defensively.
-- File paths and session IDs can collide or change. Require unambiguous ownership.
-- Files can disappear between discovery and read. Handle `NotFound` without dropping the process row.
-- Large or partial JSONL records must stay bounded and must not poison later appends.
-- `lsof`, `/proc`, and `netstat` data can race with process exit. Show stale data safely.
-- PID reuse can target a different process. Recheck command and start identity before controls.
-- Orphan ports require cross-tick history and a fresh ownership check before a signal.
-- Terminal widths below the supported layout must degrade without hiding all sessions.
+Do not run `cargo publish` or `gh release create` manually. CI handles both. Do
+not tag before the version bump reaches `main`. Do not reuse a release tag after
+a failed publish; use a new patch version.
