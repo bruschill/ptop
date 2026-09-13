@@ -66,7 +66,7 @@ Unknown and removed options fail with a clear error.
 
 ### Terminal jump
 
-Press `Enter` to focus the terminal that owns the selected Pi process. On macOS, ptop tries Herdr, cmux, tmux, then iTerm2. On Linux, it tries Herdr, cmux, then tmux. When ptop and the selected Pi share a Herdr server, ptop focuses the exact Herdr workspace, tab, and pane. The process command and start identity are checked again before a jump. Windows does not support terminal jump.
+Press `Enter` to focus the terminal that owns the selected Pi process. On macOS, ptop tries Herdr, cmux, tmux, then iTerm2. On Linux, it tries Herdr, cmux, then tmux. When ptop and the selected Pi share a Herdr server, ptop focuses the exact pane and its tab, then brings that workspace forward while ptop keeps running. The process command and start identity are checked again before a jump. Windows does not support terminal jump.
 
 Example with tmux:
 
