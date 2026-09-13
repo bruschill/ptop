@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(target_vendor = "apple")]
 use std::process::Stdio;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::time::{Duration, Instant};
