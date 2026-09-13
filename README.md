@@ -80,7 +80,9 @@ tmux new -s work
 
 ### Herdr workspace presence
 
-On macOS and Linux with Herdr 0.9.0 or newer, the interactive ptop TUI publishes a display-only `ptop=running` token to its verified Herdr workspace. The token expires within 30 seconds after the last ptop instance exits or loses access to Herdr. One-shot, JSON, update, version, and demo modes do not publish presence.
+On macOS and Linux with Herdr 0.9.0 or newer, the interactive ptop TUI temporarily renames its verified Herdr Space to `ptop` and publishes a display-only `ptop=running` token. On normal exit, ptop checks that the Space is still named `ptop` before restoring its previous name. The token expires within 30 seconds after the last ptop instance exits or loses access to Herdr. One-shot, JSON, update, version, and demo modes do not rename the Space or publish presence.
+
+Herdr 0.9.0 does not provide a conditional rename operation, so renaming and restoration are best-effort. Run one ptop TUI per Space, and do not rename that Space at the same time ptop starts or exits. A concurrent rename can be overwritten, and one of several ptop instances can restore the previous name while another remains active.
 
 Add the token to Herdr's Space sidebar rows:
 
@@ -215,7 +217,7 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 
 ptop does not retain or publish prompt text, assistant text, tool arguments, tool results, or child transcripts. Pi session parsing keeps identity, safe metadata, and structured numeric telemetry only. Fleet collection reads supported lifecycle status metadata, not child output logs or transcript files.
 
-TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. When the interactive TUI runs inside Herdr on macOS or Linux, it sends only the display token `ptop=running` and exact Herdr resource IDs back to the same local Herdr socket. Package installation and `ptop --update` are separate user-requested operations.
+TUI, text snapshots, and JSON snapshots reduce child and orphan commands to executable labels where output leaves the collector. ptop performs no network requests. When the interactive TUI runs inside Herdr on macOS or Linux, it reads the verified Space name and sends the `ptop` name, the display token `ptop=running`, the previous name on restoration, and exact Herdr resource IDs back to the same local Herdr socket. Package installation and `ptop --update` are separate user-requested operations.
 
 ## Acknowledgements
 

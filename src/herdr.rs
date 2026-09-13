@@ -27,6 +27,8 @@ const HERDR_PRESENCE_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_000);
 const HERDR_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const HERDR_PRESENCE_TTL_MS: u64 = 30_000;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const PTOP_WORKSPACE_LABEL: &str = "ptop";
 
 #[derive(Default)]
 pub(crate) struct WorkspacePresence {
@@ -196,20 +198,18 @@ fn start_workspace_presence_with(
     let worker = std::thread::Builder::new()
         .name("ptop-herdr-presence".to_string())
         .spawn(move || {
+            let restore = rename_workspace_for_ptop(&target);
             run_workspace_presence_worker(receiver, refresh_interval, || {
                 report_workspace_presence(&target);
             });
+            if let Some(previous_label) = restore {
+                restore_workspace_label(&target, &previous_label);
+            }
         })
         .ok();
+    let stop = worker.as_ref().map(|_| stop);
 
-    if worker.is_some() {
-        WorkspacePresence {
-            stop: Some(stop),
-            worker,
-        }
-    } else {
-        WorkspacePresence::default()
-    }
+    WorkspacePresence { stop, worker }
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -225,6 +225,99 @@ fn run_workspace_presence_worker(
     ) {
         report();
     }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn rename_workspace_for_ptop(target: &WorkspacePresenceTarget) -> Option<String> {
+    rename_workspace_for_ptop_with(
+        target,
+        |args| {
+            run_bounded_herdr_json(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+        |args| {
+            run_bounded_herdr_command(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+    )
+}
+
+// Herdr 0.9.0 has no conditional rename, so the read and rename can race.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn rename_workspace_for_ptop_with(
+    target: &WorkspacePresenceTarget,
+    mut get: impl FnMut(&[String]) -> Option<Value>,
+    mut rename: impl FnMut(&[String]) -> bool,
+) -> Option<String> {
+    let pane = get(&pane_get_args(target))?;
+    if !pane_matches_target(&pane, target) {
+        return None;
+    }
+
+    let workspace = get(&workspace_get_args(&target.workspace_id))?;
+    let previous_label = workspace_label(&workspace, &target.workspace_id)?.to_string();
+    if previous_label == PTOP_WORKSPACE_LABEL {
+        return None;
+    }
+
+    rename(&workspace_rename_args(
+        &target.workspace_id,
+        PTOP_WORKSPACE_LABEL,
+    ))
+    .then_some(previous_label)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn restore_workspace_label(target: &WorkspacePresenceTarget, previous_label: &str) {
+    let _ = restore_workspace_label_with(
+        target,
+        previous_label,
+        |args| {
+            run_bounded_herdr_json(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+        |args| {
+            run_bounded_herdr_command(
+                &target.binary,
+                &target.socket_path,
+                args,
+                HERDR_PRESENCE_COMMAND_TIMEOUT,
+            )
+        },
+    );
+}
+
+// The label check prevents stale restoration, but Herdr cannot make it atomic.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn restore_workspace_label_with(
+    target: &WorkspacePresenceTarget,
+    previous_label: &str,
+    mut get_workspace: impl FnMut(&[String]) -> Option<Value>,
+    mut rename: impl FnMut(&[String]) -> bool,
+) -> bool {
+    if previous_label == PTOP_WORKSPACE_LABEL {
+        return false;
+    }
+    let Some(workspace) = get_workspace(&workspace_get_args(&target.workspace_id)) else {
+        return false;
+    };
+    if workspace_label(&workspace, &target.workspace_id) != Some(PTOP_WORKSPACE_LABEL) {
+        return false;
+    }
+
+    rename(&workspace_rename_args(&target.workspace_id, previous_label))
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -256,24 +349,59 @@ fn report_workspace_presence_with(
     mut get_pane: impl FnMut(&[String]) -> Option<Value>,
     mut report: impl FnMut(&[String]) -> bool,
 ) -> bool {
-    let pane_args = vec![
-        "pane".to_string(),
-        "get".to_string(),
-        target.pane_id.clone(),
-    ];
-    let Some(pane) = get_pane(&pane_args) else {
+    let Some(pane) = get_pane(&pane_get_args(target)) else {
         return false;
     };
-    let pane_matches = pane.pointer("/result/pane").is_some_and(|pane| {
-        pane.get("pane_id").and_then(Value::as_str) == Some(target.pane_id.as_str())
-            && pane.get("workspace_id").and_then(Value::as_str)
-                == Some(target.workspace_id.as_str())
-    });
-    if !pane_matches {
+    if !pane_matches_target(&pane, target) {
         return false;
     }
 
     report(&workspace_presence_report_args(&target.workspace_id))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn pane_matches_target(pane: &Value, target: &WorkspacePresenceTarget) -> bool {
+    pane.pointer("/result/pane").is_some_and(|pane| {
+        pane.get("pane_id").and_then(Value::as_str) == Some(target.pane_id.as_str())
+            && pane.get("workspace_id").and_then(Value::as_str)
+                == Some(target.workspace_id.as_str())
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn workspace_label<'a>(workspace: &'a Value, workspace_id: &str) -> Option<&'a str> {
+    let workspace = workspace.pointer("/result/workspace")?;
+    (workspace.get("workspace_id").and_then(Value::as_str) == Some(workspace_id))
+        .then(|| workspace.get("label").and_then(Value::as_str))
+        .flatten()
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn pane_get_args(target: &WorkspacePresenceTarget) -> Vec<String> {
+    vec![
+        "pane".to_string(),
+        "get".to_string(),
+        target.pane_id.clone(),
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn workspace_get_args(workspace_id: &str) -> Vec<String> {
+    vec![
+        "workspace".to_string(),
+        "get".to_string(),
+        workspace_id.to_string(),
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn workspace_rename_args(workspace_id: &str, label: &str) -> Vec<String> {
+    vec![
+        "workspace".to_string(),
+        "rename".to_string(),
+        workspace_id.to_string(),
+        label.to_string(),
+    ]
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -434,6 +562,16 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn presence_target() -> WorkspacePresenceTarget {
+        WorkspacePresenceTarget {
+            binary: "herdr".into(),
+            socket_path: "/tmp/herdr.sock".to_string(),
+            workspace_id: "w1X".to_string(),
+            pane_id: "w1X:p2".to_string(),
+        }
+    }
+
     #[test]
     fn process_marker_accepts_an_absolute_socket_path_with_spaces() {
         let env = format!(
@@ -515,6 +653,42 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn presence_lifecycle_renames_then_restores_the_workspace() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-herdr");
+        let state = script.with_extension("state");
+        let log = script.with_extension("log");
+        fs::write(&state, "project alpha").unwrap();
+        fs::write(
+            &script,
+            "#!/bin/sh\nstate=\"${0}.state\"\nlog=\"${0}.log\"\nif [ \"$1 $2\" = \"pane get\" ]; then printf '{\"result\":{\"pane\":{\"pane_id\":\"w1X:p2\",\"workspace_id\":\"w1X\"}}}\\n'; exit; fi\nif [ \"$1 $2\" = \"workspace get\" ]; then label=$(cat \"$state\"); printf '{\"result\":{\"workspace\":{\"workspace_id\":\"w1X\",\"label\":\"%s\"}}}\\n' \"$label\"; exit; fi\nif [ \"$1 $2\" = \"workspace rename\" ]; then printf '%s' \"$4\" > \"$state\"; printf '%s\\n' \"$4\" >> \"$log\"; printf '{}\\n'; exit; fi\nif [ \"$1 $2\" = \"workspace report-metadata\" ]; then printf '{}\\n'; exit; fi\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let mut target = presence_target();
+        target.binary = script.into_os_string();
+        let presence = start_workspace_presence_with(target, Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while fs::read_to_string(&state).unwrap_or_default() != "ptop" && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(fs::read_to_string(&state).unwrap(), "ptop");
+
+        drop(presence);
+
+        assert_eq!(fs::read_to_string(&state).unwrap(), "project alpha");
+        assert_eq!(fs::read_to_string(&log).unwrap(), "ptop\nproject alpha\n");
+    }
+
     #[test]
     fn disabled_presence_does_not_start_a_worker() {
         let presence = start_workspace_presence(false);
@@ -563,6 +737,160 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
+    fn verified_workspace_is_renamed_and_its_previous_label_is_retained() {
+        let target = presence_target();
+        let mut get_args = Vec::new();
+        let mut rename_args = Vec::new();
+
+        let previous_label = rename_workspace_for_ptop_with(
+            &target,
+            |args| {
+                get_args.push(args.to_vec());
+                if args == pane_get_args(&target) {
+                    Some(serde_json::json!({
+                        "result": { "pane": {
+                            "pane_id": "w1X:p2",
+                            "workspace_id": "w1X"
+                        } }
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "result": { "workspace": {
+                            "workspace_id": "w1X",
+                            "label": "project alpha"
+                        } }
+                    }))
+                }
+            },
+            |args| {
+                rename_args.push(args.to_vec());
+                true
+            },
+        );
+
+        assert_eq!(previous_label.as_deref(), Some("project alpha"));
+        assert_eq!(
+            get_args,
+            [
+                pane_get_args(&target),
+                workspace_get_args(&target.workspace_id)
+            ]
+        );
+        assert_eq!(
+            rename_args,
+            [workspace_rename_args(&target.workspace_id, "ptop")]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn workspace_rename_requires_an_exact_pane_and_workspace() {
+        let target = presence_target();
+        let rename_called = std::cell::Cell::new(false);
+
+        let previous_label = rename_workspace_for_ptop_with(
+            &target,
+            |_| {
+                Some(serde_json::json!({
+                    "result": { "pane": {
+                        "pane_id": "w1X:p2",
+                        "workspace_id": "w2"
+                    } }
+                }))
+            },
+            |_| {
+                rename_called.set(true);
+                true
+            },
+        );
+
+        assert!(previous_label.is_none());
+        assert!(!rename_called.get());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn preexisting_ptop_workspace_label_is_not_owned() {
+        let target = presence_target();
+        let rename_called = std::cell::Cell::new(false);
+
+        let previous_label = rename_workspace_for_ptop_with(
+            &target,
+            |args| {
+                if args == pane_get_args(&target) {
+                    Some(serde_json::json!({
+                        "result": { "pane": {
+                            "pane_id": "w1X:p2",
+                            "workspace_id": "w1X"
+                        } }
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "result": { "workspace": {
+                            "workspace_id": "w1X",
+                            "label": "ptop"
+                        } }
+                    }))
+                }
+            },
+            |_| {
+                rename_called.set(true);
+                true
+            },
+        );
+
+        assert!(previous_label.is_none());
+        assert!(!rename_called.get());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn previous_workspace_label_is_restored_only_while_ptop_still_owns_it() {
+        let target = presence_target();
+        let mut rename_args = Vec::new();
+        assert!(restore_workspace_label_with(
+            &target,
+            "project alpha",
+            |_| {
+                Some(serde_json::json!({
+                    "result": { "workspace": {
+                        "workspace_id": "w1X",
+                        "label": "ptop"
+                    } }
+                }))
+            },
+            |args| {
+                rename_args.push(args.to_vec());
+                true
+            },
+        ));
+        assert_eq!(
+            rename_args,
+            [workspace_rename_args(&target.workspace_id, "project alpha")]
+        );
+
+        let rename_called = std::cell::Cell::new(false);
+        assert!(!restore_workspace_label_with(
+            &target,
+            "project alpha",
+            |_| {
+                Some(serde_json::json!({
+                    "result": { "workspace": {
+                        "workspace_id": "w1X",
+                        "label": "renamed by user"
+                    } }
+                }))
+            },
+            |_| {
+                rename_called.set(true);
+                true
+            },
+        ));
+        assert!(!rename_called.get());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
     fn presence_request_is_display_only_and_expires() {
         assert_eq!(
             workspace_presence_report_args("w1X"),
@@ -586,12 +914,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn presence_requires_the_reported_pane_to_remain_in_its_workspace() {
-        let target = WorkspacePresenceTarget {
-            binary: "herdr".into(),
-            socket_path: "/tmp/herdr.sock".to_string(),
-            workspace_id: "w1X".to_string(),
-            pane_id: "w1X:p2".to_string(),
-        };
+        let target = presence_target();
         let mut pane_args = Vec::new();
         let mut report_args = Vec::new();
         assert!(report_workspace_presence_with(
