@@ -3090,6 +3090,70 @@ mod tests {
         path
     }
 
+    fn session_from_data(data: &PiSessionData, telemetry: SessionTelemetry) -> AgentSession {
+        AgentSession {
+            pid: 1,
+            session_id: "compaction-privacy".to_string(),
+            cwd: "/safe/project".to_string(),
+            project_name: "project".to_string(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: data.model.clone(),
+            effort: data.effort.clone(),
+            context_percent: 0.0,
+            total_input_tokens: data.input,
+            total_output_tokens: data.output,
+            total_cache_read: data.cache_read,
+            total_cache_create: data.cache_write,
+            turn_count: data.turns,
+            current_tasks: vec![telemetry_task_label(true).to_string()],
+            mem_mb: 0,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: data.token_history.clone(),
+            context_history: data.context_history.clone(),
+            compaction_count: data.compactions,
+            context_window: 0,
+            children: Vec::new(),
+            telemetry: Some(telemetry),
+            process_start_id: None,
+        }
+    }
+
+    fn assert_compaction_payload_private(
+        data: &PiSessionData,
+        telemetry: SessionTelemetry,
+        semantic: &PiSemantic,
+        sentinels: &[&str],
+    ) {
+        let mut app = crate::app::App::new(
+            crate::theme::Theme::default(),
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions.push(session_from_data(data, telemetry));
+        let safe_fields = format!("{data:?}");
+        let debug_output = format!("{semantic:?}");
+        let text_output = app.session_summary(&app.sessions[0]);
+        let snapshot = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
+        for sentinel in sentinels {
+            assert!(
+                !safe_fields.contains(sentinel),
+                "safe fields retained {sentinel}"
+            );
+            assert!(
+                !debug_output.contains(sentinel),
+                "debug output retained {sentinel}"
+            );
+            assert!(
+                !text_output.contains(sentinel),
+                "text output retained {sentinel}"
+            );
+            assert!(!snapshot.contains(sentinel), "snapshot retained {sentinel}");
+        }
+    }
+
     #[test]
     fn session_fixture_escapes_windows_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -3784,6 +3848,187 @@ mod tests {
         assert_eq!(data.token_history.len(), 64);
         assert_eq!(data.token_history.first(), Some(&3));
         assert_eq!(data.token_history.last(), Some(&66));
+    }
+
+    #[test]
+    fn compaction_payloads_are_private_and_do_not_supply_usage_or_context() {
+        const SUMMARY_SENTINEL: &str = "COMPACTION-SUMMARY-SECRET-7e43";
+        const DETAILS_SENTINEL: &str = "COMPACTION-DETAILS-SECRET-91ac";
+        const RETAINED_USER_SENTINEL: &str = "COMPACTION-RETAINED-USER-SECRET-d5f0";
+        const RETAINED_ASSISTANT_SENTINEL: &str = "COMPACTION-RETAINED-ASSISTANT-SECRET-3b82";
+        let sentinels = [
+            SUMMARY_SENTINEL,
+            DETAILS_SENTINEL,
+            RETAINED_USER_SENTINEL,
+            RETAINED_ASSISTANT_SENTINEL,
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = session_file(&dir, "compaction-privacy", &cwd);
+        let attachment = PiAttachment {
+            path: path.clone(),
+            session_id: "compaction-privacy".to_string(),
+            start_id: None,
+            header_cwd: cwd,
+            identity: file_identity(&path).unwrap(),
+        };
+        let compaction = serde_json::json!({
+            "type": "compaction",
+            "id": "compaction",
+            "parentId": "before",
+            "timestamp": "2026-01-02T03:04:05.000Z",
+            "summary": SUMMARY_SENTINEL,
+            "tokensBefore": 50_000,
+            "details": {
+                "readFiles": [DETAILS_SENTINEL],
+                "modifiedFiles": [],
+            },
+            "fromHook": false,
+            "retainedTail": [
+                {
+                    "role": "user",
+                    "content": RETAINED_USER_SENTINEL,
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": RETAINED_ASSISTANT_SENTINEL}
+                    ],
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "usage": {
+                        "input": 100,
+                        "output": 200,
+                        "cacheRead": 300,
+                        "cacheWrite": 400,
+                        "totalTokens": 1_000,
+                        "cost": {"total": 500.0},
+                    },
+                    "stopReason": "stop",
+                }
+            ],
+        });
+        // Confirm this test supplies every private payload field before tailing it.
+        assert_eq!(compaction["summary"], SUMMARY_SENTINEL);
+        assert_eq!(compaction["details"]["readFiles"][0], DETAILS_SENTINEL);
+        assert_eq!(
+            compaction["retainedTail"][0]["content"],
+            RETAINED_USER_SENTINEL
+        );
+        assert_eq!(
+            compaction["retainedTail"][1]["content"][0]["text"],
+            RETAINED_ASSISTANT_SENTINEL
+        );
+        assert_eq!(compaction["retainedTail"][1]["usage"]["input"], 100);
+        let reduced_compaction = parse_pi_entry(&compaction).unwrap();
+        assert_eq!(reduced_compaction.usage, UsageObservation::Absent);
+        let compaction_without_private_tail = serde_json::json!({
+            "type": "compaction",
+            "id": "compaction",
+            "parentId": "before",
+            "summary": SUMMARY_SENTINEL,
+        });
+        assert_eq!(
+            reduced_compaction.context_chars,
+            parse_pi_entry(&compaction_without_private_tail)
+                .unwrap()
+                .context_chars,
+            "details and retainedTail must not become context sources"
+        );
+        let before = serde_json::json!({
+            "type": "message",
+            "id": "before",
+            "parentId": null,
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": 10,
+                    "output": 2,
+                    "cacheRead": 3,
+                    "cacheWrite": 4,
+                    "totalTokens": 19,
+                },
+                "content": []
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for entry in [&before, &compaction] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        drop(file);
+
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let (before_baseline_telemetry, before_baseline_data) = collector
+            .telemetry_for_attachment(&attachment, 1, &mut budget)
+            .unwrap();
+        assert_eq!(
+            (
+                before_baseline_data.input,
+                before_baseline_data.output,
+                before_baseline_data.cache_read,
+                before_baseline_data.cache_write,
+            ),
+            (10, 2, 3, 4),
+            "compaction content must not affect component accounting"
+        );
+        assert!(before_baseline_data.context_tokens.is_none());
+        assert!(before_baseline_data.baseline_tokens.is_none());
+        assert!(before_baseline_data
+            .context_reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("post-compaction assistant baseline") }));
+        assert_compaction_payload_private(
+            &before_baseline_data,
+            before_baseline_telemetry,
+            &collector.tails.get(&path).unwrap().semantic,
+            &sentinels,
+        );
+
+        let after = serde_json::json!({
+            "type": "message",
+            "id": "after",
+            "parentId": "compaction",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": 5,
+                    "output": 6,
+                    "cacheRead": 7,
+                    "cacheWrite": 8,
+                    "totalTokens": 40,
+                },
+                "content": []
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{after}").unwrap();
+        drop(file);
+
+        let (after_baseline_telemetry, after_baseline_data) = collector
+            .telemetry_for_attachment(&attachment, 2, &mut budget)
+            .unwrap();
+        assert_eq!(
+            (
+                after_baseline_data.input,
+                after_baseline_data.output,
+                after_baseline_data.cache_read,
+                after_baseline_data.cache_write,
+            ),
+            (15, 8, 10, 12),
+            "retainedTail must not become a usage source"
+        );
+        assert_eq!(after_baseline_data.baseline_tokens, Some(40));
+        assert_eq!(after_baseline_data.context_tokens, Some(40));
+        assert_eq!(after_baseline_data.trailing_tokens, Some(0));
+
+        assert_compaction_payload_private(
+            &after_baseline_data,
+            after_baseline_telemetry,
+            &collector.tails.get(&path).unwrap().semantic,
+            &sentinels,
+        );
     }
 
     #[test]
