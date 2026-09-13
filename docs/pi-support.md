@@ -90,7 +90,7 @@ These are defensive implementation limits, not a promise that every external Pi 
 
 ## Shared enrichment and polling
 
-Process information is collected every two seconds. Ports and Git status use the slower poll path, normally every ten seconds, with port-cache invalidation when the tracked PID set changes.
+Process information is collected every two seconds. Port data and Git branch and working-tree status use the slower poll path, normally every ten seconds, with port-cache invalidation when the tracked PID set changes.
 
 Orphan detection is cross-tick state. A child port becomes orphaned only after its parent Pi session disappears while the child remains alive and listening. Before sending a signal, ptop performs a fresh port scan and compares the current command with the tracked command.
 

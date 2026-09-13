@@ -400,42 +400,112 @@ pub fn last_path_segment(s: &str) -> Option<&str> {
     segment
 }
 
-pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GitInfo {
+    pub(crate) branch: String,
+    pub(crate) added: u32,
+    pub(crate) modified: u32,
+}
+
+fn parse_git_branch_header(line: &str) -> Option<String> {
+    let branch = line.strip_prefix("## ")?;
+    let branch = branch
+        .strip_prefix("No commits yet on ")
+        .or_else(|| branch.strip_prefix("Initial commit on "))
+        .unwrap_or(branch);
+    let branch = branch.split_once("...").map_or(branch, |(name, _)| name);
+    Some(branch.to_string())
+}
+
+pub(crate) fn collect_git_info(cwd: &str) -> GitInfo {
     // Validate cwd is an existing directory before running git
     if !std::path::Path::new(cwd).is_dir() {
-        return (0, 0);
+        return GitInfo::default();
     }
     let output = Command::new("git")
-        .args(["-C", cwd, "status", "--porcelain"])
+        .args(["-C", cwd, "status", "--porcelain=v1", "--branch"])
         .output()
         .ok();
 
-    let mut added = 0u32;
-    let mut modified = 0u32;
+    let mut stats = GitInfo::default();
 
     if let Some(output) = output {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
+                if let Some(branch) = parse_git_branch_header(line) {
+                    stats.branch = branch;
+                    continue;
+                }
                 if line.len() < 2 {
                     continue;
                 }
                 let status_code = &line[..2];
                 if status_code.contains('?') || status_code.contains('A') {
-                    added += 1;
+                    stats.added += 1;
                 } else if status_code.contains('M') {
-                    modified += 1;
+                    stats.modified += 1;
                 }
             }
         }
     }
 
-    (added, modified)
+    stats
+}
+
+pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
+    let info = collect_git_info(cwd);
+    (info.added, info.modified)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_stats_include_the_current_branch() {
+        let repo = tempfile::tempdir().expect("create temp repo");
+        let status = Command::new("git")
+            .args(["init", "--quiet", "--initial-branch", "feature/projects"])
+            .arg(repo.path())
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+
+        std::fs::write(repo.path().join("new.txt"), "new file").expect("write untracked file");
+
+        let info = collect_git_info(repo.path().to_str().expect("UTF-8 temp path"));
+
+        assert_eq!(info.branch, "feature/projects");
+        assert_eq!(info.added, 1);
+        assert_eq!(info.modified, 0);
+    }
+
+    #[test]
+    fn git_info_is_empty_outside_a_repository() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+
+        let info = collect_git_info(directory.path().to_str().expect("UTF-8 temp path"));
+
+        assert_eq!(info, GitInfo::default());
+    }
+
+    #[test]
+    fn git_branch_header_handles_tracking_unborn_detached_and_invalid_lines() {
+        assert_eq!(
+            parse_git_branch_header("## main...origin/main [ahead 1]"),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            parse_git_branch_header("## No commits yet on feature/first"),
+            Some("feature/first".to_string())
+        );
+        assert_eq!(
+            parse_git_branch_header("## HEAD (no branch)"),
+            Some("HEAD (no branch)".to_string())
+        );
+        assert_eq!(parse_git_branch_header(" M src/main.rs"), None);
+    }
 
     #[test]
     fn quoted_process_args_preserve_windows_path_boundaries() {
