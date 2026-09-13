@@ -411,6 +411,10 @@ mod tests {
         assert_eq!(telemetry.context.percent, None);
         assert_eq!(telemetry.context.window_tokens, None);
         assert_eq!(telemetry.usage.total_tokens, None);
+        assert_eq!(telemetry.usage.input_tokens, None);
+        assert_eq!(telemetry.usage.output_tokens, None);
+        assert_eq!(telemetry.usage.cache_read_tokens, None);
+        assert_eq!(telemetry.usage.cache_create_tokens, None);
         assert_eq!(telemetry.fleet.runs[0].usage.total_tokens, Some(42));
         assert_eq!(
             telemetry.context.details.provider.as_deref(),

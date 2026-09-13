@@ -112,16 +112,20 @@ struct PiTail {
 #[derive(Debug, Clone, Default)]
 struct PiSemantic {
     entries: HashMap<String, PiEntry>,
+    /// Every bounded, syntactically valid ID seen in this tail, including entries
+    /// whose payload reduction failed. This reserves first-observed IDs.
+    seen_ids: HashSet<String>,
     order: Vec<String>,
     limited: bool,
     invalid: bool,
+    duplicate_ids: bool,
 }
 
 #[derive(Debug, Clone)]
 struct PiEntry {
     parent_id: Option<String>,
     kind: PiEntryKind,
-    usage: Option<PiUsage>,
+    usage: UsageObservation,
     context_chars: u64,
     provider: Option<String>,
     model: Option<String>,
@@ -138,12 +142,40 @@ enum PiEntryKind {
     Other,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Observation<T> {
+    Absent,
+    Invalid,
+    Value(T),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ComponentUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PiUsage {
-    components: Option<(u64, u64, u64, u64)>,
-    total_tokens: Option<u64>,
-    cost: Option<f64>,
-    invalid_cost: bool,
+    components: Observation<ComponentUsage>,
+    total_tokens: Observation<u64>,
+    reported_cost: Observation<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UsageObservation {
+    Absent,
+    Invalid,
+    Value(PiUsage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReportedCostState {
+    Unavailable,
+    Partial,
+    Complete(f64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1189,13 +1221,18 @@ impl PiSemantic {
             }
             return true;
         };
-        if self.entries.contains_key(&id) {
+        if self.seen_ids.contains(&id) {
+            // The first observed entry is authoritative. Do not inspect a duplicate payload.
+            self.duplicate_ids = true;
             return true;
         }
-        if self.entries.len() >= MAX_SEMANTIC_ENTRIES {
+        if self.seen_ids.len() >= MAX_SEMANTIC_ENTRIES {
             self.limited = true;
             return false;
         }
+        // Reserve the ID before payload parsing so a malformed first occurrence cannot
+        // be replaced by a later, more favorable duplicate.
+        self.seen_ids.insert(id.clone());
         match parse_pi_entry(value) {
             Some(entry) => {
                 self.order.push(id.clone());
@@ -1211,70 +1248,73 @@ impl PiSemantic {
 
     fn session_data(&self, context_complete: bool) -> PiSessionData {
         let mut data = PiSessionData::default();
-        data.usage_completeness = if self.limited || self.invalid {
+        data.usage_completeness = if self.limited || self.invalid || self.duplicate_ids {
             TelemetryCompleteness::Partial
         } else {
             TelemetryCompleteness::Complete
         };
         data.context_completeness = data.usage_completeness;
+        if self.duplicate_ids {
+            append_reason(
+                &mut data.usage_reason,
+                "duplicate entry ID makes usage ambiguous",
+            );
+        }
 
+        let mut accepted_component_observation = false;
+        let mut cost_expected = false;
+        let mut cost_partial = false;
+        let mut cost_total = 0.0;
         // Lifetime accounting intentionally covers all persisted branches.
         for id in &self.order {
             let Some(entry) = self.entries.get(id) else {
                 continue;
             };
-            if let Some(usage) = &entry.usage {
-                if matches!(
-                    entry.kind,
-                    PiEntryKind::Assistant
-                        | PiEntryKind::ToolResult
-                        | PiEntryKind::Compaction
-                        | PiEntryKind::BranchSummary
-                ) {
-                    if let Some((input, output, cache_read, cache_write)) = usage.components {
-                        let totals = (
-                            data.input.checked_add(input),
-                            data.output.checked_add(output),
-                            data.cache_read.checked_add(cache_read),
-                            data.cache_write.checked_add(cache_write),
-                        );
-                        if let (Some(input), Some(output), Some(cache_read), Some(cache_write)) =
-                            totals
-                        {
-                            data.input = input;
-                            data.output = output;
-                            data.cache_read = cache_read;
-                            data.cache_write = cache_write;
-                        } else {
-                            data.usage_available = false;
+            let required = entry.kind == PiEntryKind::Assistant;
+            let optional = matches!(
+                entry.kind,
+                PiEntryKind::ToolResult | PiEntryKind::Compaction | PiEntryKind::BranchSummary
+            );
+            if required || (optional && !matches!(entry.usage, UsageObservation::Absent)) {
+                match entry.usage {
+                    UsageObservation::Value(usage) => match usage.components {
+                        Observation::Value(components) => {
+                            let totals = (
+                                data.input.checked_add(components.input),
+                                data.output.checked_add(components.output),
+                                data.cache_read.checked_add(components.cache_read),
+                                data.cache_write.checked_add(components.cache_write),
+                            );
+                            if let (
+                                Some(input),
+                                Some(output),
+                                Some(cache_read),
+                                Some(cache_write),
+                            ) = totals
+                            {
+                                data.input = input;
+                                data.output = output;
+                                data.cache_read = cache_read;
+                                data.cache_write = cache_write;
+                                accepted_component_observation = true;
+                            } else {
+                                data.usage_available = false;
+                                data.usage_completeness = TelemetryCompleteness::Partial;
+                                append_reason(
+                                    &mut data.usage_reason,
+                                    "usage component total overflowed",
+                                );
+                            }
+                        }
+                        Observation::Absent | Observation::Invalid => {
                             data.usage_completeness = TelemetryCompleteness::Partial;
                             append_reason(
                                 &mut data.usage_reason,
-                                "usage component total overflowed",
+                                "an observed usage record is incomplete",
                             );
                         }
-                        if let Some(cost) = usage.cost {
-                            match (data.cost.unwrap_or(0.0) + cost)
-                                .is_finite()
-                                .then(|| data.cost.unwrap_or(0.0) + cost)
-                            {
-                                Some(cost) => data.cost = Some(cost),
-                                None => {
-                                    data.cost = None;
-                                    data.usage_completeness = TelemetryCompleteness::Partial;
-                                    append_reason(
-                                        &mut data.usage_reason,
-                                        "reported cost total overflowed",
-                                    );
-                                }
-                            }
-                        }
-                        if usage.invalid_cost {
-                            data.cost = None;
-                            data.usage_completeness = TelemetryCompleteness::Partial;
-                            append_reason(&mut data.usage_reason, "reported cost is invalid");
-                        }
-                    } else {
+                    },
+                    UsageObservation::Absent | UsageObservation::Invalid => {
                         data.usage_completeness = TelemetryCompleteness::Partial;
                         append_reason(
                             &mut data.usage_reason,
@@ -1283,44 +1323,78 @@ impl PiSemantic {
                     }
                 }
             }
+
+            if required || (optional && !matches!(entry.usage, UsageObservation::Absent)) {
+                cost_expected = true;
+                let cost = match entry.usage {
+                    UsageObservation::Value(usage) => usage.reported_cost,
+                    UsageObservation::Absent | UsageObservation::Invalid => Observation::Invalid,
+                };
+                match cost {
+                    Observation::Value(value) => match (cost_total + value)
+                        .is_finite()
+                        .then_some(cost_total + value)
+                    {
+                        Some(total) => cost_total = total,
+                        None => cost_partial = true,
+                    },
+                    Observation::Absent | Observation::Invalid => cost_partial = true,
+                }
+            }
+
             if entry.kind == PiEntryKind::Assistant {
                 data.turns = data.turns.saturating_add(1);
-                if let Some(total) = entry
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| usage.components)
-                    .and_then(|(input, output, cache_read, cache_write)| {
-                        input
-                            .checked_add(output)
-                            .and_then(|total| total.checked_add(cache_read))
-                            .and_then(|total| total.checked_add(cache_write))
-                    })
-                {
-                    if data.token_history.len() == MAX_TOKEN_HISTORY_POINTS {
-                        data.token_history.remove(0);
+                if let UsageObservation::Value(usage) = entry.usage {
+                    if let Observation::Value(components) = usage.components {
+                        if let Some(total) = component_total(components) {
+                            if data.token_history.len() == MAX_TOKEN_HISTORY_POINTS {
+                                data.token_history.remove(0);
+                            }
+                            data.token_history.push(total);
+                        }
                     }
-                    data.token_history.push(total);
                 }
             }
         }
         if data.usage_available
-            && data
-                .input
-                .checked_add(data.output)
-                .and_then(|total| total.checked_add(data.cache_read))
-                .and_then(|total| total.checked_add(data.cache_write))
-                .is_none()
+            && component_total(ComponentUsage {
+                input: data.input,
+                output: data.output,
+                cache_read: data.cache_read,
+                cache_write: data.cache_write,
+            })
+            .is_none()
         {
             data.usage_available = false;
             data.usage_completeness = TelemetryCompleteness::Partial;
             append_reason(&mut data.usage_reason, "combined usage total overflowed");
         }
+        if data.usage_completeness == TelemetryCompleteness::Partial
+            && !accepted_component_observation
+        {
+            data.usage_available = false;
+        }
+        let cost = if !cost_expected {
+            ReportedCostState::Unavailable
+        } else if cost_partial
+            || !context_complete
+            || self.limited
+            || self.invalid
+            || self.duplicate_ids
+        {
+            ReportedCostState::Partial
+        } else {
+            ReportedCostState::Complete(cost_total)
+        };
+        data.cost = match cost {
+            ReportedCostState::Complete(value) => Some(value),
+            ReportedCostState::Unavailable | ReportedCostState::Partial => None,
+        };
         if !context_complete {
             data.context_completeness = TelemetryCompleteness::Partial;
             return data;
         }
         let Some(leaf) = self.order.last().cloned() else {
-            // A header-only attached session is a complete, known-zero lifetime total.
             data.context_reason = Some("no persisted tree entry".to_string());
             return data;
         };
@@ -1369,10 +1443,8 @@ impl PiSemantic {
             .rposition(|id| self.entries[id].kind == PiEntryKind::Compaction);
         let baseline_index = branch.iter().enumerate().rev().find_map(|(i, id)| {
             let e = &self.entries[id];
-            (e.kind == PiEntryKind::Assistant
-                && e.valid_baseline
-                && valid_baseline(e.usage.as_ref()))
-            .then_some(i)
+            (e.kind == PiEntryKind::Assistant && e.valid_baseline && valid_baseline(&e.usage))
+                .then_some(i)
         });
         if latest_compaction.is_some_and(|i| baseline_index.is_none_or(|b| b <= i)) {
             append_reason(
@@ -1383,12 +1455,10 @@ impl PiSemantic {
         }
         let (baseline, index) = if let Some(index) = baseline_index {
             (
-                context_baseline(self.entries[&branch[index]].usage.as_ref())
-                    .expect("validated baseline"),
+                context_baseline(&self.entries[&branch[index]].usage).expect("validated baseline"),
                 index,
             )
         } else {
-            // Pi estimates all context-visible messages before the first valid assistant usage.
             let estimate = branch
                 .iter()
                 .map(|id| self.entries[id].context_chars.div_ceil(4))
@@ -1421,7 +1491,7 @@ impl PiSemantic {
         } else {
             TelemetryPrecision::Estimated
         };
-        data.context_history.push(data.context_tokens.unwrap());
+        data.context_history.push(context_tokens);
         data
     }
 }
@@ -1442,20 +1512,30 @@ fn bounded_string(value: Option<&Value>, max: usize) -> Option<String> {
     (!value.is_empty() && value.len() <= max).then(|| value.to_string())
 }
 
-fn valid_baseline(usage: Option<&PiUsage>) -> bool {
+fn component_total(components: ComponentUsage) -> Option<u64> {
+    components
+        .input
+        .checked_add(components.output)?
+        .checked_add(components.cache_read)?
+        .checked_add(components.cache_write)
+}
+
+fn valid_baseline(usage: &UsageObservation) -> bool {
     context_baseline(usage).is_some_and(|n| n > 0)
 }
 
-fn context_baseline(usage: Option<&PiUsage>) -> Option<u64> {
-    let usage = usage?;
+fn context_baseline(usage: &UsageObservation) -> Option<u64> {
+    let UsageObservation::Value(usage) = usage else {
+        return None;
+    };
     match usage.total_tokens {
-        Some(total) if total > 0 => Some(total),
-        _ => usage.components.and_then(|(input, output, read, write)| {
-            input
-                .checked_add(output)?
-                .checked_add(read)?
-                .checked_add(write)
-        }),
+        Observation::Value(total) if total > 0 => Some(total),
+        Observation::Absent | Observation::Invalid | Observation::Value(_) => {
+            match usage.components {
+                Observation::Value(components) => component_total(components),
+                Observation::Absent | Observation::Invalid => None,
+            }
+        }
     }
 }
 
@@ -1476,12 +1556,11 @@ fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
         None => return None,
     };
     let message = value.get("message");
-    let usage_value = if matches!(kind, PiEntryKind::Assistant | PiEntryKind::ToolResult) {
-        value.pointer("/message/usage")
+    let usage = if matches!(kind, PiEntryKind::Assistant | PiEntryKind::ToolResult) {
+        parse_usage(value.pointer("/message/usage"))
     } else {
-        value.get("usage")
+        parse_usage(value.get("usage"))
     };
-    let usage = usage_value.map(|value| parse_usage(value).unwrap_or_default());
     let provider_value = message
         .and_then(|m| m.get("provider"))
         .or_else(|| value.get("provider"));
@@ -1519,9 +1598,12 @@ fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
     })
 }
 
-fn parse_usage(v: &Value) -> Option<PiUsage> {
+fn parse_usage(value: Option<&Value>) -> UsageObservation {
+    let Some(v) = value else {
+        return UsageObservation::Absent;
+    };
     if !v.is_object() {
-        return None;
+        return UsageObservation::Invalid;
     }
     let number = |name| v.get(name).and_then(Value::as_u64);
     let components = match (
@@ -1530,19 +1612,35 @@ fn parse_usage(v: &Value) -> Option<PiUsage> {
         number("cacheRead"),
         number("cacheWrite"),
     ) {
-        (Some(input), Some(output), Some(read), Some(write)) => Some((input, output, read, write)),
-        _ => None,
+        (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
+            Observation::Value(ComponentUsage {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            })
+        }
+        _ => Observation::Invalid,
     };
-    let total_tokens = v.get("totalTokens").and_then(Value::as_u64);
-    let cost_value = v.pointer("/cost/total");
-    let cost = cost_value
-        .and_then(Value::as_f64)
-        .filter(|cost| cost.is_finite() && *cost >= 0.0);
-    Some(PiUsage {
+    let total_tokens = match v.get("totalTokens") {
+        None => Observation::Absent,
+        Some(value) => value
+            .as_u64()
+            .map(Observation::Value)
+            .unwrap_or(Observation::Invalid),
+    };
+    let reported_cost = match v.pointer("/cost/total") {
+        None => Observation::Absent,
+        Some(value) => value
+            .as_f64()
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            .map(Observation::Value)
+            .unwrap_or(Observation::Invalid),
+    };
+    UsageObservation::Value(PiUsage {
         components,
         total_tokens,
-        cost,
-        invalid_cost: cost_value.is_some() && cost.is_none(),
+        reported_cost,
     })
 }
 
@@ -3749,6 +3847,460 @@ mod tests {
             assert!(data.token_history.is_empty());
             assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
         }
+    }
+
+    #[test]
+    fn usage_observations_apply_record_kind_rules() {
+        let assistant_cases = [
+            ("absent", serde_json::json!({}), true),
+            ("null", serde_json::json!({"usage": null}), true),
+            ("non-object", serde_json::json!({"usage": "bad"}), true),
+            (
+                "incomplete",
+                serde_json::json!({"usage": {"input": 1}}),
+                true,
+            ),
+            (
+                "negative",
+                serde_json::json!({"usage": {"input": -1, "output": 0, "cacheRead": 0, "cacheWrite": 0}}),
+                true,
+            ),
+            (
+                "wrong-typed",
+                serde_json::json!({"usage": {"input": "bad", "output": 0, "cacheRead": 0, "cacheWrite": 0}}),
+                true,
+            ),
+            (
+                "component-overflow",
+                serde_json::json!({"usage": {"input": 18446744073709551615u64, "output": 1, "cacheRead": 0, "cacheWrite": 0}}),
+                true,
+            ),
+            (
+                "complete",
+                serde_json::json!({"usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4}}),
+                false,
+            ),
+        ];
+        for (name, fields, partial) in assistant_cases {
+            let mut semantic = PiSemantic::default();
+            let mut message = serde_json::json!({"role": "assistant", "content": []});
+            message
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(semantic.add(&serde_json::json!({"type": "message", "id": name, "parentId": null, "message": message})));
+            let data = semantic.session_data(true);
+            assert_eq!(data.turns, 1, "{name}");
+            assert_eq!(
+                data.usage_completeness == TelemetryCompleteness::Partial,
+                partial,
+                "{name}"
+            );
+        }
+
+        for kind in ["toolResult", "compaction", "branch_summary"] {
+            for (usage, partial) in [
+                (None, false),
+                (Some(serde_json::Value::Null), true),
+                (Some(serde_json::json!("bad")), true),
+                (Some(serde_json::json!({"input": 1})), true),
+                (
+                    Some(
+                        serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4}),
+                    ),
+                    false,
+                ),
+            ] {
+                let mut semantic = PiSemantic::default();
+                let entry = match kind {
+                    "toolResult" => {
+                        serde_json::json!({"type": "message", "id": "entry", "parentId": null, "message": {"role": "toolResult", "usage": usage, "content": ""}})
+                    }
+                    _ => {
+                        serde_json::json!({"type": kind, "id": "entry", "parentId": null, "usage": usage})
+                    }
+                };
+                // An omitted usage key must remain omitted rather than become JSON null.
+                let entry = if usage.is_none() {
+                    match kind {
+                        "toolResult" => {
+                            serde_json::json!({"type": "message", "id": "entry", "parentId": null, "message": {"role": "toolResult", "content": ""}})
+                        }
+                        _ => serde_json::json!({"type": kind, "id": "entry", "parentId": null}),
+                    }
+                } else {
+                    entry
+                };
+                assert!(semantic.add(&entry), "{kind}");
+                let data = semantic.session_data(true);
+                assert_eq!(
+                    data.usage_completeness == TelemetryCompleteness::Partial,
+                    partial,
+                    "{kind} {usage:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reported_cost_is_independent_and_requires_complete_expectations() {
+        let cases = [
+            (
+                "complete-zero",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.0}}),
+                ],
+                Some(0.0),
+                false,
+            ),
+            (
+                "one-missing-cost",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1.0}}),
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}),
+                ],
+                None,
+                false,
+            ),
+            (
+                "all-costs-absent",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}),
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}),
+                ],
+                None,
+                false,
+            ),
+            (
+                "ordinary-sum",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1.25}}),
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 2.75}}),
+                ],
+                Some(4.0),
+                false,
+            ),
+            (
+                "invalid-components",
+                vec![
+                    serde_json::json!({"input": "bad", "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1.5}}),
+                ],
+                Some(1.5),
+                true,
+            ),
+            (
+                "negative-cost",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": -1}}),
+                ],
+                None,
+                false,
+            ),
+            (
+                "wrong-typed-cost",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": "bad"}}),
+                ],
+                None,
+                false,
+            ),
+            (
+                "accumulated-overflow",
+                vec![
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1e308}}),
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1e308}}),
+                ],
+                None,
+                false,
+            ),
+        ];
+        for (name, usages, expected_cost, component_partial) in cases {
+            let mut semantic = PiSemantic::default();
+            for (index, usage) in usages.into_iter().enumerate() {
+                assert!(semantic.add(&serde_json::json!({"type": "message", "id": format!("{name}-{index}"), "parentId": null, "message": {"role": "assistant", "usage": usage, "content": []}})));
+            }
+            let data = semantic.session_data(true);
+            assert_eq!(data.cost, expected_cost, "{name}");
+            assert_eq!(
+                data.usage_completeness == TelemetryCompleteness::Partial,
+                component_partial,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_cost_requires_present_usage_and_is_reconciled_independently() {
+        for (kind, usage, expected) in [
+            ("toolResult", None, None),
+            (
+                "toolResult",
+                Some(serde_json::json!({"input": "bad", "cost": {"total": 2.0}})),
+                Some(2.0),
+            ),
+            (
+                "compaction",
+                Some(
+                    serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 2.0}}),
+                ),
+                Some(2.0),
+            ),
+            (
+                "branch_summary",
+                Some(serde_json::json!({"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0})),
+                None,
+            ),
+        ] {
+            let mut semantic = PiSemantic::default();
+            let entry = match (kind, usage) {
+                ("toolResult", Some(usage)) => {
+                    serde_json::json!({"type": "message", "id": "entry", "parentId": null, "message": {"role": "toolResult", "usage": usage, "content": ""}})
+                }
+                ("toolResult", None) => {
+                    serde_json::json!({"type": "message", "id": "entry", "parentId": null, "message": {"role": "toolResult", "content": ""}})
+                }
+                (_, Some(usage)) => {
+                    serde_json::json!({"type": kind, "id": "entry", "parentId": null, "usage": usage})
+                }
+                (_, None) => serde_json::json!({"type": kind, "id": "entry", "parentId": null}),
+            };
+            assert!(semantic.add(&entry));
+            assert_eq!(semantic.session_data(true).cost, expected, "{kind}");
+        }
+
+        for (name, kind, usage) in [
+            ("compaction-null", "compaction", serde_json::Value::Null),
+            (
+                "branch-summary-non-object",
+                "branch_summary",
+                serde_json::json!("bad"),
+            ),
+        ] {
+            let mut semantic = PiSemantic::default();
+            assert!(semantic.add(&serde_json::json!({
+                "type": "message",
+                "id": "assistant",
+                "parentId": null,
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input": 1,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                        "cost": {"total": 1.0}
+                    },
+                    "content": []
+                }
+            })));
+            assert!(semantic.add(&serde_json::json!({
+                "type": kind,
+                "id": "optional",
+                "parentId": "assistant",
+                "usage": usage
+            })));
+            assert!(semantic.session_data(true).cost.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn reported_cost_is_withheld_for_incomplete_sources_and_duplicate_ids() {
+        let entry = serde_json::json!({"type": "message", "id": "a", "parentId": null, "message": {"role": "assistant", "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 1.0}}, "content": []}});
+        for state in ["tail", "limited", "invalid", "duplicate"] {
+            let mut semantic = PiSemantic::default();
+            assert!(semantic.add(&entry));
+            match state {
+                "limited" => semantic.limited = true,
+                "invalid" => semantic.invalid = true,
+                "duplicate" => {
+                    let duplicate = serde_json::json!({"type": "message", "id": "a", "parentId": null, "message": {"role": "assistant", "usage": {"input": 999}, "content": []}});
+                    assert!(semantic.add(&duplicate));
+                }
+                _ => {}
+            }
+            let data = semantic.session_data(state != "tail");
+            assert!(data.cost.is_none(), "{state}");
+            if state == "duplicate" {
+                assert_eq!(data.input, 1);
+                assert_eq!(data.turns, 1);
+                assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+                assert_eq!(data.context_completeness, TelemetryCompleteness::Partial);
+            }
+        }
+    }
+
+    #[test]
+    fn total_tokens_is_context_only_with_component_fallback() {
+        for (usage, baseline) in [
+            (
+                serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": 99}),
+                Some(99),
+            ),
+            (
+                serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4}),
+                Some(10),
+            ),
+            (
+                serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": "bad"}),
+                Some(10),
+            ),
+            (
+                serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": 1e100}),
+                Some(10),
+            ),
+        ] {
+            let mut semantic = PiSemantic::default();
+            assert!(semantic.add(&serde_json::json!({"type": "message", "id": "a", "parentId": null, "message": {"role": "assistant", "usage": usage, "content": []}})));
+            let data = semantic.session_data(true);
+            assert_eq!(data.baseline_tokens, baseline);
+            assert_eq!(
+                (data.input, data.output, data.cache_read, data.cache_write),
+                (1, 2, 3, 4)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_component_usage_is_unknown_but_clean_zero_is_available() {
+        for (name, entry, expected_precision, expected_completeness) in [
+            (
+                "assistant-omitted",
+                Some(
+                    r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[]}}"#,
+                ),
+                TelemetryPrecision::Unknown,
+                TelemetryCompleteness::Partial,
+            ),
+            (
+                "assistant-malformed",
+                Some(
+                    r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":null,"content":[]}}"#,
+                ),
+                TelemetryPrecision::Unknown,
+                TelemetryCompleteness::Partial,
+            ),
+            (
+                "header-only",
+                None,
+                TelemetryPrecision::Exact,
+                TelemetryCompleteness::Complete,
+            ),
+            (
+                "optional-absent",
+                Some(
+                    r#"{"type":"message","id":"t","parentId":null,"message":{"role":"toolResult","content":""}}"#,
+                ),
+                TelemetryPrecision::Exact,
+                TelemetryCompleteness::Complete,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().to_string_lossy().to_string();
+            let path = session_file(&dir, name, &cwd);
+            if let Some(entry) = entry {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(entry.as_bytes())
+                    .unwrap();
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            let attachment = PiAttachment {
+                path: path.clone(),
+                session_id: name.to_string(),
+                start_id: None,
+                header_cwd: cwd,
+                identity: file_identity(&path).unwrap(),
+            };
+            let mut collector = PiCollector::new();
+            let mut budget = MAX_TAIL_WORK_BYTES;
+            let (telemetry, data) = collector
+                .telemetry_for_attachment(&attachment, 1, &mut budget)
+                .unwrap();
+            assert_eq!(telemetry.usage.precision, expected_precision, "{name}");
+            assert_eq!(
+                telemetry.usage.completeness, expected_completeness,
+                "{name}"
+            );
+            assert_eq!(
+                data.usage_available,
+                expected_precision != TelemetryPrecision::Unknown,
+                "{name}"
+            );
+            assert!(telemetry.usage_details.reported_cost.is_none(), "{name}");
+            assert_eq!(
+                (data.input, data.output, data.cache_read, data.cache_write),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_first_entry_reserves_its_id_before_duplicate_reduction() {
+        let mut semantic = PiSemantic::default();
+        assert!(!semantic.add(&serde_json::json!({"type": "message", "id": "same", "message": {"role": "assistant", "content": []}})));
+        assert!(semantic.add(&serde_json::json!({"type": "message", "id": "same", "parentId": null, "message": {"role": "assistant", "usage": {"input": 9, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 3.0}}, "content": []}})));
+        let data = semantic.session_data(true);
+        assert!(semantic.duplicate_ids);
+        assert!(semantic.entries.is_empty());
+        assert_eq!(data.turns, 0);
+        assert_eq!(
+            (data.input, data.output, data.cache_read, data.cache_write),
+            (0, 0, 0, 0)
+        );
+        assert!(data.cost.is_none());
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert_eq!(data.context_completeness, TelemetryCompleteness::Partial);
+    }
+
+    #[test]
+    fn raw_cost_parse_loss_and_incomplete_tail_withhold_reported_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let path = session_file(&dir, "cost-tail", &cwd);
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(br#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":1}},"content":[]}}
+{"type":"message","id":"partial"#).unwrap();
+        let attachment = PiAttachment {
+            path: path.clone(),
+            session_id: "cost-tail".to_string(),
+            start_id: None,
+            header_cwd: cwd,
+            identity: file_identity(&path).unwrap(),
+        };
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let (telemetry, _) = collector
+            .telemetry_for_attachment(&attachment, 1, &mut budget)
+            .unwrap();
+        assert!(telemetry.usage_details.reported_cost.is_none());
+        assert_eq!(telemetry.usage.completeness, TelemetryCompleteness::Partial);
+
+        // A raw JSON number outside serde_json's finite range is parser loss and
+        // therefore cannot publish cost after a complete tail scan either.
+        let raw_path = dir.path().join("raw-cost.jsonl");
+        fs::write(&raw_path, format!("{}{{\"type\":\"message\",\"id\":\"raw\",\"parentId\":null,\"message\":{{\"role\":\"assistant\",\"usage\":{{\"cost\":{{\"total\":1e999}}}}}}}}\n", session_header("raw-cost", &attachment.header_cwd))).unwrap();
+        let raw_attachment = PiAttachment {
+            path: raw_path.clone(),
+            session_id: "raw-cost".to_string(),
+            start_id: None,
+            header_cwd: attachment.header_cwd.clone(),
+            identity: file_identity(&raw_path).unwrap(),
+        };
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let (raw_telemetry, _) = collector
+            .telemetry_for_attachment(&raw_attachment, 2, &mut budget)
+            .unwrap();
+        assert!(raw_telemetry.usage_details.reported_cost.is_none());
+        assert_eq!(
+            raw_telemetry.usage.completeness,
+            TelemetryCompleteness::Partial
+        );
     }
 
     #[test]
