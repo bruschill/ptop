@@ -82,7 +82,7 @@ ptop makes no network request while monitoring. It reads local files, process me
 
 ## Parent parser limits
 
-The parent session tailer is stateful. It scans an attached file once, then reads only appended bytes. It handles incomplete lines, truncation, replacement, deletion, malformed records, and oversized lines without retaining raw transcript content.
+The parent session tailer is stateful. It scans an attached file once, then reads only appended bytes. It handles incomplete lines, truncation, replacement, deletion, malformed records, and oversized lines without retaining raw transcript content. Session headers without `version` use version 1. Versions 1, 2, and 3 support the existing base telemetry; invalid or unsupported versions remain process-only. The accepted version is retained with the attachment and tail identity, and each header revalidation compares it. A version change resets or rejects tail state instead of reusing prior semantics. Private rich-telemetry reduction is gated solely on version 3; it never infers rich-schema support from entry shape.
 
 Token history contains the latest 64 persisted assistant entries with complete component usage, in file order across all branches. Each point is the checked sum of input, output, cache-read, and cache-write tokens for one assistant turn. Entries with unavailable or overflowing component usage are omitted rather than represented as zero. The lifetime turn count still includes every persisted assistant entry.
 

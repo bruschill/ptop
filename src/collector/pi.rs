@@ -67,6 +67,7 @@ struct PiAttachment {
     path: PathBuf,
     session_id: String,
     start_id: Option<String>,
+    version: u64,
     header_cwd: String,
     identity: FileIdentity,
 }
@@ -75,6 +76,7 @@ struct PiAttachment {
 struct PiHeader {
     session_id: String,
     cwd: String,
+    version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,7 @@ struct PiTail {
     identity: FileIdentity,
     header_session_id: String,
     header_cwd: String,
+    header_version: u64,
     offset: u64,
     /// A hash of a small suffix immediately before `offset`, never transcript content.
     boundary_fingerprint: Option<u64>,
@@ -107,6 +110,12 @@ struct PiTail {
     complete: bool,
     error: Option<String>,
     semantic: PiSemantic,
+}
+
+impl PiTail {
+    fn supports_rich_telemetry(&self) -> bool {
+        self.header_version == 3
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -606,6 +615,7 @@ impl PiCollector {
                         if prior.as_ref().is_some_and(|attachment| {
                             attachment.path == path
                                 && (attachment.session_id != header.session_id
+                                    || attachment.version != header.version
                                     || attachment.identity != identity)
                         }) {
                             errors.insert(root, "session file identity changed".to_string());
@@ -656,6 +666,7 @@ impl PiCollector {
                     path,
                     session_id: header.session_id,
                     start_id,
+                    version: header.version,
                     header_cwd: header.cwd,
                     identity,
                 };
@@ -696,7 +707,11 @@ impl PiCollector {
         observed_at_ms: u64,
         tail_budget: &mut usize,
     ) -> Result<(SessionTelemetry, PiSessionData), String> {
-        let expected_header = (&attachment.session_id[..], &attachment.header_cwd[..]);
+        let expected_header = (
+            &attachment.session_id[..],
+            &attachment.header_cwd[..],
+            attachment.version,
+        );
         let (
             mut data,
             context_is_complete,
@@ -715,6 +730,7 @@ impl PiCollector {
                 && !tail.parse_limited
                 && !tail.semantic.limited
                 && !tail.semantic.invalid;
+            debug_assert_eq!(tail.supports_rich_telemetry(), attachment.version == 3);
             (
                 tail.semantic.session_data(complete),
                 complete,
@@ -845,7 +861,7 @@ impl PiCollector {
         path: &Path,
         observed_at_ms: u64,
         budget: &mut usize,
-        expected_header: Option<(&str, &str)>,
+        expected_header: Option<(&str, &str, u64)>,
         expected_identity: Option<&FileIdentity>,
     ) -> Result<&PiTail, String> {
         // Open once for metadata and reads. The post-read path check below fails closed
@@ -867,7 +883,7 @@ impl PiCollector {
         let length = metadata.len();
         // Re-read the header from this open descriptor every pass. File identity and
         // the boundary fingerprint alone cannot prove an in-place rewrite kept the
-        // validated session ID and cwd.
+        // validated session ID, cwd, and version.
         let header = match read_header_from(&mut file, budget) {
             Ok(header) => header,
             Err(error) => {
@@ -875,9 +891,9 @@ impl PiCollector {
                 return Err(error);
             }
         };
-        if expected_header
-            .is_some_and(|(session_id, cwd)| header.session_id != session_id || header.cwd != cwd)
-        {
+        if expected_header.is_some_and(|(session_id, cwd, version)| {
+            header.session_id != session_id || header.cwd != cwd || header.version != version
+        }) {
             self.tails.remove(path);
             return Err("session file header changed after ownership validation".to_string());
         }
@@ -886,6 +902,7 @@ impl PiCollector {
                 || length < tail.offset
                 || tail.header_session_id != header.session_id
                 || tail.header_cwd != header.cwd
+                || tail.header_version != header.version
                 || !fingerprint_matches(&mut file, tail)
         });
         if reset {
@@ -895,6 +912,7 @@ impl PiCollector {
                     identity: identity.clone(),
                     header_session_id: header.session_id,
                     header_cwd: header.cwd,
+                    header_version: header.version,
                     offset: 0,
                     boundary_fingerprint: None,
                     discard_oversized_line: false,
@@ -1191,6 +1209,7 @@ fn parse_header(line: &[u8]) -> Result<PiHeader, String> {
     Ok(PiHeader {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
+        version,
     })
 }
 
@@ -3078,9 +3097,13 @@ mod tests {
     }
 
     fn session_header(id: &str, cwd: &str) -> String {
+        session_header_with_version(id, cwd, 3)
+    }
+
+    fn session_header_with_version(id: &str, cwd: &str, version: u64) -> String {
         format!(
             "{}\n",
-            serde_json::json!({"type": "session", "version": 3, "id": id, "cwd": cwd})
+            serde_json::json!({"type": "session", "version": version, "id": id, "cwd": cwd})
         )
     }
 
@@ -3369,6 +3392,7 @@ mod tests {
             path: path.clone(),
             session_id: "owned-a".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd.clone(),
             identity: file_identity(&path).unwrap(),
         };
@@ -3395,6 +3419,33 @@ mod tests {
     }
 
     #[test]
+    fn reopened_header_version_must_match_the_resolved_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let path = session_file(&dir, "owned", &cwd);
+        let attachment = PiAttachment {
+            path: path.clone(),
+            session_id: "owned".to_string(),
+            start_id: None,
+            version: 3,
+            header_cwd: cwd.clone(),
+            identity: file_identity(&path).unwrap(),
+        };
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        assert!(collector
+            .telemetry_for_attachment(&attachment, 1, &mut budget)
+            .is_ok());
+
+        fs::write(&path, session_header_with_version("owned", &cwd, 2)).unwrap();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        assert!(collector
+            .telemetry_for_attachment(&attachment, 2, &mut budget)
+            .is_err());
+        assert!(!collector.tails.contains_key(&path));
+    }
+
+    #[test]
     fn reopened_file_identity_must_match_the_resolved_attachment() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
@@ -3403,6 +3454,7 @@ mod tests {
             path: path.clone(),
             session_id: "owned".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd.clone(),
             identity: file_identity(&path).unwrap(),
         };
@@ -3427,6 +3479,7 @@ mod tests {
             path: path.clone(),
             session_id: "shared".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd.clone(),
             identity: file_identity(&path).unwrap(),
         };
@@ -3441,6 +3494,7 @@ mod tests {
                 identity: file_identity(&dir.path().join("session.jsonl")).unwrap(),
                 header_session_id: "shared".to_string(),
                 header_cwd: dir.path().to_string_lossy().into_owned(),
+                header_version: 3,
                 offset: 0,
                 boundary_fingerprint: None,
                 discard_oversized_line: false,
@@ -3482,6 +3536,7 @@ mod tests {
                 path: unique,
                 session_id: "unique".to_string(),
                 start_id: None,
+                version: 3,
                 header_cwd: cwd.clone(),
                 identity: unique_identity,
             },
@@ -3492,6 +3547,7 @@ mod tests {
                 path: shared_path,
                 session_id: "shared".to_string(),
                 start_id: None,
+                version: 3,
                 header_cwd: cwd,
                 identity: shared_identity,
             },
@@ -3518,6 +3574,7 @@ mod tests {
                 path,
                 session_id: "old".to_string(),
                 start_id: Some("old-start".to_string()),
+                version: 3,
                 header_cwd: cwd,
                 identity,
             },
@@ -3573,15 +3630,96 @@ mod tests {
 
     #[test]
     fn header_defaults_missing_version_to_v1_and_rejects_unsupported_versions() {
-        assert!(parse_header(br#"{"type":"session","id":"a","cwd":"/tmp"}"#).is_ok());
+        let missing = parse_header(br#"{"type":"session","id":"a","cwd":"/tmp"}"#).unwrap();
+        assert_eq!(missing.version, 1);
+        for version in 1..=3 {
+            assert_eq!(
+                parse_header(
+                    format!(r#"{{"type":"session","version":{version},"id":"a","cwd":"/tmp"}}"#)
+                        .as_bytes()
+                )
+                .unwrap()
+                .version,
+                version
+            );
+        }
         assert!(
             parse_header(br#"{"type":"session","version":null,"id":"a","cwd":"/tmp"}"#).is_err()
         );
+        assert!(parse_header(br#"{"type":"session","version":0,"id":"a","cwd":"/tmp"}"#).is_err());
         assert!(parse_header(br#"{"type":"session","version":4,"id":"a","cwd":"/tmp"}"#).is_err());
         assert!(
             parse_header(br#"{"type":"session","version":"2","id":"a","cwd":"/tmp"}"#).is_err()
         );
-        assert!(parse_header(br#"{"type":"session","version":2,"id":"a","cwd":"/tmp"}"#).is_ok());
+    }
+
+    #[test]
+    fn base_telemetry_supports_versions_1_through_3_and_rich_only_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        for version in 1..=3 {
+            let path = dir.path().join(format!("session-v{version}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{}{{\"type\":\"message\",\"id\":\"entry\",\"parentId\":null,\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":1,\"output\":2,\"cacheRead\":3,\"cacheWrite\":4}},\"content\":[]}}}}\n",
+                    session_header_with_version("versioned", &cwd, version)
+                ),
+            )
+            .unwrap();
+            let mut collector = PiCollector::new();
+            let tail = collector.tail_session(&path, version).unwrap();
+            assert_eq!(tail.header_version, version);
+            assert_eq!(tail.supports_rich_telemetry(), version == 3);
+            let data = tail.semantic.session_data(tail.complete);
+            assert_eq!(
+                (data.input, data.output, data.cache_read, data.cache_write),
+                (1, 2, 3, 4)
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_header_version_change_resets_tail_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy();
+        let path = dir.path().join("session.jsonl");
+        let entry = |id| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":null,"message":{{"role":"assistant","usage":{{"input":1,"output":0,"cacheRead":0,"cacheWrite":0}},"content":[]}}}}"#
+            )
+        };
+        fs::write(
+            &path,
+            format!(
+                "{}{}\n",
+                session_header_with_version("same", &cwd, 3),
+                entry("old")
+            ),
+        )
+        .unwrap();
+        let mut collector = PiCollector::new();
+        assert!(collector
+            .tail_session(&path, 1)
+            .unwrap()
+            .semantic
+            .entries
+            .contains_key("old"));
+
+        fs::write(
+            &path,
+            format!(
+                "{}{}\n",
+                session_header_with_version("same", &cwd, 2),
+                entry("new")
+            ),
+        )
+        .unwrap();
+        let tail = collector.tail_session(&path, 2).unwrap();
+        assert_eq!(tail.header_version, 2);
+        assert!(!tail.supports_rich_telemetry());
+        assert!(tail.semantic.entries.contains_key("new"));
+        assert!(!tail.semantic.entries.contains_key("old"));
     }
 
     #[test]
@@ -3716,6 +3854,7 @@ mod tests {
                     path,
                     session_id: "clone".into(),
                     start_id: None,
+                    version: 3,
                     header_cwd: cwd.clone(),
                 },
             );
@@ -3806,6 +3945,7 @@ mod tests {
             path: path.clone(),
             session_id: "attached".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd,
             identity: file_identity(&path).unwrap(),
         };
@@ -3870,6 +4010,7 @@ mod tests {
             path: path.clone(),
             session_id: "compaction-privacy".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd,
             identity: file_identity(&path).unwrap(),
         };
@@ -4505,6 +4646,7 @@ mod tests {
                 path: path.clone(),
                 session_id: name.to_string(),
                 start_id: None,
+                version: 3,
                 header_cwd: cwd,
                 identity: file_identity(&path).unwrap(),
             };
@@ -4560,6 +4702,7 @@ mod tests {
             path: path.clone(),
             session_id: "cost-tail".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: cwd,
             identity: file_identity(&path).unwrap(),
         };
@@ -4579,6 +4722,7 @@ mod tests {
             path: raw_path.clone(),
             session_id: "raw-cost".to_string(),
             start_id: None,
+            version: 3,
             header_cwd: attachment.header_cwd.clone(),
             identity: file_identity(&raw_path).unwrap(),
         };
