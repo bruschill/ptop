@@ -11,6 +11,8 @@
 //! process. Only `Failed`/`Jumped` stop the walk.
 
 mod cmux;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod herdr;
 #[cfg(target_os = "macos")]
 mod iterm2;
 mod tmux;
@@ -54,22 +56,31 @@ pub fn resolve(jumpers: &[Box<dyn TerminalJumper>], pid: u32) -> JumpOutcome {
 }
 
 /// The registry: the single ordered source of truth for supported terminals.
-/// Order = most specific first: cmux (env-tagged) → tmux (multiplexer) →
-/// iTerm2 on macOS (emulator). They are mutually exclusive by tty, so order
-/// only matters for the multiplexer-inside-emulator case.
+/// Order = innermost location first: Herdr → cmux → tmux → iTerm2. Herdr is
+/// first so a Pi pane inside an outer multiplexer is selected precisely.
 #[cfg(target_os = "macos")]
 pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![
+        Box::new(herdr::HerdrJumper),
         Box::new(cmux::CmuxJumper),
         Box::new(tmux::TmuxJumper),
         Box::new(iterm2::ITerm2Jumper),
     ]
 }
 
-/// The registry: the single ordered source of truth for supported terminals.
-/// Non-macOS builds exclude the iTerm2 adapter so standalone Linux/Windows
-/// sessions no-op cleanly instead of trying macOS-only `osascript`.
-#[cfg(not(target_os = "macos"))]
+/// Linux supports Herdr and the two existing multiplexer adapters.
+#[cfg(target_os = "linux")]
+pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
+    vec![
+        Box::new(herdr::HerdrJumper),
+        Box::new(cmux::CmuxJumper),
+        Box::new(tmux::TmuxJumper),
+    ]
+}
+
+/// Other targets retain the existing registry. Windows controls remain
+/// disabled by the app, and iTerm2 is macOS-only.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![Box::new(cmux::CmuxJumper), Box::new(tmux::TmuxJumper)]
 }
@@ -219,6 +230,13 @@ mod tests {
 
     // ---- resolve / registry loop ----
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn registry_prefers_herdr() {
+        let names: Vec<_> = jumpers().iter().map(|jumper| jumper.name()).collect();
+        assert_eq!(names.first(), Some(&"herdr"));
+    }
+
     #[test]
     fn resolve_all_not_applicable_is_noop() {
         let js = vec![
@@ -325,9 +343,12 @@ mod tests {
     #[test]
     fn jumpers_include_platform_backends() {
         #[cfg(target_os = "macos")]
+        assert_eq!(jumpers().len(), 4);
+
+        #[cfg(target_os = "linux")]
         assert_eq!(jumpers().len(), 3);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert_eq!(jumpers().len(), 2);
     }
 

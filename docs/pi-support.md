@@ -11,12 +11,12 @@ ptop monitors local Pi coding-agent processes only. Process discovery is indepen
 | Owned session telemetry attachment | Yes | Yes | Process-only |
 | `pi-subagents` fleet status | Yes | Yes | Unavailable |
 | Git working-tree enrichment | Yes | Yes | Yes |
-| Terminal jump | cmux, tmux, iTerm2 | cmux, tmux | Disabled |
+| Terminal jump | Herdr, cmux, tmux, iTerm2 | Herdr, cmux, tmux | Disabled |
 | Pi process kill | Yes | Yes | Disabled |
 
 Windows uses `sysinfo` and `netstat -ano`. It reports load average as 0. Jump and kill controls remain disabled until ptop can apply the same trusted process-identity checks used on Unix.
 
-On macOS and Linux, ptop checks that a controlled PID still belongs to a Pi process. Where available, it also compares an opaque process-start identity to prevent PID reuse from targeting another process.
+On macOS and Linux, ptop checks that a controlled PID still belongs to a Pi process. Where available, it also compares an opaque process-start identity to prevent PID reuse from targeting another process. Herdr jumps use the selected Pi process's pane ID and server socket, and apply only when ptop is attached to the same Herdr server.
 
 ## Telemetry attachment contract
 
