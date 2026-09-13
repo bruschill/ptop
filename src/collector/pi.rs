@@ -218,7 +218,6 @@ struct PiSessionData {
     context_reason: Option<String>,
     usage_reason: Option<String>,
     usage_available: bool,
-    active_leaf_id: Option<String>,
 }
 
 impl Default for PiSessionData {
@@ -246,7 +245,6 @@ impl Default for PiSessionData {
             context_reason: None,
             usage_reason: None,
             usage_available: true,
-            active_leaf_id: None,
         }
     }
 }
@@ -467,11 +465,7 @@ impl PiCollector {
                     total_cache_read: data.cache_read,
                     total_cache_create: data.cache_write,
                     turn_count: data.turns,
-                    current_tasks: vec![if data.active_leaf_id.is_some() {
-                        "persisted Pi session telemetry".to_string()
-                    } else {
-                        "session telemetry unavailable".to_string()
-                    }],
+                    current_tasks: vec![telemetry_task_label(attachment.is_some()).to_string()],
                     mem_mb: proc.rss_kb / 1024,
                     version: String::new(),
                     git_branch: String::new(),
@@ -745,7 +739,6 @@ impl PiCollector {
             data.context_tokens = None;
             data.baseline_tokens = None;
             data.trailing_tokens = None;
-            data.active_leaf_id = None;
             data.context_precision = TelemetryPrecision::Unknown;
             append_reason(
                 &mut data.context_reason,
@@ -792,7 +785,7 @@ impl PiCollector {
                     tokens: data.context_tokens,
                     baseline_tokens: data.baseline_tokens,
                     trailing_tokens: data.trailing_tokens,
-                    active_leaf_id: data.active_leaf_id.clone(),
+                    active_leaf_id: None,
                     provider: (!data.provider.is_empty()).then_some(data.provider.clone()),
                     reason: data.context_reason.clone(),
                 },
@@ -963,6 +956,14 @@ impl Default for PiCollector {
 impl PiCollector {
     pub(crate) fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
+    }
+}
+
+fn telemetry_task_label(attached: bool) -> &'static str {
+    if attached {
+        "persisted Pi session telemetry"
+    } else {
+        "session telemetry unavailable"
     }
 }
 
@@ -1394,26 +1395,26 @@ impl PiSemantic {
             data.context_completeness = TelemetryCompleteness::Partial;
             return data;
         }
-        let Some(leaf) = self.order.last().cloned() else {
+        let Some(latest_persisted_entry_id) = self.order.last().cloned() else {
             data.context_reason = Some("no persisted tree entry".to_string());
             return data;
         };
-        data.active_leaf_id = Some(leaf.clone());
         append_reason(
             &mut data.context_reason,
-            "active leaf is inferred from the latest persisted entry",
+            "context is inferred from the latest persisted entry",
         );
         let mut branch = Vec::new();
-        let mut current = leaf.clone();
+        let mut current = latest_persisted_entry_id;
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(current.clone()) {
-                data.context_reason = Some("active branch has a cycle".to_string());
+                data.context_reason = Some("latest persisted entry branch has a cycle".to_string());
                 data.context_completeness = TelemetryCompleteness::Partial;
                 return data;
             }
             let Some(entry) = self.entries.get(&current) else {
-                data.context_reason = Some("active branch parent is missing".to_string());
+                data.context_reason =
+                    Some("latest persisted entry branch parent is missing".to_string());
                 data.context_completeness = TelemetryCompleteness::Partial;
                 return data;
             };
@@ -3686,7 +3687,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_usage_deduplicates_branches_and_context_uses_active_leaf() {
+    fn passive_navigation_to_an_earlier_leaf_without_append_keeps_latest_persisted_inference() {
         let mut semantic = PiSemantic::default();
         for line in [
             r#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}"#,
@@ -3704,8 +3705,54 @@ mod tests {
         );
         assert_eq!(data.context_tokens, Some(20));
         assert_eq!(data.token_history, vec![18, 7]);
-        assert_eq!(data.active_leaf_id.as_deref(), Some("other"));
+        assert!(data.context_reason.as_deref().is_some_and(|reason| {
+            reason.contains("latest persisted entry") && !reason.contains("active leaf")
+        }));
         assert_eq!(data.context_precision, TelemetryPrecision::Estimated);
+
+        // The persisted tree has no navigation signal. Re-reading it without an
+        // append must keep context inference on the same latest persisted entry.
+        let repeated = semantic.session_data(true);
+        assert_eq!(repeated.context_tokens, data.context_tokens);
+        assert_eq!(repeated.context_reason, data.context_reason);
+    }
+
+    #[test]
+    fn attached_task_label_does_not_depend_on_a_leaf_id() {
+        let mut semantic = PiSemantic::default();
+        assert!(semantic.add(&serde_json::json!({
+            "type": "message",
+            "id": "persisted",
+            "parentId": null,
+            "message": {"role": "assistant", "usage": {"totalTokens": 1}, "content": []}
+        })));
+        let data = semantic.session_data(true);
+        assert_eq!(telemetry_task_label(true), "persisted Pi session telemetry");
+        assert!(data.context_reason.as_deref().is_some_and(|reason| {
+            reason.contains("latest persisted entry") && !reason.contains("active leaf")
+        }));
+    }
+
+    #[test]
+    fn attached_telemetry_has_no_active_leaf_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = session_file(&dir, "attached", &cwd);
+        let attachment = PiAttachment {
+            path: path.clone(),
+            session_id: "attached".to_string(),
+            start_id: None,
+            header_cwd: cwd,
+            identity: file_identity(&path).unwrap(),
+        };
+        let mut collector = PiCollector::new();
+        let mut budget = MAX_TAIL_WORK_BYTES;
+        let (telemetry, _) = collector
+            .telemetry_for_attachment(&attachment, 1, &mut budget)
+            .unwrap();
+
+        assert_eq!(telemetry.attachment, AttachmentState::Attached);
+        assert!(telemetry.context_details.active_leaf_id.is_none());
     }
 
     #[test]
@@ -3778,7 +3825,6 @@ mod tests {
             (data.input, data.output, data.cache_read, data.cache_write),
             (0, 0, 0, 0)
         );
-        assert!(data.active_leaf_id.is_none());
         assert!(data.context_tokens.is_none());
     }
 
@@ -3794,7 +3840,6 @@ mod tests {
         );
         assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
         assert!(data.context_tokens.is_none());
-        assert!(data.active_leaf_id.is_none());
     }
 
     #[test]

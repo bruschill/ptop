@@ -2,8 +2,8 @@
 
 ## Status
 
-The owner approved the defaults. Phase 0 Change 0.1 is implemented and
-verified in the working tree. Change 0.2 and later changes have not started.
+The owner approved the defaults. Phase 0 Changes 0.1 and 0.2 are implemented
+and verified. Change 0.3 and later changes have not started.
 
 This plan turns Phase 0 and Phase 1 from
 [`pi-harness-telemetry.md`](pi-harness-telemetry.md) into ordered,
@@ -666,5 +666,5 @@ Stop execution and ask the owner if any of these occurs:
 ## Approval gate
 
 The owner confirmed the defaults in **Approved-by-execution defaults** before
-implementation began. Phase 0 Change 0.1 is complete in the working tree. The
-next implementation step is Phase 0 Change 0.2.
+implementation began. Phase 0 Changes 0.1 and 0.2 are complete. The next
+implementation step is Phase 0 Change 0.3.
