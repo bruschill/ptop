@@ -12,7 +12,7 @@ use crate::model::{
     TelemetryMetadata, TelemetryPrecision, UsageTelemetryDetails,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -139,6 +139,7 @@ struct PiEntry {
     provider: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    assistant_stop_reason: Option<AssistantStopReason>,
     valid_baseline: bool,
 }
 
@@ -149,6 +150,88 @@ enum PiEntryKind {
     Compaction,
     BranchSummary,
     Other,
+}
+
+/// Fixed, privacy-safe reduction of Pi's assistant stop reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantStopReason {
+    Stop,
+    Length,
+    ToolUse,
+    Error,
+    Aborted,
+    Deferred,
+    Pending,
+    Unknown,
+}
+
+impl AssistantStopReason {
+    fn permits_context_baseline(self) -> bool {
+        !matches!(
+            self,
+            Self::Error | Self::Aborted | Self::Pending | Self::Unknown
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AssistantOutcomeCounts {
+    stop: u32,
+    length: u32,
+    tool_use: u32,
+    error: u32,
+    aborted: u32,
+    deferred: u32,
+    pending: u32,
+    unknown: u32,
+}
+
+impl AssistantOutcomeCounts {
+    fn add(&mut self, reason: AssistantStopReason) {
+        let count = match reason {
+            AssistantStopReason::Stop => &mut self.stop,
+            AssistantStopReason::Length => &mut self.length,
+            AssistantStopReason::ToolUse => &mut self.tool_use,
+            AssistantStopReason::Error => &mut self.error,
+            AssistantStopReason::Aborted => &mut self.aborted,
+            AssistantStopReason::Deferred => &mut self.deferred,
+            AssistantStopReason::Pending => &mut self.pending,
+            AssistantStopReason::Unknown => &mut self.unknown,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    fn total(self) -> u32 {
+        self.stop
+            .saturating_add(self.length)
+            .saturating_add(self.tool_use)
+            .saturating_add(self.error)
+            .saturating_add(self.aborted)
+            .saturating_add(self.deferred)
+            .saturating_add(self.pending)
+            .saturating_add(self.unknown)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AssistantObservation {
+    stop_reason: AssistantStopReason,
+    components: Observation<ComponentUsage>,
+    reported_cost: Observation<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantOutcomeProjection {
+    counts: AssistantOutcomeCounts,
+    observations: VecDeque<AssistantObservation>,
+}
+
+impl AssistantOutcomeProjection {
+    fn validates_for_turns(&self, turns: u32) -> bool {
+        self.counts.total() == turns
+            && self.observations.len() == (turns as usize).min(MAX_TOKEN_HISTORY_POINTS)
+            && self.observations.len() <= MAX_TOKEN_HISTORY_POINTS
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -732,7 +815,8 @@ impl PiCollector {
                 && !tail.semantic.invalid;
             debug_assert_eq!(tail.supports_rich_telemetry(), attachment.version == 3);
             (
-                tail.semantic.session_data(complete),
+                tail.semantic
+                    .session_data_for_version(complete, tail.supports_rich_telemetry()),
                 complete,
                 tail.error.clone(),
                 tail.source_updated_at_ms,
@@ -820,11 +904,12 @@ impl PiCollector {
 
     fn resolve_context_window(&mut self, attachment: &PiAttachment) -> Option<u64> {
         let tail = self.tails.get(&attachment.path)?;
-        let data = tail.semantic.session_data(
+        let data = tail.semantic.session_data_for_version(
             tail.complete
                 && !tail.parse_limited
                 && !tail.semantic.limited
                 && !tail.semantic.invalid,
+            tail.supports_rich_telemetry(),
         );
         if data.provider.is_empty() || data.model.is_empty() {
             return None;
@@ -1266,7 +1351,54 @@ impl PiSemantic {
         }
     }
 
+    fn assistant_outcome_projection(&self) -> AssistantOutcomeProjection {
+        let mut projection = AssistantOutcomeProjection {
+            counts: AssistantOutcomeCounts::default(),
+            observations: VecDeque::new(),
+        };
+        for id in &self.order {
+            let Some(entry) = self.entries.get(id) else {
+                continue;
+            };
+            if entry.kind != PiEntryKind::Assistant {
+                continue;
+            }
+            let stop_reason = entry
+                .assistant_stop_reason
+                .expect("assistant entries always have a reduced stop reason");
+            projection.counts.add(stop_reason);
+            if projection.observations.len() == MAX_TOKEN_HISTORY_POINTS {
+                projection.observations.pop_front();
+            }
+            let (components, reported_cost) = match entry.usage {
+                UsageObservation::Absent => (Observation::Absent, Observation::Absent),
+                UsageObservation::Invalid => (Observation::Invalid, Observation::Invalid),
+                UsageObservation::Value(usage) => (usage.components, usage.reported_cost),
+            };
+            projection.observations.push_back(AssistantObservation {
+                stop_reason,
+                components,
+                reported_cost,
+            });
+        }
+        projection
+    }
+
+    #[cfg(test)]
     fn session_data(&self, context_complete: bool) -> PiSessionData {
+        self.session_data_for_version(context_complete, true)
+    }
+
+    fn session_data_for_version(
+        &self,
+        context_complete: bool,
+        rich_telemetry_supported: bool,
+    ) -> PiSessionData {
+        let assistant_outcomes = if rich_telemetry_supported {
+            Some(self.assistant_outcome_projection())
+        } else {
+            None
+        };
         let mut data = PiSessionData::default();
         data.usage_completeness = if self.limited || self.invalid || self.duplicate_ids {
             TelemetryCompleteness::Partial
@@ -1376,6 +1508,11 @@ impl PiSemantic {
                 }
             }
         }
+        apply_assistant_outcome_validation(
+            &mut data,
+            assistant_outcomes.as_ref(),
+            &mut cost_partial,
+        );
         if data.usage_available
             && component_total(ComponentUsage {
                 input: data.input,
@@ -1463,8 +1600,13 @@ impl PiSemantic {
             .rposition(|id| self.entries[id].kind == PiEntryKind::Compaction);
         let baseline_index = branch.iter().enumerate().rev().find_map(|(i, id)| {
             let e = &self.entries[id];
-            (e.kind == PiEntryKind::Assistant && e.valid_baseline && valid_baseline(&e.usage))
-                .then_some(i)
+            (e.kind == PiEntryKind::Assistant
+                && e.valid_baseline
+                && (!rich_telemetry_supported
+                    || e.assistant_stop_reason
+                        .is_some_and(AssistantStopReason::permits_context_baseline))
+                && valid_baseline(&e.usage))
+            .then_some(i)
         });
         if latest_compaction.is_some_and(|i| baseline_index.is_none_or(|b| b <= i)) {
             append_reason(
@@ -1514,6 +1656,23 @@ impl PiSemantic {
         data.context_history.push(context_tokens);
         data
     }
+}
+
+fn apply_assistant_outcome_validation(
+    data: &mut PiSessionData,
+    outcomes: Option<&AssistantOutcomeProjection>,
+    cost_partial: &mut bool,
+) {
+    if outcomes.is_none_or(|outcomes| outcomes.validates_for_turns(data.turns)) {
+        return;
+    }
+    data.usage_available = false;
+    data.usage_completeness = TelemetryCompleteness::Partial;
+    *cost_partial = true;
+    append_reason(
+        &mut data.usage_reason,
+        "assistant outcome projection is inconsistent",
+    );
 }
 
 fn append_reason(reason: &mut Option<String>, addition: &str) {
@@ -1600,6 +1759,8 @@ fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
         Some(value) => Some(bounded_string(Some(value), MAX_SEMANTIC_METADATA_BYTES)?),
         None => None,
     };
+    let assistant_stop_reason = (kind == PiEntryKind::Assistant)
+        .then(|| parse_assistant_stop_reason(message.and_then(|m| m.get("stopReason"))));
     let context_chars = context_entry_chars(value, message);
     Some(PiEntry {
         parent_id,
@@ -1609,13 +1770,26 @@ fn parse_pi_entry(value: &Value) -> Option<PiEntry> {
         provider,
         model,
         effort,
+        assistant_stop_reason,
+        // Keep the pre-rich-schema error and aborted behavior for v1/v2 base telemetry.
         valid_baseline: !matches!(
-            message
-                .and_then(|m| m.get("stopReason"))
-                .and_then(Value::as_str),
-            Some("aborted") | Some("error")
+            assistant_stop_reason,
+            Some(AssistantStopReason::Error | AssistantStopReason::Aborted)
         ),
     })
+}
+
+fn parse_assistant_stop_reason(value: Option<&Value>) -> AssistantStopReason {
+    match value.and_then(Value::as_str) {
+        Some("stop") => AssistantStopReason::Stop,
+        Some("length") => AssistantStopReason::Length,
+        Some("toolUse") => AssistantStopReason::ToolUse,
+        Some("error") => AssistantStopReason::Error,
+        Some("aborted") => AssistantStopReason::Aborted,
+        Some("deferred") => AssistantStopReason::Deferred,
+        Some("pending") => AssistantStopReason::Pending,
+        _ => AssistantStopReason::Unknown,
+    }
 }
 
 fn parse_usage(value: Option<&Value>) -> UsageObservation {
@@ -3894,8 +4068,8 @@ mod tests {
         let mut semantic = PiSemantic::default();
         for line in [
             r#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}"#,
-            r#"{"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18},"content":[]}}"#,
-            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":7},"content":[]}}"#,
+            r#"{"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"openai","model":"gpt","stopReason":"stop","usage":{"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18},"content":[]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","provider":"openai","model":"gpt","stopReason":"stop","usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":7},"content":[]}}"#,
             r#"{"type":"message","id":"other","parentId":"a","message":{"role":"toolResult","usage":{"input":2,"output":0,"cacheRead":0,"cacheWrite":0},"content":"nested"}}"#,
             r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","usage":{"input":999},"content":[]}}"#,
         ] {
@@ -3988,6 +4162,294 @@ mod tests {
         assert_eq!(data.token_history.len(), 64);
         assert_eq!(data.token_history.first(), Some(&3));
         assert_eq!(data.token_history.last(), Some(&66));
+    }
+
+    #[test]
+    fn assistant_outcomes_are_bounded_private_and_v3_only() {
+        const ERROR_SENTINEL: &str = "ASSISTANT-ERROR-SECRET-37c9";
+        const CONTENT_SENTINEL: &str = "ASSISTANT-CONTENT-SECRET-a1f2";
+        const FUTURE_STOP_SENTINEL: &str = "future-reason";
+        let cases = [
+            (
+                "stop",
+                serde_json::json!("stop"),
+                AssistantStopReason::Stop,
+                true,
+            ),
+            (
+                "length",
+                serde_json::json!("length"),
+                AssistantStopReason::Length,
+                true,
+            ),
+            (
+                "toolUse",
+                serde_json::json!("toolUse"),
+                AssistantStopReason::ToolUse,
+                true,
+            ),
+            (
+                "error",
+                serde_json::json!("error"),
+                AssistantStopReason::Error,
+                false,
+            ),
+            (
+                "aborted",
+                serde_json::json!("aborted"),
+                AssistantStopReason::Aborted,
+                false,
+            ),
+            (
+                "deferred",
+                serde_json::json!("deferred"),
+                AssistantStopReason::Deferred,
+                true,
+            ),
+            (
+                "pending",
+                serde_json::json!("pending"),
+                AssistantStopReason::Pending,
+                false,
+            ),
+            (
+                "future",
+                serde_json::json!(FUTURE_STOP_SENTINEL),
+                AssistantStopReason::Unknown,
+                false,
+            ),
+            ("missing", Value::Null, AssistantStopReason::Unknown, false),
+            ("null", Value::Null, AssistantStopReason::Unknown, false),
+            (
+                "wrong type",
+                serde_json::json!({"reason": "bad"}),
+                AssistantStopReason::Unknown,
+                false,
+            ),
+        ];
+        let mut semantic = PiSemantic::default();
+        for (index, (name, stop_reason, expected, permits_baseline)) in cases.iter().enumerate() {
+            let mut message = serde_json::json!({
+                "role": "assistant",
+                "usage": if index % 2 == 0 {
+                    serde_json::json!({"input": index + 1, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": index as f64}})
+                } else {
+                    Value::Null
+                },
+                "content": [{"type": "text", "text": CONTENT_SENTINEL}],
+                "errorMessage": ERROR_SENTINEL,
+            });
+            if *name != "missing" {
+                message["stopReason"] = stop_reason.clone();
+            }
+            let entry = serde_json::json!({
+                "type": "message",
+                "id": format!("outcome-{index}"),
+                // Put one accepted entry on an abandoned branch.
+                "parentId": if index == 3 { serde_json::json!("outcome-0") } else if index == 4 { serde_json::json!("outcome-1") } else { Value::Null },
+                "message": message,
+            });
+            assert!(semantic.add(&entry), "{name}");
+            assert_eq!(
+                semantic.entries[&format!("outcome-{index}")].assistant_stop_reason,
+                Some(*expected),
+                "{name}"
+            );
+            assert_eq!(
+                expected.permits_context_baseline(),
+                *permits_baseline,
+                "{name}"
+            );
+        }
+
+        // A duplicate assistant ID is accepted as a record but contributes only once.
+        assert!(semantic.add(&serde_json::json!({
+            "type": "message", "id": "outcome-0", "parentId": null,
+            "message": {"role": "assistant", "stopReason": "duplicate-future", "usage": null, "content": []}
+        })));
+        let projection = semantic.assistant_outcome_projection();
+        assert_eq!(
+            projection.counts,
+            AssistantOutcomeCounts {
+                stop: 1,
+                length: 1,
+                tool_use: 1,
+                error: 1,
+                aborted: 1,
+                deferred: 1,
+                pending: 1,
+                unknown: 4,
+            }
+        );
+        assert_eq!(projection.counts.total(), cases.len() as u32);
+        assert_eq!(projection.observations.len(), cases.len());
+        assert!(matches!(
+            projection.observations[1].components,
+            Observation::Invalid
+        ));
+        assert!(matches!(
+            projection.observations[1].reported_cost,
+            Observation::Invalid
+        ));
+        assert!(!format!("{projection:?}").contains(ERROR_SENTINEL));
+        assert!(!format!("{semantic:?}").contains(ERROR_SENTINEL));
+        assert!(!format!("{semantic:?}").contains(CONTENT_SENTINEL));
+        assert!(!format!("{projection:?}").contains(FUTURE_STOP_SENTINEL));
+        assert!(!format!("{semantic:?}").contains(FUTURE_STOP_SENTINEL));
+
+        let mut observation_matrix = PiSemantic::default();
+        for (id, usage) in [
+            ("omitted", None),
+            (
+                "missing-cost",
+                Some(serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4})),
+            ),
+            (
+                "invalid-components",
+                Some(serde_json::json!({"input": "bad", "cost": {"total": 1.5}})),
+            ),
+        ] {
+            let mut message =
+                serde_json::json!({"role": "assistant", "stopReason": "stop", "content": []});
+            if let Some(usage) = usage {
+                message["usage"] = usage;
+            }
+            assert!(observation_matrix.add(&serde_json::json!({
+                "type": "message", "id": id, "parentId": null, "message": message,
+            })));
+        }
+        let matrix = observation_matrix.assistant_outcome_projection();
+        assert!(matches!(
+            matrix.observations[0].components,
+            Observation::Absent
+        ));
+        assert!(matches!(
+            matrix.observations[0].reported_cost,
+            Observation::Absent
+        ));
+        assert!(matches!(
+            matrix.observations[1].components,
+            Observation::Value(_)
+        ));
+        assert!(matches!(
+            matrix.observations[1].reported_cost,
+            Observation::Absent
+        ));
+        assert!(matches!(
+            matrix.observations[2].components,
+            Observation::Invalid
+        ));
+        assert!(matches!(
+            matrix.observations[2].reported_cost,
+            Observation::Value(1.5)
+        ));
+
+        for (index, (name, stop_reason, _, permits_baseline)) in cases.iter().enumerate() {
+            let mut message = serde_json::json!({
+                "role": "assistant",
+                "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "content": []
+            });
+            if *name != "missing" {
+                message["stopReason"] = stop_reason.clone();
+            }
+            let mut one = PiSemantic::default();
+            assert!(one.add(&serde_json::json!({
+                "type": "message", "id": format!("baseline-{index}"), "parentId": null,
+                "message": message,
+            })));
+            assert_eq!(
+                one.session_data_for_version(true, true)
+                    .baseline_tokens
+                    .is_some(),
+                *permits_baseline,
+                "{name}"
+            );
+        }
+
+        // The compatibility history remains complete-only and does not use the rich ring.
+        let data = semantic.session_data_for_version(true, true);
+        assert_eq!(data.turns, cases.len() as u32);
+        assert_eq!(projection.counts.total(), data.turns);
+        assert_eq!(data.token_history, vec![1, 3, 5, 7, 9, 11]);
+        assert!(semantic.session_data_for_version(true, false).token_history == data.token_history);
+
+        // Pending is a rich v3 baseline failure; v1/v2 retain their base behavior.
+        let mut pending = PiSemantic::default();
+        assert!(pending.add(&serde_json::json!({
+            "type": "message", "id": "pending", "parentId": null,
+            "message": {"role": "assistant", "stopReason": "pending", "usage": {"totalTokens": 7}, "content": []}
+        })));
+        assert!(pending
+            .session_data_for_version(true, true)
+            .baseline_tokens
+            .is_none());
+        assert_eq!(
+            pending
+                .session_data_for_version(true, false)
+                .baseline_tokens,
+            Some(7)
+        );
+
+        let mut bounded = PiSemantic::default();
+        for index in 0..66 {
+            let stop_reason = if index % 2 == 0 { "stop" } else { "length" };
+            assert!(bounded.add(&serde_json::json!({
+                "type": "message", "id": format!("bounded-{index}"), "parentId": null,
+                "message": {"role": "assistant", "stopReason": stop_reason, "usage": null, "content": []}
+            })));
+        }
+        let bounded_projection = bounded.assistant_outcome_projection();
+        assert_eq!(bounded_projection.counts.total(), 66);
+        assert_eq!(bounded_projection.observations.len(), 64);
+        for (offset, point) in bounded_projection.observations.iter().enumerate() {
+            let expected = if (offset + 2) % 2 == 0 {
+                AssistantStopReason::Stop
+            } else {
+                AssistantStopReason::Length
+            };
+            assert_eq!(point.stop_reason, expected);
+            assert!(matches!(point.components, Observation::Invalid));
+            assert!(matches!(point.reported_cost, Observation::Invalid));
+        }
+    }
+
+    #[test]
+    fn assistant_outcome_projection_validation_marks_existing_usage_partial() {
+        let mut observations = VecDeque::new();
+        observations.push_back(AssistantObservation {
+            stop_reason: AssistantStopReason::Stop,
+            components: Observation::Absent,
+            reported_cost: Observation::Absent,
+        });
+        let valid = AssistantOutcomeProjection {
+            counts: AssistantOutcomeCounts {
+                stop: 1,
+                ..AssistantOutcomeCounts::default()
+            },
+            observations: observations.clone(),
+        };
+        assert!(valid.validates_for_turns(1));
+
+        let inconsistent = AssistantOutcomeProjection {
+            counts: AssistantOutcomeCounts::default(),
+            observations,
+        };
+        assert!(!inconsistent.validates_for_turns(1));
+        let mut data = PiSessionData {
+            turns: 1,
+            usage_completeness: TelemetryCompleteness::Complete,
+            ..PiSessionData::default()
+        };
+        let mut cost_partial = false;
+        apply_assistant_outcome_validation(&mut data, Some(&inconsistent), &mut cost_partial);
+        assert!(!data.usage_available);
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
+        assert!(cost_partial);
+        assert_eq!(
+            data.usage_reason.as_deref(),
+            Some("assistant outcome projection is inconsistent")
+        );
     }
 
     #[test]
@@ -4133,6 +4595,7 @@ mod tests {
             "parentId": "compaction",
             "message": {
                 "role": "assistant",
+                "stopReason": "stop",
                 "usage": {
                     "input": 5,
                     "output": 6,
@@ -4192,7 +4655,7 @@ mod tests {
         let mut semantic = PiSemantic::default();
         for line in [
             r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","stopReason":"error","usage":{"totalTokens":99},"content":[]}}"#,
-            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5},"content":[]}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","stopReason":"stop","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5},"content":[]}}"#,
         ] {
             semantic.add(&serde_json::from_str(line).unwrap());
         }
@@ -4581,7 +5044,7 @@ mod tests {
             ),
         ] {
             let mut semantic = PiSemantic::default();
-            assert!(semantic.add(&serde_json::json!({"type": "message", "id": "a", "parentId": null, "message": {"role": "assistant", "usage": usage, "content": []}})));
+            assert!(semantic.add(&serde_json::json!({"type": "message", "id": "a", "parentId": null, "message": {"role": "assistant", "stopReason": "stop", "usage": usage, "content": []}})));
             let data = semantic.session_data(true);
             assert_eq!(data.baseline_tokens, baseline);
             assert_eq!(
