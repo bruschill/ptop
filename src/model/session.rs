@@ -423,6 +423,75 @@ pub struct UsageTelemetryDetails {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationStatus {
+    Unavailable,
+    Partial,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TokenComponents {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssistantOutcomeTelemetry {
+    pub status: ReconciliationStatus,
+    pub total: u32,
+    pub stop: u32,
+    pub length: u32,
+    pub tool_use: u32,
+    pub error: u32,
+    pub aborted: u32,
+    pub deferred: u32,
+    pub pending: u32,
+    pub unknown: u32,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComponentReconciliation {
+    pub status: ReconciliationStatus,
+    pub total: Option<TokenComponents>,
+    pub assistant: Option<TokenComponents>,
+    pub unattributed_tool_or_summary: Option<TokenComponents>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReportedCostReconciliation {
+    pub status: ReconciliationStatus,
+    pub total: Option<f64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiAttributionBucket {
+    pub provider: String,
+    pub model: String,
+    pub components: TokenComponents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiAttributionTelemetry {
+    pub named: Vec<PiAttributionBucket>,
+    pub unavailable: TokenComponents,
+    pub overflow: TokenComponents,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PiHarnessTelemetry {
+    pub assistant_outcomes: AssistantOutcomeTelemetry,
+    pub components: ComponentReconciliation,
+    pub reported_cost: ReportedCostReconciliation,
+    pub attribution: Option<PiAttributionTelemetry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionTelemetry {
     pub attachment: AttachmentState,
@@ -434,6 +503,7 @@ pub struct SessionTelemetry {
     pub context_details: ContextTelemetryDetails,
     pub usage_details: UsageTelemetryDetails,
     pub fleet: FleetTelemetry,
+    pub harness: Option<PiHarnessTelemetry>,
 }
 
 impl SessionTelemetry {
@@ -461,6 +531,7 @@ impl SessionTelemetry {
                 observed_at_ms,
                 "owned parent session identity unavailable",
             ),
+            harness: None,
         }
     }
 }

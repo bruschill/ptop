@@ -14,7 +14,8 @@ use crate::app::App;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
     AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails, FleetTelemetry,
-    OrphanPort, SessionStatus, SourceHealth, TelemetryMetadata, UsageTelemetryDetails,
+    OrphanPort, PiHarnessTelemetry, SessionStatus, SourceHealth, TelemetryMetadata,
+    UsageTelemetryDetails,
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,6 +85,7 @@ pub struct SessionTelemetryView {
     /// Local pi-subagents lifecycle metadata. Run aggregates remain separate
     /// from parent transcript totals to avoid adapter double counting.
     pub fleet: FleetTelemetry,
+    pub harness: Option<PiHarnessTelemetry>,
 }
 
 /// A single session, flattened and curated for JSON consumers.
@@ -243,6 +245,7 @@ impl App {
                             metadata: telemetry.usage.clone(),
                         },
                         fleet: telemetry.fleet.clone(),
+                        harness: telemetry.harness.clone(),
                     }
                 }),
             })
@@ -404,6 +407,116 @@ mod tests {
     }
 
     #[test]
+    fn pi_harness_serialized_dto_key_sets_remain_stable() {
+        let components = crate::model::TokenComponents {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+        };
+        let harness = crate::model::PiHarnessTelemetry {
+            assistant_outcomes: crate::model::AssistantOutcomeTelemetry {
+                status: crate::model::ReconciliationStatus::Partial,
+                total: 1,
+                stop: 0,
+                length: 0,
+                tool_use: 1,
+                error: 0,
+                aborted: 0,
+                deferred: 0,
+                pending: 0,
+                unknown: 0,
+                reason: Some("persisted session scan is incomplete".to_string()),
+            },
+            components: crate::model::ComponentReconciliation {
+                status: crate::model::ReconciliationStatus::Partial,
+                total: Some(components),
+                assistant: Some(components),
+                unattributed_tool_or_summary: Some(crate::model::TokenComponents::default()),
+                reason: Some("persisted session scan is incomplete".to_string()),
+            },
+            reported_cost: crate::model::ReportedCostReconciliation {
+                status: crate::model::ReconciliationStatus::Unavailable,
+                total: None,
+                reason: Some("no reported cost observations".to_string()),
+            },
+            attribution: Some(crate::model::PiAttributionTelemetry {
+                named: vec![crate::model::PiAttributionBucket {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                    components,
+                }],
+                unavailable: crate::model::TokenComponents::default(),
+                overflow: crate::model::TokenComponents::default(),
+            }),
+        };
+        let json = serde_json::to_value(harness).unwrap();
+
+        assert_eq!(
+            sorted_keys(&json),
+            vec![
+                "assistant_outcomes",
+                "attribution",
+                "components",
+                "reported_cost",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["assistant_outcomes"]),
+            vec![
+                "aborted", "deferred", "error", "length", "pending", "reason", "status", "stop",
+                "tool_use", "total", "unknown",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["components"]),
+            vec![
+                "assistant",
+                "reason",
+                "status",
+                "total",
+                "unattributed_tool_or_summary",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["reported_cost"]),
+            vec!["reason", "status", "total"]
+        );
+        assert_eq!(
+            sorted_keys(&json["attribution"]),
+            vec!["named", "overflow", "unavailable"]
+        );
+        assert_eq!(
+            sorted_keys(&json["attribution"]["named"][0]),
+            vec!["components", "model", "provider"]
+        );
+        for value in [
+            &json["components"]["total"],
+            &json["components"]["assistant"],
+            &json["components"]["unattributed_tool_or_summary"],
+            &json["attribution"]["named"][0]["components"],
+            &json["attribution"]["unavailable"],
+            &json["attribution"]["overflow"],
+        ] {
+            assert_eq!(
+                sorted_keys(value),
+                vec![
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                ]
+            );
+        }
+        assert_eq!(json["assistant_outcomes"]["status"], "partial");
+        assert_eq!(json["reported_cost"]["status"], "unavailable");
+        assert!(json["reported_cost"]["total"].is_null());
+        assert!(json["components"]["total"]["input_tokens"]
+            .as_u64()
+            .is_some());
+    }
+
+    #[test]
     fn pi_snapshot_serialized_dto_key_sets_remain_stable() {
         let json = serde_json::to_value(demo_app().to_snapshot(2_000)).unwrap();
         let session = &json["sessions"][0];
@@ -464,10 +577,12 @@ mod tests {
                 "context",
                 "error",
                 "fleet",
+                "harness",
                 "source_health",
                 "usage",
             ]
         );
+        assert!(telemetry["harness"].is_null());
         assert_eq!(
             sorted_keys(&telemetry["context"]),
             vec![

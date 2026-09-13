@@ -7,9 +7,11 @@ use crate::herdr::HerdrProcessMarker;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use crate::herdr::{process_herdr_marker, run_bounded_herdr_json};
 use crate::model::{
-    AgentSession, AttachmentConfidence, AttachmentState, ChildProcess, ContextTelemetryDetails,
-    FleetTelemetry, SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness,
-    TelemetryMetadata, TelemetryPrecision, UsageTelemetryDetails,
+    AgentSession, AssistantOutcomeTelemetry, AttachmentConfidence, AttachmentState, ChildProcess,
+    ComponentReconciliation, ContextTelemetryDetails, FleetTelemetry, PiAttributionBucket,
+    PiAttributionTelemetry, PiHarnessTelemetry, ReconciliationStatus, ReportedCostReconciliation,
+    SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness, TelemetryMetadata,
+    TelemetryPrecision, TokenComponents, UsageTelemetryDetails,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -424,6 +426,7 @@ struct PiSessionData {
     context_reason: Option<String>,
     usage_reason: Option<String>,
     usage_available: bool,
+    harness: Option<PiHarnessTelemetry>,
 }
 
 impl Default for PiSessionData {
@@ -451,6 +454,7 @@ impl Default for PiSessionData {
             context_reason: None,
             usage_reason: None,
             usage_available: true,
+            harness: None,
         }
     }
 }
@@ -937,7 +941,7 @@ impl PiCollector {
                 tail.last_successful_parse_at_ms,
             )
         };
-        data.context_window = self.resolve_context_window(attachment);
+        data.context_window = self.resolve_context_window(attachment, &data.provider, &data.model);
         if data.context_tokens.is_none() {
             data.context_precision = TelemetryPrecision::Unknown;
         }
@@ -1011,21 +1015,19 @@ impl PiCollector {
                     observed_at_ms,
                     "pi-subagents status root unavailable",
                 ),
+                harness: data.harness.clone(),
             },
             data,
         ))
     }
 
-    fn resolve_context_window(&mut self, attachment: &PiAttachment) -> Option<u64> {
-        let tail = self.tails.get(&attachment.path)?;
-        let data = tail.semantic.session_data_for_version(
-            tail.complete
-                && !tail.parse_limited
-                && !tail.semantic.limited
-                && !tail.semantic.invalid,
-            tail.supports_rich_telemetry(),
-        );
-        if data.provider.is_empty() || data.model.is_empty() {
+    fn resolve_context_window(
+        &mut self,
+        attachment: &PiAttachment,
+        provider: &str,
+        model: &str,
+    ) -> Option<u64> {
+        if provider.is_empty() || model.is_empty() {
             return None;
         }
         let root = pi_agent_root(&attachment.path)?;
@@ -1034,7 +1036,7 @@ impl PiCollector {
         if catalog.unavailable {
             return None;
         }
-        model_window_from_catalog(catalog, &data.provider, &data.model)
+        model_window_from_catalog(catalog, provider, model)
     }
 
     #[cfg(test)]
@@ -1974,6 +1976,7 @@ impl PiSemantic {
             );
         }
         apply_parent_harness_validation(&mut data, &parent, rich_telemetry_supported);
+        data.harness = validated_public_harness(&parent, context_complete, self);
         if !context_complete {
             data.context_completeness = TelemetryCompleteness::Partial;
             return data;
@@ -2100,6 +2103,165 @@ fn apply_parent_harness_validation(
         &mut data.usage_reason,
         "parent harness telemetry projection is inconsistent",
     );
+}
+
+fn token_components(components: ComponentUsage) -> TokenComponents {
+    TokenComponents {
+        input_tokens: components.input,
+        output_tokens: components.output,
+        cache_read_tokens: components.cache_read,
+        cache_write_tokens: components.cache_write,
+    }
+}
+
+fn reconciliation_status(
+    completeness: TelemetryCompleteness,
+    available: bool,
+) -> ReconciliationStatus {
+    if !available {
+        ReconciliationStatus::Unavailable
+    } else if completeness == TelemetryCompleteness::Complete {
+        ReconciliationStatus::Complete
+    } else {
+        ReconciliationStatus::Partial
+    }
+}
+
+fn bounded_reason(reason: Option<String>) -> Option<String> {
+    reason
+        .map(|reason| {
+            let mut bounded = String::new();
+            for phrase in reason.split("; ") {
+                if bounded.split("; ").any(|seen| seen == phrase) {
+                    continue;
+                }
+                let separator = if bounded.is_empty() { "" } else { "; " };
+                if bounded.len() + separator.len() + phrase.len() > MAX_TELEMETRY_ERROR_BYTES {
+                    break;
+                }
+                bounded.push_str(separator);
+                bounded.push_str(phrase);
+            }
+            bounded
+        })
+        .filter(|reason| !reason.is_empty())
+}
+
+fn validated_public_harness(
+    parent: &ParentHarnessTelemetry,
+    context_complete: bool,
+    semantic: &PiSemantic,
+) -> Option<PiHarnessTelemetry> {
+    parent
+        .validates()
+        .then(|| public_harness_telemetry(parent, context_complete, semantic))
+}
+
+fn public_harness_telemetry(
+    parent: &ParentHarnessTelemetry,
+    context_complete: bool,
+    semantic: &PiSemantic,
+) -> PiHarnessTelemetry {
+    let scan_partial =
+        !context_complete || semantic.limited || semantic.invalid || semantic.duplicate_ids;
+    let outcomes_status = if scan_partial {
+        ReconciliationStatus::Partial
+    } else {
+        ReconciliationStatus::Complete
+    };
+    let outcome_reason = scan_partial.then(|| "persisted session scan is incomplete".to_string());
+    let mut components_status =
+        reconciliation_status(parent.component_completeness, parent.component_available);
+    if scan_partial && components_status == ReconciliationStatus::Complete {
+        components_status = ReconciliationStatus::Partial;
+    }
+    let components_available = components_status != ReconciliationStatus::Unavailable;
+    let component_reason = bounded_reason(if scan_partial {
+        Some("persisted session scan is incomplete".to_string())
+    } else {
+        parent.usage_reason.clone()
+    });
+    let (cost_status, cost_total, cost_reason) = match parent.reported_cost {
+        ReportedCostState::Complete(total) => (ReconciliationStatus::Complete, Some(total), None),
+        ReportedCostState::Partial => (
+            ReconciliationStatus::Partial,
+            None,
+            Some(
+                if scan_partial {
+                    "persisted session scan is incomplete"
+                } else {
+                    "an expected reported cost is unavailable"
+                }
+                .to_string(),
+            ),
+        ),
+        ReportedCostState::Unavailable => (
+            ReconciliationStatus::Unavailable,
+            None,
+            Some("no reported cost observations".to_string()),
+        ),
+    };
+    let mut named: Vec<_> = parent
+        .attribution
+        .named
+        .iter()
+        .map(|(key, components)| PiAttributionBucket {
+            provider: key.provider.clone(),
+            model: key.model.clone(),
+            components: token_components(*components),
+        })
+        .collect();
+    named.sort_by(|left, right| {
+        let left_total = left
+            .components
+            .input_tokens
+            .saturating_add(left.components.output_tokens)
+            .saturating_add(left.components.cache_read_tokens)
+            .saturating_add(left.components.cache_write_tokens);
+        let right_total = right
+            .components
+            .input_tokens
+            .saturating_add(right.components.output_tokens)
+            .saturating_add(right.components.cache_read_tokens)
+            .saturating_add(right.components.cache_write_tokens);
+        right_total
+            .cmp(&left_total)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    PiHarnessTelemetry {
+        assistant_outcomes: AssistantOutcomeTelemetry {
+            status: outcomes_status,
+            total: parent.assistant_outcomes.counts.total(),
+            stop: parent.assistant_outcomes.counts.stop,
+            length: parent.assistant_outcomes.counts.length,
+            tool_use: parent.assistant_outcomes.counts.tool_use,
+            error: parent.assistant_outcomes.counts.error,
+            aborted: parent.assistant_outcomes.counts.aborted,
+            deferred: parent.assistant_outcomes.counts.deferred,
+            pending: parent.assistant_outcomes.counts.pending,
+            unknown: parent.assistant_outcomes.counts.unknown,
+            reason: bounded_reason(outcome_reason),
+        },
+        components: ComponentReconciliation {
+            status: components_status,
+            total: components_available.then(|| token_components(parent.component_total)),
+            assistant: components_available.then(|| token_components(parent.assistant_total)),
+            unattributed_tool_or_summary: components_available
+                .then(|| token_components(parent.unattributed_tool_or_summary_total)),
+            reason: component_reason,
+        },
+        reported_cost: ReportedCostReconciliation {
+            status: cost_status,
+            total: cost_total,
+            reason: bounded_reason(cost_reason),
+        },
+        attribution: components_available.then(|| PiAttributionTelemetry {
+            named,
+            unavailable: token_components(parent.attribution.unavailable),
+            overflow: token_components(parent.attribution.overflow),
+        }),
+    }
 }
 
 fn append_reason(reason: &mut Option<String>, addition: &str) {
@@ -4689,6 +4851,102 @@ mod tests {
     }
 
     #[test]
+    fn attachment_public_harness_availability_is_version_gated() {
+        for version in [1, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let id = format!("version-{version}");
+            let path = dir.path().join("session.jsonl");
+            fs::write(&path, session_header_with_version(&id, &cwd, version)).unwrap();
+            let attachment = PiAttachment {
+                path: path.clone(),
+                session_id: id,
+                start_id: None,
+                version,
+                header_cwd: cwd,
+                identity: file_identity(&path).unwrap(),
+            };
+            let mut collector = PiCollector::new();
+            let mut budget = MAX_TAIL_WORK_BYTES;
+            let (telemetry, data) = collector
+                .telemetry_for_attachment(&attachment, 1, &mut budget)
+                .unwrap();
+            assert_eq!(telemetry.harness.is_some(), version == 3, "v{version}");
+            assert_eq!(data.harness.is_some(), version == 3, "v{version}");
+            if version == 3 {
+                let harness = telemetry.harness.unwrap();
+                assert_eq!(harness.components.status, ReconciliationStatus::Complete);
+                assert_eq!(harness.components.total, Some(TokenComponents::default()));
+            }
+        }
+    }
+
+    #[test]
+    fn collector_harness_snapshot_preserves_partial_and_unavailable_nulls() {
+        for (id, entry, expected_status, expected_total) in [
+            (
+                "partial",
+                serde_json::json!({"type":"message","id":"one","parentId":null,"message":{"role":"assistant","provider":"p","model":"m","usage":{"input":7,"output":0,"cacheRead":0,"cacheWrite":0}}}),
+                "partial",
+                Some(7_u64),
+            ),
+            (
+                "unavailable",
+                serde_json::json!({"type":"message","id":"one","parentId":null,"message":{"role":"assistant"}}),
+                "unavailable",
+                None,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let path = session_file(&dir, id, &cwd);
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{entry}").unwrap();
+            if id == "partial" {
+                writeln!(file, "{}", serde_json::json!({"type":"message","id":"two","parentId":"one","message":{"role":"assistant"}})).unwrap();
+            }
+            drop(file);
+            let attachment = PiAttachment {
+                path: path.clone(),
+                session_id: id.into(),
+                start_id: None,
+                version: 3,
+                header_cwd: cwd,
+                identity: file_identity(&path).unwrap(),
+            };
+            let mut collector = PiCollector::new();
+            let mut budget = MAX_TAIL_WORK_BYTES;
+            let (telemetry, data) = collector
+                .telemetry_for_attachment(&attachment, 1, &mut budget)
+                .unwrap();
+            let mut app = crate::app::App::new(
+                crate::theme::Theme::default(),
+                crate::config::PanelVisibility::default(),
+            );
+            app.sessions.push(session_from_data(&data, telemetry));
+            let harness = serde_json::to_value(app.to_snapshot(2_000)).unwrap()["sessions"][0]
+                ["telemetry"]["harness"]
+                .clone();
+            assert_eq!(harness["components"]["status"], expected_status, "{id}");
+            match expected_total {
+                Some(total) => assert_eq!(
+                    harness["components"]["total"]["input_tokens"], total,
+                    "{id}"
+                ),
+                None => {
+                    assert!(harness["components"]["total"].is_null(), "{id}");
+                    assert!(harness["components"]["assistant"].is_null(), "{id}");
+                    assert!(
+                        harness["components"]["unattributed_tool_or_summary"].is_null(),
+                        "{id}"
+                    );
+                    assert!(harness["attribution"].is_null(), "{id}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn semantic_token_history_keeps_the_latest_64_assistant_turns() {
         let mut semantic = PiSemantic::default();
         for index in 0..66 {
@@ -5352,6 +5610,169 @@ mod tests {
     }
 
     #[test]
+    fn public_harness_conversion_covers_version_availability_and_reconciliation() {
+        let empty = PiSemantic::default();
+        assert!(empty
+            .session_data_for_version(true, false)
+            .harness
+            .is_none());
+        assert!(empty.session_data_for_version(true, true).harness.is_some());
+        let known_empty = empty.session_data_for_version(true, true).harness.unwrap();
+        assert_eq!(
+            known_empty.components.status,
+            ReconciliationStatus::Complete
+        );
+        assert_eq!(
+            known_empty.components.total,
+            Some(TokenComponents::default())
+        );
+        assert_eq!(
+            known_empty.reported_cost.status,
+            ReconciliationStatus::Unavailable
+        );
+
+        let mut partial = PiSemantic::default();
+        assert!(partial.add(&serde_json::json!({
+            "type": "message", "id": "complete", "parentId": null,
+            "message": {"role": "assistant", "provider": "z", "model": "m", "stopReason": "stop",
+                "usage": {"input": 4, "output": 3, "cacheRead": 2, "cacheWrite": 1}}
+        })));
+        assert!(partial.add(&serde_json::json!({
+            "type": "message", "id": "missing", "parentId": "complete",
+            "message": {"role": "assistant", "stopReason": "length"}
+        })));
+        let partial_harness = partial
+            .session_data_for_version(true, true)
+            .harness
+            .unwrap();
+        assert_eq!(
+            partial_harness.components.status,
+            ReconciliationStatus::Partial
+        );
+        assert_eq!(partial_harness.components.total.unwrap().input_tokens, 4);
+        assert_eq!(
+            partial_harness.reported_cost.status,
+            ReconciliationStatus::Partial
+        );
+        assert_eq!(partial_harness.attribution.unwrap().named[0].provider, "z");
+
+        let mut unavailable = PiSemantic::default();
+        assert!(unavailable.add(&serde_json::json!({
+            "type": "message", "id": "missing", "parentId": null,
+            "message": {"role": "assistant", "stopReason": "stop"}
+        })));
+        let unavailable = unavailable
+            .session_data_for_version(true, true)
+            .harness
+            .unwrap();
+        assert_eq!(
+            unavailable.components.status,
+            ReconciliationStatus::Unavailable
+        );
+        assert!(unavailable.components.total.is_none());
+        assert!(unavailable.components.assistant.is_none());
+        assert!(unavailable
+            .components
+            .unattributed_tool_or_summary
+            .is_none());
+        assert!(unavailable.attribution.is_none());
+    }
+
+    #[test]
+    fn public_harness_conversion_keeps_component_and_cost_coverage_independent() {
+        let mut components_complete = PiSemantic::default();
+        assert!(components_complete.add(&serde_json::json!({
+            "type": "message", "id": "components", "parentId": null,
+            "message": {"role": "assistant", "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4}}
+        })));
+        let first = components_complete
+            .session_data_for_version(true, true)
+            .harness
+            .unwrap();
+        assert_eq!(first.components.status, ReconciliationStatus::Complete);
+        assert_eq!(first.reported_cost.status, ReconciliationStatus::Partial);
+
+        let mut cost_complete = PiSemantic::default();
+        assert!(cost_complete.add(&serde_json::json!({
+            "type": "message", "id": "cost", "parentId": null,
+            "message": {"role": "assistant", "usage": {"input": "bad", "cost": {"total": 1.25}}}
+        })));
+        let second = cost_complete
+            .session_data_for_version(true, true)
+            .harness
+            .unwrap();
+        assert_eq!(second.components.status, ReconciliationStatus::Unavailable);
+        assert_eq!(second.reported_cost.status, ReconciliationStatus::Complete);
+        assert_eq!(second.reported_cost.total, Some(1.25));
+    }
+
+    #[test]
+    fn public_harness_conversion_sorts_attribution_and_bounds_reasons() {
+        let mut semantic = PiSemantic::default();
+        for (id, provider, model, input) in [
+            ("one", "z", "m", 2),
+            ("two", "a", "z", 5),
+            ("three", "a", "a", 5),
+        ] {
+            assert!(semantic.add(&serde_json::json!({
+                "type": "message", "id": id, "parentId": null,
+                "message": {"role": "assistant", "provider": provider, "model": model,
+                    "usage": {"input": input, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.0}}}
+            })));
+        }
+        let harness = semantic
+            .session_data_for_version(true, true)
+            .harness
+            .unwrap();
+        let named = &harness.attribution.unwrap().named;
+        assert_eq!(
+            named
+                .iter()
+                .map(|bucket| (bucket.provider.as_str(), bucket.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "a"), ("a", "z"), ("z", "m")]
+        );
+        let reason = bounded_reason(Some(format!(
+            "{}; {}; {}; {}",
+            "a".repeat(80),
+            "a".repeat(80),
+            "b".repeat(80),
+            "c".repeat(80)
+        )))
+        .unwrap();
+        assert!(reason.len() <= MAX_TELEMETRY_ERROR_BYTES);
+        assert_eq!(reason.matches(&"a".repeat(80)).count(), 1);
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn inconsistent_parent_harness_projection_is_not_public() {
+        let mut parent = ParentHarnessTelemetry {
+            component_total: ComponentUsage::default(),
+            component_completeness: TelemetryCompleteness::Complete,
+            component_available: true,
+            usage_reason: None,
+            reported_cost: ReportedCostState::Unavailable,
+            assistant_total: ComponentUsage::default(),
+            unattributed_tool_or_summary_total: ComponentUsage::default(),
+            accepted_assistant_count: 1,
+            assistant_outcomes: AssistantOutcomeProjection {
+                counts: AssistantOutcomeCounts::default(),
+                observations: VecDeque::new(),
+            },
+            attribution: BoundedAttributionBreakdown::default(),
+            assistant_points: VecDeque::new(),
+            summary_events: VecDeque::new(),
+            accepted_summary_event_count: 0,
+            compatibility_token_history: VecDeque::new(),
+        };
+        assert!(!parent.validates());
+        assert!(validated_public_harness(&parent, true, &PiSemantic::default()).is_none());
+        parent.accepted_assistant_count = 0;
+        assert!(parent.validates());
+    }
+
+    #[test]
     fn parent_harness_validation_is_release_safe() {
         let mut telemetry = ParentHarnessTelemetry {
             component_total: ComponentUsage::default(),
@@ -5622,6 +6043,8 @@ mod tests {
         const FIRST_KEPT_SENTINEL: &str = "RICH-FIRST-KEPT-SECRET-81a6";
         const FROM_ID_SENTINEL: &str = "RICH-FROM-ID-SECRET-3f70";
         const DEBUG_LABEL_SENTINEL: &str = "RICH-DEBUG-LABEL-SECRET-8be2";
+        const ENTRY_ID_SENTINEL: &str = "RICH-ENTRY-ID-SECRET-49ef";
+        const PARENT_ID_SENTINEL: &str = "RICH-PARENT-ID-SECRET-bc71";
         let private_strings = [
             CONTENT_SENTINEL,
             ERROR_SENTINEL,
@@ -5632,15 +6055,13 @@ mod tests {
             FIRST_KEPT_SENTINEL,
             FROM_ID_SENTINEL,
             DEBUG_LABEL_SENTINEL,
+            ENTRY_ID_SENTINEL,
+            PARENT_ID_SENTINEL,
             "ParentHarnessTelemetry",
             "AssistantOutcomeCounts",
             "BoundedAttributionBreakdown",
-            "assistant_outcomes",
             "assistant_points",
             "summary_events",
-            "attribution",
-            "attribution.unavailable",
-            "attribution.overflow",
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -5665,7 +6086,7 @@ mod tests {
                 file,
                 "{}",
                 serde_json::json!({
-                    "type": "message", "id": format!("named-{index}"), "parentId": null,
+                    "type": "message", "id": if index == 0 { ENTRY_ID_SENTINEL.to_string() } else { format!("named-{index}") }, "parentId": null,
                     "debugLabel": DEBUG_LABEL_SENTINEL,
                     "message": {
                         "role": "assistant", "provider": format!("provider-{index}"),
@@ -5682,7 +6103,7 @@ mod tests {
             file,
             "{}",
             serde_json::json!({
-                "type": "message", "id": "unavailable", "parentId": null,
+                "type": "message", "id": "unavailable", "parentId": PARENT_ID_SENTINEL,
                 "message": {
                     "role": "assistant", "provider": "provider", "model": "model",
                     "responseModel": {"raw": "invalid"}, "stopReason": "error",
@@ -5721,6 +6142,11 @@ mod tests {
             .telemetry_for_attachment(&attachment, 1, &mut budget)
             .unwrap();
         let semantic = &collector.tails[&path].semantic;
+        assert_eq!(
+            semantic.rich_reduction_calls.get(),
+            1,
+            "attachment refresh must build rich telemetry once"
+        );
         let parent = semantic.parent_harness_telemetry(true);
         assert_eq!(parent.attribution.named.len(), MAX_NAMED_ATTRIBUTION_KEYS);
         assert_eq!(parent.attribution.unavailable.input, 1);
@@ -5738,9 +6164,29 @@ mod tests {
         app.sessions.push(session_from_data(&data, telemetry));
         let snapshot = serde_json::to_value(app.to_snapshot(2_000)).unwrap();
         let snapshot_text = snapshot.to_string();
+        let harness = &snapshot["sessions"][0]["telemetry"]["harness"];
+        assert_eq!(harness["assistant_outcomes"]["status"], "complete");
+        assert_eq!(harness["assistant_outcomes"]["total"], 66);
+        assert_eq!(harness["components"]["status"], "complete");
+        assert_eq!(harness["reported_cost"]["status"], "complete");
+        assert!(harness.get("assistant_points").is_none());
+        assert!(harness.get("summary_events").is_none());
         let mut text_output = Vec::new();
         crate::write_snapshot(&mut text_output, &app).unwrap();
         let text_output = String::from_utf8(text_output).unwrap();
+        // `--once` already has a legacy `reported cost:` field. These are the
+        // exact new harness labels/forms and must remain absent.
+        for label in [
+            "Outcomes",
+            "Models",
+            "Usage components",
+            "reported cost complete",
+        ] {
+            assert!(
+                !text_output.contains(label),
+                "--once text exposed harness label {label}"
+            );
+        }
         for private in private_strings {
             assert!(
                 !snapshot_text.contains(private),
