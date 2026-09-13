@@ -23,7 +23,7 @@ fn get_entries() -> Vec<(String, String)> {
         ("  v".to_string(), t("help.view_menu")),
         ("  c".to_string(), t("help.open_config")),
         ("  t".to_string(), t("help.cycle_theme")),
-        ("  1-5".to_string(), t("help.toggle_panels")),
+        ("  1-6".to_string(), t("help.toggle_panels")),
         (t("help.help"), String::new()),
         ("  ?".to_string(), t("help.this_help")),
     ]

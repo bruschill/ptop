@@ -403,7 +403,7 @@ fn handle_key_press(
     } else if app.view_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
-            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='6') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
         }
@@ -441,7 +441,7 @@ fn handle_key_press(
             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
             KeyCode::Char('t') => app.cycle_theme(),
-            KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='6') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
             KeyCode::Char('?') => app.toggle_help(),
@@ -1054,6 +1054,29 @@ mod tests {
         telemetry.usage.completeness = TelemetryCompleteness::Partial;
         assert_eq!(format_context_value(session), "≈ 42%");
         assert_eq!(format_token_value(session), "≈14+");
+    }
+
+    #[test]
+    fn runs_key_toggles_visibility_in_normal_and_view_modes() {
+        let mut app = App::new(theme::Theme::default(), config::PanelVisibility::default());
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            true,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert!(!app.show_runs);
+
+        app.view_open = true;
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            true,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert!(app.show_runs);
     }
 
     #[test]

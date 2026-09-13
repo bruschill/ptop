@@ -385,7 +385,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 ports::draw_ports_panel(f, app, *area, theme)
             }
             DesktopPanel::Runs => runs::draw_runs_panel(f, app, *area, theme),
-            DesktopPanel::Narrow(NarrowSection::Sessions | NarrowSection::Context) => {}
+            DesktopPanel::Narrow(
+                NarrowSection::Sessions | NarrowSection::Context | NarrowSection::Runs,
+            ) => {}
         }
     }
 
@@ -413,7 +415,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     if app.show_ports {
         mid_sections.push(DesktopPanel::Narrow(NarrowSection::Ports));
     }
-    if app.show_sessions && area.width >= RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
+    if app.show_runs && (area.width >= RUNS_PROMOTION_WIDTH || !app.show_sessions) {
         mid_sections.push(DesktopPanel::Runs);
     }
 
@@ -421,7 +423,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let mid_h_ideal: u16 = 9;
     let sessions_ideal: u16 = if app.show_sessions {
         let base = (app.sessions.len() as u16 * 2 + 7).max(8);
-        if area.width < RUNS_PROMOTION_WIDTH && runs::selected_has_runs(app) {
+        if app.show_runs && area.width < RUNS_PROMOTION_WIDTH {
             base.saturating_add(7)
         } else {
             base
@@ -631,8 +633,19 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
         return vec![(sections[0], area)];
     }
 
-    let count = sections.len() as u32;
-    let constraints: Vec<Constraint> = (0..count).map(|_| Constraint::Ratio(1, count)).collect();
+    let constraints: Vec<Constraint> = if tab == NarrowTab::Work
+        && sections.first() == Some(&NarrowSection::Sessions)
+        && sections.len() > 1
+    {
+        // Keep enough Session height for its selected-detail area while Work
+        // also exposes Projects and Runs on compact terminals.
+        let mut constraints = vec![Constraint::Length(10)];
+        constraints.extend((1..sections.len()).map(|_| Constraint::Min(5)));
+        constraints
+    } else {
+        let count = sections.len() as u32;
+        (0..count).map(|_| Constraint::Ratio(1, count)).collect()
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -659,6 +672,7 @@ fn draw_narrow_section(
         NarrowSection::Context => context::draw_context_panel_active(f, app, area, theme, active),
         NarrowSection::Tokens => tokens::draw_tokens_panel_active(f, app, area, theme, active),
         NarrowSection::Ports => ports::draw_ports_panel_active(f, app, area, theme, active),
+        NarrowSection::Runs => runs::draw_runs_panel_active(f, app, area, theme, active),
     }
 }
 
@@ -1373,6 +1387,94 @@ mod tests {
             assert!(
                 text.contains("Turns:") && text.contains("Avg:"),
                 "compact token panel clipped turn statistics at {width}x{height}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn runs_visibility_applies_to_wide_compact_and_narrow_layouts() {
+        let mut app = pi_fleet_app();
+        for (width, height) in [(140, 40), (100, 24), (80, 24)] {
+            if width < DESKTOP_WIDTH {
+                app.set_narrow_tab(NarrowTab::Work);
+            }
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                if width >= RUNS_PROMOTION_WIDTH {
+                    text.contains("⁶runs")
+                } else {
+                    text.contains("run-wide")
+                },
+                "runs missing at {width}x{height}\\n{text}"
+            );
+        }
+
+        app.show_runs = false;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("⁶runs"));
+    }
+
+    #[test]
+    fn desktop_runs_stays_independent_without_sessions_below_promotion_width() {
+        let mut app = pi_fleet_app();
+        app.show_sessions = false;
+        for width in [100, 139] {
+            let layout = desktop_layout(&app, Rect::new(0, 0, width, 30));
+            assert!(layout.sessions.is_none());
+            assert!(layout
+                .mid
+                .iter()
+                .any(|(panel, _)| *panel == DesktopPanel::Runs));
+        }
+    }
+
+    #[test]
+    fn narrow_sessions_remain_visible_when_the_desktop_setting_is_off() {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.show_sessions = false;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("sessions"),
+            "narrow layout hid all sessions\\n{text}"
+        );
+        assert!(text.contains("πPI"), "narrow layout hid Pi rows\\n{text}");
+    }
+
+    #[test]
+    fn embedded_runs_stay_visible_on_short_desktop_layouts() {
+        for width in [100, 139] {
+            let text = render_pi_fleet(width, 18);
+            assert!(
+                text.contains("Fleet healthy"),
+                "embedded Runs state missing at {width}x18\\n{text}"
+            );
+            assert!(
+                !text.contains("⁶runs"),
+                "Runs must stay embedded at {width}x18\\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_runs_show_no_session_state_at_supported_desktop_sizes() {
+        for (width, height) in [(100, 18), (139, 18), (100, 30), (139, 30)] {
+            let app = App::new(Theme::default(), PanelVisibility::default());
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("no Pi session selected"),
+                "embedded Runs no-session state missing at {width}x{height}\\n{text}"
             );
         }
     }

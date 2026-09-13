@@ -64,7 +64,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.cycle_theme", "cycle theme");
     m.insert(
         "help.toggle_panels",
-        "toggle panels (context/tokens/projects/ports/sessions)",
+        "toggle panels (context/tokens/projects/ports/sessions/runs)",
     );
     m.insert("help.this_help", "this help");
 
@@ -91,6 +91,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("view.projects_panel", "projects panel");
     m.insert("view.ports_panel", "ports panel");
     m.insert("view.sessions_panel", "sessions panel");
+    m.insert("view.runs_panel", "runs panel");
     m.insert("view.cycle_theme", "cycle theme");
     m.insert("view.key_toggle", "key = toggle  ·  Esc = close ");
 
@@ -145,6 +146,24 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.projects_panel", "Projects panel (3)");
     m.insert("config.ports_panel", "Ports panel (4)");
     m.insert("config.sessions_panel", "Sessions panel (5)");
+    m.insert("config.runs_panel", "Runs panel (6)");
+
+    // Runs panel
+    m.insert("runs.title", "runs");
+    m.insert("runs.no_session_selected", "no Pi session selected");
+    m.insert("runs.not_installed", "pi-subagents is not installed");
+    m.insert(
+        "runs.no_runs",
+        "pi-subagents is installed; no runs for this session",
+    );
+    m.insert(
+        "runs.telemetry_unavailable",
+        "pi-subagents telemetry is unavailable or stale",
+    );
+    m.insert(
+        "runs.unsupported_lifecycle",
+        "unsupported pi-subagents lifecycle version",
+    );
 
     // Terminal size too small
     m.insert("term.too_small", "Terminal size too small:");
@@ -209,7 +228,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.cycle_theme", "切换主题");
     m.insert(
         "help.toggle_panels",
-        "切换面板 (上下文/词元/项目/端口/会话)",
+        "切换面板 (上下文/词元/项目/端口/会话/运行)",
     );
     m.insert("help.this_help", "显示帮助");
 
@@ -236,6 +255,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("view.projects_panel", "项目面板");
     m.insert("view.ports_panel", "端口面板");
     m.insert("view.sessions_panel", "会话面板");
+    m.insert("view.runs_panel", "运行面板");
     m.insert("view.cycle_theme", "切换主题");
     m.insert("view.key_toggle", "按键切换  ·  Esc 关闭 ");
 
@@ -290,6 +310,21 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.projects_panel", "项目面板 (3)");
     m.insert("config.ports_panel", "端口面板 (4)");
     m.insert("config.sessions_panel", "会话面板 (5)");
+    m.insert("config.runs_panel", "运行面板 (6)");
+
+    // Runs panel
+    m.insert("runs.title", "运行");
+    m.insert("runs.no_session_selected", "未选择 Pi 会话");
+    m.insert("runs.not_installed", "未安装 pi-subagents");
+    m.insert("runs.no_runs", "已安装 pi-subagents；此会话没有运行");
+    m.insert(
+        "runs.telemetry_unavailable",
+        "pi-subagents 遥测不可用或已过期",
+    );
+    m.insert(
+        "runs.unsupported_lifecycle",
+        "不支持的 pi-subagents 生命周期版本",
+    );
 
     // Terminal size too small
     m.insert("term.too_small", "终端尺寸过小:");
