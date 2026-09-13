@@ -41,6 +41,7 @@ const HEADER_READ_CHUNK_BYTES: usize = 4096;
 const MAX_TELEMETRY_ERROR_BYTES: usize = 160;
 const MAX_SEMANTIC_ENTRIES: usize = 8_192;
 const MAX_TOKEN_HISTORY_POINTS: usize = 64;
+const MAX_SUMMARY_OBSERVATIONS: usize = 64;
 const MAX_NAMED_ATTRIBUTION_KEYS: usize = 64;
 const MAX_SEMANTIC_ID_BYTES: usize = 256;
 const MAX_SEMANTIC_PARENT_BYTES: usize = 256;
@@ -146,6 +147,7 @@ struct PiEntry {
     effort: Option<String>,
     assistant_stop_reason: Option<AssistantStopReason>,
     assistant_metadata: Option<AssistantMetadata>,
+    summary_observation: Option<SummaryObservation>,
     valid_baseline: bool,
 }
 
@@ -156,6 +158,21 @@ enum PiEntryKind {
     Compaction,
     BranchSummary,
     Other,
+}
+
+/// Privacy-safe kind of a persisted Pi summary event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryKind {
+    Compaction,
+    BranchSummary,
+}
+
+/// Bounded private reduction of one persisted Pi summary event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SummaryObservation {
+    kind: SummaryKind,
+    tokens_before: Observation<u64>,
+    usage: UsageObservation,
 }
 
 /// Fixed, privacy-safe reduction of Pi's assistant stop reason.
@@ -266,6 +283,8 @@ struct ParentHarnessTelemetry {
     assistant_outcomes: AssistantOutcomeProjection,
     attribution: BoundedAttributionBreakdown,
     assistant_points: VecDeque<AssistantObservation>,
+    summary_events: VecDeque<SummaryObservation>,
+    accepted_summary_event_count: u32,
     compatibility_token_history: VecDeque<u64>,
 }
 
@@ -309,6 +328,9 @@ impl ParentHarnessTelemetry {
         self.assistant_outcomes
             .validates_for_turns(self.accepted_assistant_count)
             && self.assistant_points == self.assistant_outcomes.observations
+            && self.summary_events.len()
+                == (self.accepted_summary_event_count as usize).min(MAX_SUMMARY_OBSERVATIONS)
+            && self.summary_events.len() <= MAX_SUMMARY_OBSERVATIONS
             && add_component_values(
                 self.assistant_total,
                 self.unattributed_tool_or_summary_total,
@@ -1481,6 +1503,26 @@ impl PiSemantic {
         projection
     }
 
+    fn summary_projection(&self) -> (VecDeque<SummaryObservation>, u32) {
+        let mut events = VecDeque::new();
+        let mut count = 0_u32;
+        for id in &self.order {
+            let Some(observation) = self
+                .entries
+                .get(id)
+                .and_then(|entry| entry.summary_observation)
+            else {
+                continue;
+            };
+            count = count.saturating_add(1);
+            if events.len() == MAX_SUMMARY_OBSERVATIONS {
+                events.pop_front();
+            }
+            events.push_back(observation);
+        }
+        (events, count)
+    }
+
     fn parent_harness_telemetry(&self, context_complete: bool) -> ParentHarnessTelemetry {
         #[cfg(test)]
         self.rich_reduction_calls
@@ -1502,9 +1544,15 @@ impl PiSemantic {
             assistant_outcomes: self.assistant_outcome_projection(),
             attribution: BoundedAttributionBreakdown::default(),
             assistant_points: VecDeque::new(),
+            summary_events: VecDeque::new(),
+            accepted_summary_event_count: 0,
             compatibility_token_history: VecDeque::new(),
         };
         telemetry.assistant_points = telemetry.assistant_outcomes.observations.clone();
+        (
+            telemetry.summary_events,
+            telemetry.accepted_summary_event_count,
+        ) = self.summary_projection();
         let mut accepted_component_observation = false;
         let mut cost_expected = false;
         let mut cost_partial = false;
@@ -2232,6 +2280,21 @@ fn parse_pi_entry_for_version(value: &Value, rich_telemetry_supported: bool) -> 
         });
     let assistant_stop_reason = (kind == PiEntryKind::Assistant)
         .then(|| parse_assistant_stop_reason(message.and_then(|m| m.get("stopReason"))));
+    let summary_observation = rich_telemetry_supported
+        .then(|| match kind {
+            PiEntryKind::Compaction => Some(SummaryObservation {
+                kind: SummaryKind::Compaction,
+                tokens_before: parse_tokens_before(value.get("tokensBefore")),
+                usage,
+            }),
+            PiEntryKind::BranchSummary => Some(SummaryObservation {
+                kind: SummaryKind::BranchSummary,
+                tokens_before: Observation::Absent,
+                usage,
+            }),
+            PiEntryKind::Assistant | PiEntryKind::ToolResult | PiEntryKind::Other => None,
+        })
+        .flatten();
     let context_chars = context_entry_chars(value, message);
     Some(PiEntry {
         parent_id,
@@ -2243,6 +2306,7 @@ fn parse_pi_entry_for_version(value: &Value, rich_telemetry_supported: bool) -> 
         effort,
         assistant_stop_reason,
         assistant_metadata,
+        summary_observation,
         // Keep the pre-rich-schema error and aborted behavior for v1/v2 base telemetry.
         valid_baseline: !matches!(
             assistant_stop_reason,
@@ -2261,6 +2325,16 @@ fn parse_assistant_stop_reason(value: Option<&Value>) -> AssistantStopReason {
         Some("deferred") => AssistantStopReason::Deferred,
         Some("pending") => AssistantStopReason::Pending,
         _ => AssistantStopReason::Unknown,
+    }
+}
+
+fn parse_tokens_before(value: Option<&Value>) -> Observation<u64> {
+    match value {
+        None => Observation::Absent,
+        Some(value) => value
+            .as_u64()
+            .map(Observation::Value)
+            .unwrap_or(Observation::Invalid),
     }
 }
 
@@ -4311,7 +4385,7 @@ mod tests {
             fs::write(
                 &path,
                 format!(
-                    "{}{{\"type\":\"message\",\"id\":\"entry\",\"parentId\":null,\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":1,\"output\":2,\"cacheRead\":3,\"cacheWrite\":4}},\"content\":[]}}}}\n",
+                    "{}{{\"type\":\"message\",\"id\":\"entry\",\"parentId\":null,\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":1,\"output\":2,\"cacheRead\":3,\"cacheWrite\":4}},\"content\":[]}}}}\n{{\"type\":\"compaction\",\"id\":\"compaction\",\"parentId\":\"entry\",\"tokensBefore\":10}}\n",
                     session_header_with_version("versioned", &cwd, version)
                 ),
             )
@@ -4320,6 +4394,12 @@ mod tests {
             let tail = collector.tail_session(&path, version).unwrap();
             assert_eq!(tail.header_version, version);
             assert_eq!(tail.supports_rich_telemetry(), version == 3);
+            assert_eq!(
+                tail.semantic.entries["compaction"]
+                    .summary_observation
+                    .is_some(),
+                version == 3
+            );
             let data = tail.semantic.session_data(tail.complete);
             assert_eq!(
                 (data.input, data.output, data.cache_read, data.cache_write),
@@ -5288,6 +5368,8 @@ mod tests {
             },
             attribution: BoundedAttributionBreakdown::default(),
             assistant_points: VecDeque::new(),
+            summary_events: VecDeque::new(),
+            accepted_summary_event_count: 0,
             compatibility_token_history: VecDeque::new(),
         };
         assert!(telemetry.validates());
@@ -5318,11 +5400,15 @@ mod tests {
         const DETAILS_SENTINEL: &str = "COMPACTION-DETAILS-SECRET-91ac";
         const RETAINED_USER_SENTINEL: &str = "COMPACTION-RETAINED-USER-SECRET-d5f0";
         const RETAINED_ASSISTANT_SENTINEL: &str = "COMPACTION-RETAINED-ASSISTANT-SECRET-3b82";
+        const FIRST_KEPT_ENTRY_ID_SENTINEL: &str = "COMPACTION-FIRST-KEPT-SECRET-47ea";
+        const FROM_ID_SENTINEL: &str = "COMPACTION-FROM-ID-SECRET-3c1b";
         let sentinels = [
             SUMMARY_SENTINEL,
             DETAILS_SENTINEL,
             RETAINED_USER_SENTINEL,
             RETAINED_ASSISTANT_SENTINEL,
+            FIRST_KEPT_ENTRY_ID_SENTINEL,
+            FROM_ID_SENTINEL,
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -5347,6 +5433,8 @@ mod tests {
                 "readFiles": [DETAILS_SENTINEL],
                 "modifiedFiles": [],
             },
+            "firstKeptEntryId": FIRST_KEPT_ENTRY_ID_SENTINEL,
+            "fromId": FROM_ID_SENTINEL,
             "fromHook": false,
             "retainedTail": [
                 {
@@ -5375,6 +5463,8 @@ mod tests {
         // Confirm this test supplies every private payload field before tailing it.
         assert_eq!(compaction["summary"], SUMMARY_SENTINEL);
         assert_eq!(compaction["details"]["readFiles"][0], DETAILS_SENTINEL);
+        assert_eq!(compaction["firstKeptEntryId"], FIRST_KEPT_ENTRY_ID_SENTINEL);
+        assert_eq!(compaction["fromId"], FROM_ID_SENTINEL);
         assert_eq!(
             compaction["retainedTail"][0]["content"],
             RETAINED_USER_SENTINEL
@@ -5386,6 +5476,20 @@ mod tests {
         assert_eq!(compaction["retainedTail"][1]["usage"]["input"], 100);
         let reduced_compaction = parse_pi_entry(&compaction).unwrap();
         assert_eq!(reduced_compaction.usage, UsageObservation::Absent);
+        assert_eq!(
+            reduced_compaction.summary_observation,
+            Some(SummaryObservation {
+                kind: SummaryKind::Compaction,
+                tokens_before: Observation::Value(50_000),
+                usage: UsageObservation::Absent,
+            })
+        );
+        for sentinel in sentinels {
+            assert!(
+                !format!("{reduced_compaction:?}").contains(sentinel),
+                "PiEntry retained {sentinel}"
+            );
+        }
         let compaction_without_private_tail = serde_json::json!({
             "type": "compaction",
             "id": "compaction",
@@ -5448,6 +5552,18 @@ mod tests {
             &collector.tails.get(&path).unwrap().semantic,
             &sentinels,
         );
+        let parent = collector
+            .tails
+            .get(&path)
+            .unwrap()
+            .semantic
+            .parent_harness_telemetry(true);
+        for sentinel in sentinels {
+            assert!(
+                !format!("{parent:?}").contains(sentinel),
+                "ParentHarnessTelemetry retained {sentinel}"
+            );
+        }
 
         let after = serde_json::json!({
             "type": "message",
@@ -5493,6 +5609,171 @@ mod tests {
             &collector.tails.get(&path).unwrap().semantic,
             &sentinels,
         );
+    }
+
+    #[test]
+    fn summary_observations_are_bounded_private_and_version_gated() {
+        let mut semantic = PiSemantic::default();
+        let usage = serde_json::json!({"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4});
+        for (id, kind, tokens_before, event_usage) in [
+            (
+                "valid",
+                "compaction",
+                serde_json::json!(10),
+                Some(usage.clone()),
+            ),
+            ("missing", "compaction", Value::Null, None),
+            ("null", "compaction", Value::Null, Some(Value::Null)),
+            (
+                "wrong-type",
+                "compaction",
+                serde_json::json!("ten"),
+                Some(usage.clone()),
+            ),
+            (
+                "negative",
+                "compaction",
+                serde_json::json!(-1),
+                Some(usage.clone()),
+            ),
+            (
+                "overflow",
+                "compaction",
+                serde_json::json!(1e30),
+                Some(usage.clone()),
+            ),
+            (
+                "branch",
+                "branch_summary",
+                serde_json::json!(999),
+                Some(usage.clone()),
+            ),
+        ] {
+            let mut entry = serde_json::json!({
+                "type": kind, "id": id, "parentId": null,
+                "summary": "SUMMARY-SECRET", "details": "DETAILS-SECRET",
+                "retainedTail": "TAIL-SECRET", "firstKeptEntryId": "FIRST-SECRET",
+                "fromId": "FROM-SECRET", "unknownFutureField": "UNKNOWN-SECRET"
+            });
+            if id != "missing" {
+                entry["tokensBefore"] = tokens_before;
+            }
+            if let Some(event_usage) = event_usage {
+                entry["usage"] = event_usage;
+            }
+            assert!(semantic.add(&entry), "{id}");
+        }
+        for index in 0..60 {
+            assert!(semantic.add(&serde_json::json!({
+                "type": if index % 2 == 0 { "compaction" } else { "branch_summary" },
+                "id": format!("event-{index}"), "parentId": null,
+                "tokensBefore": index, "usage": usage,
+            })));
+        }
+
+        let telemetry = semantic.parent_harness_telemetry(true);
+        assert_eq!(telemetry.accepted_summary_event_count, 67);
+        assert_eq!(telemetry.summary_events.len(), MAX_SUMMARY_OBSERVATIONS);
+        assert_eq!(
+            telemetry.summary_events.front().unwrap().kind,
+            SummaryKind::Compaction
+        );
+        assert_eq!(
+            telemetry.summary_events.front().unwrap().tokens_before,
+            Observation::Invalid
+        );
+        assert_eq!(
+            telemetry.summary_events.back().unwrap().kind,
+            SummaryKind::BranchSummary
+        );
+        assert_eq!(
+            telemetry.summary_events.back().unwrap().tokens_before,
+            Observation::Absent
+        );
+        assert!(matches!(
+            telemetry.summary_events[0].usage,
+            UsageObservation::Value(_)
+        ));
+        assert!(matches!(
+            telemetry.summary_events[1].usage,
+            UsageObservation::Value(_)
+        ));
+        assert!(matches!(
+            telemetry.summary_events[2].usage,
+            UsageObservation::Value(_)
+        ));
+        assert_eq!(telemetry.summary_events[3].kind, SummaryKind::BranchSummary);
+        assert_eq!(
+            telemetry.summary_events[3].tokens_before,
+            Observation::Absent
+        );
+        assert!(telemetry.validates());
+        assert_eq!(semantic.session_data_for_version(true, true).compactions, 0);
+        assert_ne!(telemetry.accepted_summary_event_count, 0);
+        for sentinel in [
+            "SUMMARY-SECRET",
+            "DETAILS-SECRET",
+            "TAIL-SECRET",
+            "FIRST-SECRET",
+            "FROM-SECRET",
+            "UNKNOWN-SECRET",
+        ] {
+            assert!(!format!("{semantic:?}").contains(sentinel));
+            assert!(!format!("{telemetry:?}").contains(sentinel));
+        }
+
+        let missing_tokens = serde_json::json!({
+            "type": "compaction", "id": "missing-tokens", "parentId": null
+        });
+        let missing_observation = parse_pi_entry(&missing_tokens)
+            .unwrap()
+            .summary_observation
+            .unwrap();
+        assert_eq!(missing_observation.tokens_before, Observation::Absent);
+        assert_eq!(missing_observation.usage, UsageObservation::Absent);
+        let null_tokens = serde_json::json!({
+            "type": "compaction", "id": "null-tokens", "parentId": null,
+            "tokensBefore": null, "usage": usage
+        });
+        assert_eq!(
+            parse_pi_entry(&null_tokens)
+                .unwrap()
+                .summary_observation
+                .unwrap()
+                .tokens_before,
+            Observation::Invalid
+        );
+        let malformed_usage = serde_json::json!({
+            "type": "branch_summary", "id": "malformed-usage", "parentId": null,
+            "tokensBefore": 99, "usage": null
+        });
+        let malformed_observation = parse_pi_entry(&malformed_usage)
+            .unwrap()
+            .summary_observation
+            .unwrap();
+        assert_eq!(malformed_observation.kind, SummaryKind::BranchSummary);
+        assert_eq!(malformed_observation.tokens_before, Observation::Absent);
+        assert_eq!(malformed_observation.usage, UsageObservation::Invalid);
+        let v2_entry = serde_json::json!({
+            "type": "compaction", "id": "v2", "parentId": null,
+            "tokensBefore": 10, "usage": usage
+        });
+        assert!(parse_pi_entry_for_version(&v2_entry, false)
+            .unwrap()
+            .summary_observation
+            .is_none());
+        let mut v2 = PiSemantic::default();
+        assert!(v2.add_for_version(&v2_entry, false));
+        let _ = v2.session_data_for_version(true, false);
+        assert_eq!(v2.rich_reduction_calls.get(), 0);
+
+        let mut invalid = telemetry.clone();
+        invalid.accepted_summary_event_count = 63;
+        assert!(!invalid.validates());
+        let mut data = PiSessionData::default();
+        apply_parent_harness_validation(&mut data, &invalid, true);
+        assert!(!data.usage_available);
+        assert_eq!(data.usage_completeness, TelemetryCompleteness::Partial);
     }
 
     #[test]
