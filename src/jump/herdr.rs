@@ -30,7 +30,6 @@ impl TerminalJumper for HerdrJumper {
                 args,
                 Duration::from_millis(HERDR_JUMP_TIMEOUT_MS),
             )
-            .is_some()
         })
     }
 }
@@ -49,7 +48,7 @@ fn current_herdr_socket_from(mut env: impl FnMut(&str) -> Option<String>) -> Opt
 fn try_jump_with(
     current_socket: Option<String>,
     marker: Option<HerdrProcessMarker>,
-    run: impl FnOnce(&HerdrProcessMarker, &[String]) -> bool,
+    mut run: impl FnMut(&HerdrProcessMarker, &[String]) -> Option<serde_json::Value>,
 ) -> JumpAttempt {
     let (Some(current_socket), Some(marker)) = (current_socket, marker) else {
         return JumpAttempt::NotApplicable;
@@ -63,17 +62,35 @@ fn try_jump_with(
         "focus".to_string(),
         marker.pane_id.clone(),
     ];
-    if run(&marker, &args) {
+    let Some(focus_result) = run(&marker, &args) else {
+        return JumpAttempt::Failed("focus command failed or timed out".to_string());
+    };
+    let Some(workspace_id) = focus_result
+        .pointer("/result/agent/workspace_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+    else {
+        return JumpAttempt::Failed(
+            "focus response did not identify the target workspace".to_string(),
+        );
+    };
+
+    let workspace_args = vec![
+        "workspace".to_string(),
+        "focus".to_string(),
+        workspace_id.to_string(),
+    ];
+    if run(&marker, &workspace_args).is_some() {
         JumpAttempt::Jumped
     } else {
-        JumpAttempt::Failed("focus command failed or timed out".to_string())
+        JumpAttempt::Failed("workspace focus command failed or timed out".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn marker(socket_path: &str) -> HerdrProcessMarker {
         HerdrProcessMarker {
@@ -109,19 +126,33 @@ mod tests {
     }
 
     #[test]
-    fn same_server_focuses_the_exact_pi_pane() {
+    fn same_server_focuses_the_exact_pi_pane_and_its_workspace() {
+        let calls = RefCell::new(Vec::new());
         let attempt = try_jump_with(
             Some("/tmp/herdr.sock".to_string()),
             Some(marker("/tmp/herdr.sock")),
             |location, args| {
                 assert_eq!(location.pane_id, "w1X:p2");
                 assert_eq!(location.socket_path, "/tmp/herdr.sock");
-                assert_eq!(args, ["agent", "focus", "w1X:p2"]);
-                true
+                calls.borrow_mut().push(args.to_vec());
+                Some(serde_json::json!({
+                    "result": {
+                        "agent": {
+                            "workspace_id": "w1X"
+                        }
+                    }
+                }))
             },
         );
 
         assert_eq!(attempt, JumpAttempt::Jumped);
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ["agent", "focus", "w1X:p2"].map(str::to_string),
+                ["workspace", "focus", "w1X"].map(str::to_string),
+            ]
+        );
     }
 
     #[test]
@@ -132,7 +163,7 @@ mod tests {
             Some(marker("/tmp/target.sock")),
             |_, _| {
                 called.set(true);
-                true
+                Some(serde_json::json!({}))
             },
         );
 
@@ -145,7 +176,7 @@ mod tests {
         let attempt = try_jump_with(
             Some("/tmp/herdr.sock".to_string()),
             Some(marker("/tmp/herdr.sock")),
-            |_, _| false,
+            |_, _| None,
         );
 
         assert_eq!(
