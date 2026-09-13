@@ -541,7 +541,12 @@ fn format_token_value(session: &model::AgentSession) -> String {
 }
 
 fn print_snapshot(app: &App) {
-    println!("ptop — {} Pi processes\n", app.sessions.len());
+    let mut output = stdout();
+    write_snapshot(&mut output, app).expect("failed printing to stdout");
+}
+
+pub(crate) fn write_snapshot(output: &mut dyn io::Write, app: &App) -> io::Result<()> {
+    writeln!(output, "ptop — {} Pi processes\n", app.sessions.len())?;
     for session in &app.sessions {
         let status = match &session.status {
             model::SessionStatus::Thinking => "◉ Think",
@@ -565,7 +570,8 @@ fn print_snapshot(app: &App) {
         let context = format_context_value(session);
         let tokens = format_token_value(session);
         let age = format!("seen:{}", session.elapsed_display());
-        println!(
+        writeln!(
+            output,
             "  {} {:<20} {} {} {:<10} CTX:{} Tok:{} Mem:{}M {}",
             session.pid,
             sanitize_output(&project_label),
@@ -576,9 +582,9 @@ fn print_snapshot(app: &App) {
             tokens,
             session.mem_mb,
             age,
-        );
+        )?;
         if let Some(task) = session.current_tasks.last() {
-            println!("       └─ {}", sanitize_output(task));
+            writeln!(output, "       └─ {}", sanitize_output(task))?;
         }
         if let Some(telemetry) = &session.telemetry {
             let now_ms = std::time::SystemTime::now()
@@ -587,42 +593,46 @@ fn print_snapshot(app: &App) {
                 .as_millis() as u64;
             let observed_age =
                 ui::fmt_age(now_ms.saturating_sub(telemetry.context.observed_at_ms) / 1_000);
-            println!(
+            writeln!(
+                output,
                 "       telemetry: {} ({}) · source {} · observed {}",
                 telemetry.attachment.label(),
                 telemetry.attachment_confidence.label(),
                 telemetry.source_health.label(),
                 observed_age
-            );
+            )?;
             if let Some(provider) = &telemetry.context_details.provider {
-                println!(
+                writeln!(
+                    output,
                     "       provider/model: {}/{}",
                     sanitize_output(provider),
                     sanitize_output(&session.model)
-                );
+                )?;
             }
-            println!(
+            writeln!(
+                output,
                 "       context: {} · {}/{} · {}",
                 context.trim(),
                 telemetry.context.precision.label(),
                 telemetry.context.completeness.label(),
                 sanitize_output(&telemetry.context.provenance)
-            );
-            println!(
+            )?;
+            writeln!(
+                output,
                 "       tokens: {} · {}/{} · {}",
                 tokens,
                 telemetry.usage.precision.label(),
                 telemetry.usage.completeness.label(),
                 sanitize_output(&telemetry.usage.provenance)
-            );
+            )?;
             if let Some(reason) = &telemetry.context_details.reason {
-                println!("       context note: {}", sanitize_output(reason));
+                writeln!(output, "       context note: {}", sanitize_output(reason))?;
             }
             if let Some(cost) = telemetry.usage_details.reported_cost {
-                println!("       reported cost: {cost:.4}");
+                writeln!(output, "       reported cost: {cost:.4}")?;
             }
             let fleet = &telemetry.fleet;
-            println!(
+            writeln!(output,
                 "       fleet: {} · background {} · foreground {} · {} run{} · status.json · {}d retention",
                 fleet.source_health.label(),
                 fleet.background_visibility.label(),
@@ -630,9 +640,9 @@ fn print_snapshot(app: &App) {
                 fleet.runs.len(),
                 if fleet.runs.len() == 1 { "" } else { "s" },
                 fleet.retention_days
-            );
+            )?;
             if let Some(reason) = &fleet.reason {
-                println!("       fleet note: {}", sanitize_output(reason));
+                writeln!(output, "       fleet note: {}", sanitize_output(reason))?;
             }
             for run in &fleet.runs {
                 let run_tokens = run
@@ -646,7 +656,8 @@ fn print_snapshot(app: &App) {
                     .map(|proof| format!(" · exit {}", proof.state.label()))
                     .unwrap_or_default();
                 let stale = if run.stale { " · stale" } else { "" };
-                println!(
+                writeln!(
+                    output,
                     "       run {} · {} · {} · {}{}{}{}",
                     sanitize_output(&run.run_id),
                     run.execution.label(),
@@ -655,38 +666,41 @@ fn print_snapshot(app: &App) {
                     run_tokens,
                     terminal,
                     stale
-                );
+                )?;
                 for child in &run.children {
                     let child_tokens = child
                         .usage
                         .total_tokens
                         .map(|tokens| format!(" · {} tok", fmt_tok(tokens)))
                         .unwrap_or_default();
-                    println!(
+                    writeln!(
+                        output,
                         "         child {} · {} · {}{}",
                         sanitize_output(&child.name),
                         child.execution.label(),
                         child.state.label(),
                         child_tokens
-                    );
+                    )?;
                 }
             }
         }
         if session.process_start_id.is_none() {
-            println!("       identity: PID only (reuse not guarded)");
+            writeln!(output, "       identity: PID only (reuse not guarded)")?;
         }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
             let command = model::safe_process_label(&child.command);
-            println!(
+            writeln!(
+                output,
                 "       {} {} {}K {}",
                 child.pid,
                 sanitize_output(&command),
                 child.mem_kb / 1024,
                 port,
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 fn run_update() -> io::Result<()> {
