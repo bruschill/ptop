@@ -12,7 +12,7 @@ The demo uses the user-created [madeofcode](https://github.com/bruschill/madeofc
 
 - Pi sessions with status, model, thinking level, context, tokens, memory, and current telemetry state.
 - `pi-subagents` fleet runs and child lifecycle metadata.
-- Per-project Git branch and working-tree counts.
+- Per-project Git branch and working-tree counts, refreshed on the slower polling interval.
 - Child processes, listening ports, port conflicts, and orphan ports.
 - Host CPU, memory, and load metrics.
 - Process-only Pi rows when telemetry cannot be attached safely.

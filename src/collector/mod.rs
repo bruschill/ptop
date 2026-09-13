@@ -61,7 +61,7 @@ pub struct Collector {
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from the last port scan. A change invalidates the cache.
     cached_port_pids: Vec<u32>,
-    cached_git: HashMap<String, (u32, u32)>,
+    cached_git: HashMap<String, process::GitInfo>,
     /// Port-owning children from previous ticks, keyed by child PID.
     tracked_port_children: HashMap<u32, TrackedPortChild>,
 }
@@ -110,24 +110,26 @@ impl Collector {
         if slow_tick {
             self.cached_git.clear();
             for session in &mut sessions {
-                let stats = process::collect_git_stats(&session.cwd);
+                let stats = process::collect_git_info(&session.cwd);
+                session.git_branch = stats.branch.clone();
+                session.git_added = stats.added;
+                session.git_modified = stats.modified;
                 self.cached_git.insert(session.cwd.clone(), stats);
-                session.git_added = stats.0;
-                session.git_modified = stats.1;
             }
         } else {
             for session in &mut sessions {
                 let stats = self
                     .cached_git
                     .get(&session.cwd)
-                    .copied()
+                    .cloned()
                     .unwrap_or_else(|| {
-                        let stats = process::collect_git_stats(&session.cwd);
-                        self.cached_git.insert(session.cwd.clone(), stats);
+                        let stats = process::collect_git_info(&session.cwd);
+                        self.cached_git.insert(session.cwd.clone(), stats.clone());
                         stats
                     });
-                session.git_added = stats.0;
-                session.git_modified = stats.1;
+                session.git_branch = stats.branch;
+                session.git_added = stats.added;
+                session.git_modified = stats.modified;
             }
         }
 
