@@ -102,6 +102,8 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("header.ctx", "ctx");
 
     // Tokens panel
+    m.insert("tokens.title", "Total Tokens / all live sessions");
+    m.insert("tokens.title_short", "Total Tokens / live");
     m.insert("tokens.total", "Total");
     m.insert("tokens.input", "Input");
     m.insert("tokens.output", "Output");
@@ -110,6 +112,10 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.turns", "Turns");
     m.insert("tokens.avg", "Avg");
     m.insert("tokens.tokens_turn", "tokens/turn");
+    m.insert("tokens.live", "Live");
+    m.insert("tokens.complete", "Complete");
+    m.insert("tokens.partial", "Partial");
+    m.insert("tokens.unavailable", "Unavailable");
 
     // Context panel
     m.insert("context.rate", "Rate");
@@ -247,6 +253,8 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("header.ctx", "上下文");
 
     // Tokens panel
+    m.insert("tokens.title", "总 Token / 所有实时会话");
+    m.insert("tokens.title_short", "总 Token / 实时");
     m.insert("tokens.total", "总计");
     m.insert("tokens.input", "输入");
     m.insert("tokens.output", "输出");
@@ -255,6 +263,10 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.turns", "轮数");
     m.insert("tokens.avg", "平均");
     m.insert("tokens.tokens_turn", "词元/轮");
+    m.insert("tokens.live", "实时");
+    m.insert("tokens.complete", "完整");
+    m.insert("tokens.partial", "部分");
+    m.insert("tokens.unavailable", "不可用");
 
     // Context panel
     m.insert("context.rate", "速率");
