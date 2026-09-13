@@ -68,13 +68,14 @@ Fleet telemetry also reports conservative `pi-subagents` availability: `Installe
 
 ## Privacy boundary
 
-The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. It does not retain or publish:
+The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. For attached version-3 sessions, JSON and selected-session detail may publish only aggregate assistant outcomes, reconciled parent components and reported cost, and at most 64 sorted Pi attribution buckets. `telemetry.harness` is `null` for process-only rows, versions 1 and 2, unsupported sessions, failed attachments, and inconsistent projections. Its unavailable authoritative totals are `null`; it never exposes observations or summary events. It does not retain or publish:
 
 - prompt text
 - assistant text
 - tool arguments or tool results
 - chat transcripts or tool previews
 - child transcripts, events, prompt files, or output logs
+- assistant observation histories, summary events, entry IDs, or parent IDs
 
 TUI, text snapshots, and JSON snapshots reduce child and orphan process commands to executable labels. Fleet status labels are bounded and terminal-control characters are removed before display.
 
@@ -126,6 +127,7 @@ Orphan detection is cross-tick state. A child port becomes orphaned only after i
 - bounded token history
 - fleet runs and children
 - privacy-safe child process labels
+- `telemetry.harness` aggregate version-3 parent telemetry when validated
 - orphan ports
 
 Snapshots omit monitor-mode discriminators, account quota, MCP server state, per-session transcript data, tool previews, file-audit data, and old multi-agent identifiers.

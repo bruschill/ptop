@@ -65,6 +65,7 @@ fn pi_telemetry(
             reason: None,
         },
         fleet,
+        harness: None,
     }
 }
 

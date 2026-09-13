@@ -2,15 +2,13 @@
 
 ## Status
 
-This document is a research basis, not an implementation specification. Passive
-JSONL can support richer historical telemetry, but accounting correctness,
-privacy decisions, and completeness semantics must be settled first. Live
-harness state needs a separate feasibility study because the installed Pi
-extension API does not provide a trusted ptop sidecar protocol or portable
-process-start identity.
-
-The execution-ready Phase 0 and Phase 1 work is specified in
-[`pi-harness-telemetry-plan.md`](pi-harness-telemetry-plan.md).
+This document is a research basis for later work. Phase 0 and Phase 1 are
+complete. The owner approved and this branch implements the first Phase 2 slice
+specified in [`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md):
+privacy-safe aggregate outcomes, component and cost reconciliation, and Pi model
+attribution in JSON and selected-session detail. Live harness state still needs
+a separate feasibility study because the installed Pi extension API does not
+provide a trusted ptop sidecar protocol or portable process-start identity.
 
 ## Summary
 
@@ -331,6 +329,10 @@ any sidecar value.
 Do not publish new UI or snapshot fields during this phase.
 
 ### Phase 2: snapshots and UI
+
+The approved first-slice DTO, UI, compatibility, and caller interface is in
+[`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md). This branch
+implements that slice.
 
 - Add compatibility-reviewed optional DTOs. Authoritative unavailable values use
   `null`.

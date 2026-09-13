@@ -664,8 +664,11 @@ Stop execution and ask the owner if any of these occurs:
 - a phase cannot stay compile-green without temporary dead code allowances; or
 - Linux, macOS, or Windows process-only compilation regresses.
 
-## Approval gate
+## Historical approval gate
 
 The owner confirmed the defaults in **Approved-by-execution defaults** before
-implementation began. Phase 0 and Phase 1 are complete. Any public rich
-telemetry consumer remains deferred to a separately approved Phase 2.
+Phase 0 and Phase 1 implementation began. At their completion, public rich
+telemetry remained deferred. The owner later approved the first Phase 2 public
+consumer specified in
+[`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md), and this
+branch implements it.

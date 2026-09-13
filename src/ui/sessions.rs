@@ -546,7 +546,10 @@ fn draw_pi_metadata(
             })
         })
         .unwrap_or_else(|| "—".to_string());
-    let compact_for_runs = show_runs && !telemetry.fleet.runs.is_empty() && area.height <= 6;
+    let reserved_runs_rows = u16::from(show_runs && area.height > 0);
+    let available_metadata_rows = area.height.saturating_sub(reserved_runs_rows);
+    let compact_for_runs = (show_runs && !telemetry.fleet.runs.is_empty() && area.height <= 6)
+        || (telemetry.harness.is_some() && available_metadata_rows < 8);
     let tokens = session
         .total_tokens_value()
         .map(|total| {
@@ -595,10 +598,6 @@ fn draw_pi_metadata(
             &telemetry.usage,
             theme,
         ),
-        Line::from(Span::styled(
-            format!(" Identity {identity}"),
-            Style::default().fg(theme.inactive_fg),
-        )),
     ];
 
     if compact_for_runs {
@@ -628,11 +627,28 @@ fn draw_pi_metadata(
                     Style::default().fg(theme.inactive_fg),
                 ),
             ]),
-            Line::from(Span::styled(
+        ];
+        if telemetry.harness.is_none() {
+            lines.push(Line::from(Span::styled(
                 format!(" Identity {identity}"),
                 Style::default().fg(theme.inactive_fg),
-            )),
-        ];
+            )));
+        }
+    }
+
+    if let Some(harness) = &telemetry.harness {
+        lines.extend(harness_detail_lines(harness, area.width, theme));
+        // Identity is lower priority than the approved aggregate lines.
+        lines.push(Line::from(Span::styled(
+            format!(" Identity {identity}"),
+            Style::default().fg(theme.inactive_fg),
+        )));
+    } else if !compact_for_runs {
+        // Preserve the existing non-harness detail order.
+        lines.push(Line::from(Span::styled(
+            format!(" Identity {identity}"),
+            Style::default().fg(theme.inactive_fg),
+        )));
     }
 
     if !compact_for_runs {
@@ -648,12 +664,6 @@ fn draw_pi_metadata(
                     " Context note: {}",
                     truncate_str(reason, area.width as usize)
                 ),
-                Style::default().fg(theme.inactive_fg),
-            )));
-        }
-        if let Some(cost) = telemetry.usage_details.reported_cost {
-            lines.push(Line::from(Span::styled(
-                format!(" Reported cost: {cost:.4}"),
                 Style::default().fg(theme.inactive_fg),
             )));
         }
@@ -703,6 +713,133 @@ fn draw_pi_metadata(
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn reconciliation_label(status: crate::model::ReconciliationStatus) -> &'static str {
+    match status {
+        crate::model::ReconciliationStatus::Unavailable => "unavailable",
+        crate::model::ReconciliationStatus::Partial => "partial",
+        crate::model::ReconciliationStatus::Complete => "complete",
+    }
+}
+
+fn token_component_total(components: &crate::model::TokenComponents) -> u64 {
+    components
+        .input_tokens
+        .saturating_add(components.output_tokens)
+        .saturating_add(components.cache_read_tokens)
+        .saturating_add(components.cache_write_tokens)
+}
+
+fn harness_detail_lines(
+    harness: &crate::model::PiHarnessTelemetry,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let outcomes = &harness.assistant_outcomes;
+    let mut outcome_parts = vec![
+        format!("Outcomes {}", reconciliation_label(outcomes.status)),
+        outcomes.total.to_string(),
+    ];
+    for (label, value) in [
+        ("stop", outcomes.stop),
+        ("tool", outcomes.tool_use),
+        ("length", outcomes.length),
+        ("error", outcomes.error),
+        ("aborted", outcomes.aborted),
+        ("deferred", outcomes.deferred),
+        ("pending", outcomes.pending),
+        ("unknown", outcomes.unknown),
+    ] {
+        if value > 0 {
+            outcome_parts.push(format!("{label} {value}"));
+        }
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            " {}",
+            truncate_str(&outcome_parts.join(" · "), width as usize)
+        ),
+        Style::default().fg(theme.inactive_fg),
+    ))];
+    let model_line = match &harness.attribution {
+        None => "Models unavailable".to_string(),
+        Some(attribution) => {
+            let mut values = Vec::new();
+            for bucket in attribution.named.iter().take(2) {
+                let name = if width >= 90 {
+                    format!("{}/{}", bucket.provider, bucket.model)
+                } else {
+                    shorten_model(&bucket.model, false)
+                };
+                values.push(format!(
+                    "{name} {}",
+                    fmt_tokens(token_component_total(&bucket.components))
+                ));
+            }
+            if attribution.named.len() > 2 {
+                values.push(format!("+{} models", attribution.named.len() - 2));
+            }
+            let unavailable = token_component_total(&attribution.unavailable);
+            if unavailable > 0 {
+                values.push(format!("unattributed {}", fmt_tokens(unavailable)));
+            }
+            let overflow = token_component_total(&attribution.overflow);
+            if overflow > 0 {
+                values.push(format!("other models {}", fmt_tokens(overflow)));
+            }
+            if values.is_empty() {
+                values.push("none".to_string());
+            }
+            format!(
+                "Models{} {}",
+                if harness.components.status == crate::model::ReconciliationStatus::Partial {
+                    " partial"
+                } else {
+                    ""
+                },
+                values.join(" · ")
+            )
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        format!(" {}", truncate_str(&model_line, width as usize)),
+        Style::default().fg(theme.inactive_fg),
+    )));
+    let cost = match harness.reported_cost.total {
+        Some(value) => format!("${value:.4}"),
+        None => reconciliation_label(harness.reported_cost.status).to_string(),
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            " Usage components {} · reported cost {}",
+            reconciliation_label(harness.components.status),
+            cost
+        ),
+        Style::default().fg(theme.inactive_fg),
+    )));
+    let mut reasons = Vec::new();
+    for reason in [
+        harness.components.reason.as_deref(),
+        harness.reported_cost.reason.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    if !reasons.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Note: {}",
+                truncate_str(&reasons.join("; "), width.saturating_sub(7) as usize)
+            ),
+            Style::default().fg(theme.inactive_fg),
+        )));
+    }
+    lines
 }
 
 fn task_row_text(task_text: &str, max_width: usize) -> String {
@@ -798,6 +935,173 @@ mod tests {
         assert!(
             !text.contains("[1m]"),
             "non-1M context windows must not be labeled as 1M\n{text}"
+        );
+    }
+
+    #[test]
+    fn selected_session_renders_harness_aggregate_lines() {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        let mut session = test_session("harness", "harness");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.harness = Some(test_harness());
+        session.telemetry = Some(telemetry);
+        app.sessions.push(session);
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 20,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("Outcomes complete · 3 · stop 1 · tool 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Models openai/gpt-5 145 · unattributed 7 · other models 9"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Usage components complete · reported cost $0.0125"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn harness_detail_prioritizes_aggregates_before_identity_and_keeps_runs_row() {
+        let mut session = test_session("harness-priority", "harness");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.harness = Some(test_harness());
+        telemetry.fleet.runs.push(FleetRun {
+            lifecycle_version: Some(3),
+            run_id: "run-1".into(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Single,
+            state: FleetRunState::Running,
+            execution: FleetExecution::InProcess,
+            runner_pid: None,
+            started_at_ms: None,
+            updated_at_ms: None,
+            ended_at_ms: None,
+            source_updated_at_ms: 1,
+            stale: false,
+            process_terminal: None,
+            usage: FleetUsage::separate_run_aggregate(),
+            children: Vec::new(),
+            omitted_children: 0,
+            reason: None,
+        });
+        session.telemetry = Some(telemetry);
+        let backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), true))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Outcomes complete"), "{text}");
+        assert!(text.contains("Models openai/gpt-5"), "{text}");
+        assert!(text.contains("Usage components complete"), "{text}");
+        assert!(text.contains("run-1"), "{text}");
+        assert!(
+            text.find("Outcomes").unwrap() < text.find("Identity").unwrap(),
+            "{text}"
+        );
+
+        let backend = TestBackend::new(120, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), true))
+            .unwrap();
+        let compact = format!("{}", terminal.backend());
+        assert!(
+            compact.contains("Outcomes complete") && compact.contains("Models openai/gpt-5"),
+            "{compact}"
+        );
+        assert!(compact.contains("Usage components complete"), "{compact}");
+        assert!(!compact.contains("Identity"), "{compact}");
+        assert!(compact.contains("Fleet unavailable"), "{compact}");
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), false))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.find("Outcomes").unwrap() < text.find("Identity").unwrap(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn harness_detail_handles_unavailable_zero_and_narrow_long_models() {
+        let mut unavailable = test_harness();
+        unavailable.components.status = crate::model::ReconciliationStatus::Unavailable;
+        unavailable.components.total = None;
+        unavailable.components.assistant = None;
+        unavailable.components.unattributed_tool_or_summary = None;
+        unavailable.attribution = None;
+        unavailable.reported_cost.total = Some(0.0);
+        let unavailable_lines = harness_detail_lines(&unavailable, 50, &Theme::default());
+        let unavailable_text = unavailable_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unavailable_text.contains("Models unavailable"));
+        assert!(unavailable_text.contains("Usage components unavailable · reported cost $0.0000"));
+
+        let mut long = test_harness();
+        let bucket = &mut long.attribution.as_mut().unwrap().named[0];
+        bucket.provider = "provider-".repeat(20);
+        bucket.model = "model-".repeat(20);
+        let narrow = harness_detail_lines(&long, 40, &Theme::default());
+        let narrow_text = narrow
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(narrow_text.contains("Models"));
+        assert!(
+            !narrow_text.contains("provider-provider"),
+            "narrow output leaked provider\n{narrow_text}"
+        );
+    }
+
+    #[test]
+    fn harness_detail_joins_distinct_reconciliation_reasons() {
+        let mut harness = test_harness();
+        harness.components.status = crate::model::ReconciliationStatus::Partial;
+        harness.components.reason = Some("component coverage is partial".to_string());
+        harness.reported_cost.status = crate::model::ReconciliationStatus::Partial;
+        harness.reported_cost.total = None;
+        harness.reported_cost.reason = Some("reported cost is partial".to_string());
+
+        let text = harness_detail_lines(&harness, 160, &Theme::default())
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Models partial"), "{text}");
+        assert!(
+            text.contains("Note: component coverage is partial; reported cost is partial"),
+            "{text}"
         );
     }
 
@@ -1064,6 +1368,66 @@ mod tests {
             1,
             "fleet metadata must not add process rows"
         );
+    }
+
+    fn test_harness() -> crate::model::PiHarnessTelemetry {
+        crate::model::PiHarnessTelemetry {
+            assistant_outcomes: crate::model::AssistantOutcomeTelemetry {
+                status: crate::model::ReconciliationStatus::Complete,
+                total: 3,
+                stop: 1,
+                length: 0,
+                tool_use: 2,
+                error: 0,
+                aborted: 0,
+                deferred: 0,
+                pending: 0,
+                unknown: 0,
+                reason: None,
+            },
+            components: crate::model::ComponentReconciliation {
+                status: crate::model::ReconciliationStatus::Complete,
+                total: Some(crate::model::TokenComponents {
+                    input_tokens: 107,
+                    output_tokens: 39,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 5,
+                }),
+                assistant: Some(crate::model::TokenComponents {
+                    input_tokens: 107,
+                    output_tokens: 39,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 5,
+                }),
+                unattributed_tool_or_summary: Some(crate::model::TokenComponents::default()),
+                reason: None,
+            },
+            reported_cost: crate::model::ReportedCostReconciliation {
+                status: crate::model::ReconciliationStatus::Complete,
+                total: Some(0.0125),
+                reason: None,
+            },
+            attribution: Some(crate::model::PiAttributionTelemetry {
+                named: vec![crate::model::PiAttributionBucket {
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    components: crate::model::TokenComponents {
+                        input_tokens: 100,
+                        output_tokens: 30,
+                        cache_read_tokens: 10,
+                        cache_write_tokens: 5,
+                    },
+                }],
+                unavailable: crate::model::TokenComponents {
+                    input_tokens: 7,
+                    ..crate::model::TokenComponents::default()
+                },
+                overflow: crate::model::TokenComponents {
+                    output_tokens: 9,
+                    ..crate::model::TokenComponents::default()
+                },
+            }),
+        }
     }
 
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
