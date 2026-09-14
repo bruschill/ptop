@@ -6,6 +6,7 @@ mod help;
 mod ports;
 mod projects;
 mod runs;
+mod session_history;
 mod sessions;
 mod tokens;
 mod view_menu;

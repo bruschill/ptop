@@ -484,12 +484,50 @@ pub struct PiAttributionTelemetry {
     pub overflow: TokenComponents,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiPointAttribution {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiAssistantUsagePoint {
+    pub components: Option<TokenComponents>,
+    pub attribution: Option<PiPointAttribution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiSummaryMarkerKind {
+    Compaction,
+    BranchSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiSummaryMarker {
+    pub kind: PiSummaryMarkerKind,
+    pub position: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiHarnessHistoryTelemetry {
+    pub status: ReconciliationStatus,
+    pub assistant_count: u32,
+    pub omitted_assistant_points: u32,
+    pub points: Vec<PiAssistantUsagePoint>,
+    pub summary_event_count: u32,
+    pub omitted_summary_events: u32,
+    pub markers: Vec<PiSummaryMarker>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PiHarnessTelemetry {
     pub assistant_outcomes: AssistantOutcomeTelemetry,
     pub components: ComponentReconciliation,
     pub reported_cost: ReportedCostReconciliation,
     pub attribution: Option<PiAttributionTelemetry>,
+    pub history: Option<PiHarnessHistoryTelemetry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

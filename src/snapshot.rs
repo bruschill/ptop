@@ -449,8 +449,32 @@ mod tests {
                 unavailable: crate::model::TokenComponents::default(),
                 overflow: crate::model::TokenComponents::default(),
             }),
+            history: Some(crate::model::PiHarnessHistoryTelemetry {
+                status: crate::model::ReconciliationStatus::Complete,
+                assistant_count: 1,
+                omitted_assistant_points: 0,
+                points: vec![crate::model::PiAssistantUsagePoint {
+                    components: Some(components),
+                    attribution: Some(crate::model::PiPointAttribution {
+                        provider: "provider".to_string(),
+                        model: "model".to_string(),
+                    }),
+                }],
+                summary_event_count: 1,
+                omitted_summary_events: 0,
+                markers: vec![crate::model::PiSummaryMarker {
+                    kind: crate::model::PiSummaryMarkerKind::Compaction,
+                    position: 1,
+                }],
+                reason: None,
+            }),
         };
-        let json = serde_json::to_value(harness).unwrap();
+        let json = serde_json::to_value(&harness).unwrap();
+        let mut null_harness = harness.clone();
+        let null_point = &mut null_harness.history.as_mut().unwrap().points[0];
+        null_point.components = None;
+        null_point.attribution = None;
+        let null_history = serde_json::to_value(&null_harness).unwrap();
 
         assert_eq!(
             sorted_keys(&json),
@@ -458,6 +482,7 @@ mod tests {
                 "assistant_outcomes",
                 "attribution",
                 "components",
+                "history",
                 "reported_cost",
             ]
         );
@@ -490,6 +515,40 @@ mod tests {
             sorted_keys(&json["attribution"]["named"][0]),
             vec!["components", "model", "provider"]
         );
+        assert_eq!(
+            sorted_keys(&json["history"]),
+            vec![
+                "assistant_count",
+                "markers",
+                "omitted_assistant_points",
+                "omitted_summary_events",
+                "points",
+                "reason",
+                "status",
+                "summary_event_count",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["history"]["points"][0]),
+            vec!["attribution", "components"]
+        );
+        assert_eq!(
+            sorted_keys(&json["history"]["points"][0]["attribution"]),
+            vec!["model", "provider"]
+        );
+        assert_eq!(
+            sorted_keys(&json["history"]["points"][0]["components"]),
+            vec![
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "input_tokens",
+                "output_tokens",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["history"]["markers"][0]),
+            vec!["kind", "position"]
+        );
         for value in [
             &json["components"]["total"],
             &json["components"]["assistant"],
@@ -514,6 +573,12 @@ mod tests {
         assert!(json["components"]["total"]["input_tokens"]
             .as_u64()
             .is_some());
+
+        assert!(null_history["history"]["points"][0]["components"].is_null());
+        assert!(null_history["history"]["points"][0]["attribution"].is_null());
+        let mut unavailable_harness = harness;
+        unavailable_harness.history = None;
+        assert!(serde_json::to_value(unavailable_harness).unwrap()["history"].is_null());
     }
 
     #[test]

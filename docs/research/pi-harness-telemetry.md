@@ -3,7 +3,7 @@
 ## Status
 
 This document is a research basis for later work. Phase 0 and Phase 1 are
-complete. The owner approved and this branch implements the first Phase 2 slice
+complete. The owner approved and `main` implements the first Phase 2 slice
 specified in [`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md):
 privacy-safe aggregate outcomes, component and cost reconciliation, and Pi model
 attribution in JSON and selected-session detail. Live harness state still needs
@@ -331,8 +331,10 @@ Do not publish new UI or snapshot fields during this phase.
 ### Phase 2: snapshots and UI
 
 The approved first-slice DTO, UI, compatibility, and caller interface is in
-[`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md). This branch
-implements that slice.
+[`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md) and is
+implemented on `main`. The next bounded-history and summary-marker slice is
+approved in
+[`pi-harness-telemetry-phase-2-history.md`](pi-harness-telemetry-phase-2-history.md).
 
 - Add compatibility-reviewed optional DTOs. Authoritative unavailable values use
   `null`.

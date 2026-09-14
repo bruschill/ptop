@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{btop_block_active, fmt_age, fmt_tokens, grad_at, make_gradient, truncate_str};
+use super::{
+    btop_block_active, fmt_age, fmt_tokens, grad_at, make_gradient, session_history, truncate_str,
+};
 
 #[cfg(test)]
 pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
@@ -548,8 +550,23 @@ fn draw_pi_metadata(
         .unwrap_or_else(|| "—".to_string());
     let reserved_runs_rows = u16::from(show_runs && area.height > 0);
     let available_metadata_rows = area.height.saturating_sub(reserved_runs_rows);
+    let history_full = telemetry
+        .harness
+        .as_ref()
+        .and_then(|harness| harness.history.as_ref())
+        .is_some()
+        && area.width >= 90
+        && available_metadata_rows >= 12;
+    let history_compact = telemetry
+        .harness
+        .as_ref()
+        .and_then(|harness| harness.history.as_ref())
+        .is_some()
+        && area.width < 90
+        && available_metadata_rows >= 9;
     let compact_for_runs = (show_runs && !telemetry.fleet.runs.is_empty() && area.height <= 6)
-        || (telemetry.harness.is_some() && available_metadata_rows < 8);
+        || (telemetry.harness.is_some()
+            && (available_metadata_rows < 8 || history_full || history_compact));
     let tokens = session
         .total_tokens_value()
         .map(|total| {
@@ -637,12 +654,35 @@ fn draw_pi_metadata(
     }
 
     if let Some(harness) = &telemetry.harness {
-        lines.extend(harness_detail_lines(harness, area.width, theme));
-        // Identity is lower priority than the approved aggregate lines.
-        lines.push(Line::from(Span::styled(
-            format!(" Identity {identity}"),
-            Style::default().fg(theme.inactive_fg),
-        )));
+        // The first three lines are the required aggregate rows. Keep the optional
+        // reconciliation note behind history so the approved thresholds fit it.
+        let mut harness_lines = harness_detail_lines(harness, area.width, theme);
+        let aggregate_lines: Vec<_> = harness_lines.drain(..3.min(harness_lines.len())).collect();
+        lines.extend(aggregate_lines);
+        if (history_full || history_compact) && lines.len() < available_metadata_rows as usize {
+            if let Some(history) = &harness.history {
+                lines.extend(session_history::history_lines(
+                    history,
+                    area.width,
+                    (available_metadata_rows as usize).saturating_sub(lines.len()),
+                    theme,
+                ));
+            }
+        }
+        if lines.len() < available_metadata_rows as usize {
+            lines.extend(
+                harness_lines
+                    .into_iter()
+                    .take((available_metadata_rows as usize).saturating_sub(lines.len())),
+            );
+        }
+        // Identity is lower priority than the approved aggregate and history rows.
+        if lines.len() < available_metadata_rows as usize {
+            lines.push(Line::from(Span::styled(
+                format!(" Identity {identity}"),
+                Style::default().fg(theme.inactive_fg),
+            )));
+        }
     } else if !compact_for_runs {
         // Preserve the existing non-harness detail order.
         lines.push(Line::from(Span::styled(
@@ -651,21 +691,24 @@ fn draw_pi_metadata(
         )));
     }
 
-    if !compact_for_runs {
+    let show_surplus_context = !compact_for_runs || history_full || history_compact;
+    if show_surplus_context && lines.len() < available_metadata_rows as usize {
         if let Some(provider) = &telemetry.context_details.provider {
             lines.push(Line::from(Span::styled(
                 format!(" Provider/model: {}/{}", provider, session.model),
                 Style::default().fg(theme.inactive_fg),
             )));
         }
-        if let Some(reason) = &telemetry.context_details.reason {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " Context note: {}",
-                    truncate_str(reason, area.width as usize)
-                ),
-                Style::default().fg(theme.inactive_fg),
-            )));
+        if lines.len() < available_metadata_rows as usize {
+            if let Some(reason) = &telemetry.context_details.reason {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " Context note: {}",
+                        truncate_str(reason, area.width as usize)
+                    ),
+                    Style::default().fg(theme.inactive_fg),
+                )));
+            }
         }
     }
 
@@ -976,6 +1019,139 @@ mod tests {
             text.contains("Usage components complete · reported cost $0.0125"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn selected_session_renders_history_at_full_and_compact_thresholds() {
+        let mut session = test_session("history", "history");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        let mut harness = test_harness();
+        harness.history = Some(test_history());
+        telemetry.harness = Some(harness);
+        session.telemetry = Some(telemetry);
+
+        for (width, height, expected_row) in [(120, 12, " I  "), (80, 9, " T  ")] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), false))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("History complete"),
+                "{width}x{height}:\n{text}"
+            );
+            assert!(text.contains(expected_row), "{width}x{height}:\n{text}");
+            assert!(text.find("Usage components").unwrap() < text.find("History").unwrap());
+        }
+    }
+
+    #[test]
+    fn harness_detail_omits_history_below_detail_threshold() {
+        let mut session = test_session("history-short", "history");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        let mut harness = test_harness();
+        harness.history = Some(test_history());
+        telemetry.harness = Some(harness);
+        session.telemetry = Some(telemetry);
+        let backend = TestBackend::new(120, 11);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), false))
+            .unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("History complete"));
+    }
+
+    #[test]
+    fn history_keeps_live_runs_and_optional_detail_order() {
+        let mut session = test_session("history-run", "history");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        let mut harness = test_harness();
+        harness.history = Some(test_history());
+        harness.components.status = crate::model::ReconciliationStatus::Partial;
+        harness.components.reason = Some("component coverage is partial".into());
+        telemetry.harness = Some(harness);
+        telemetry.context_details.provider = Some("history-provider".into());
+        telemetry.context_details.reason = Some("history context note".into());
+        telemetry.fleet.runs.push(FleetRun {
+            lifecycle_version: Some(3),
+            run_id: "history-live-run".into(),
+            parent_run_id: None,
+            nested: false,
+            mode: FleetRunMode::Single,
+            state: FleetRunState::Running,
+            execution: FleetExecution::InProcess,
+            runner_pid: None,
+            started_at_ms: None,
+            updated_at_ms: None,
+            ended_at_ms: None,
+            source_updated_at_ms: 1,
+            stale: false,
+            process_terminal: None,
+            usage: FleetUsage::separate_run_aggregate(),
+            children: Vec::new(),
+            omitted_children: 0,
+            reason: None,
+        });
+        session.telemetry = Some(telemetry);
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), true))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        for label in [
+            "Outcomes complete",
+            "History complete",
+            "Note: component coverage is partial",
+            "Identity",
+            "Provider/model: history-provider/",
+            "Context note: history context note",
+            "history-liv…",
+        ] {
+            assert!(text.contains(label), "{label} missing:\n{text}");
+        }
+        assert!(text.find("Outcomes complete").unwrap() < text.find("History complete").unwrap());
+        assert!(
+            text.find("History complete").unwrap()
+                < text.find("Note: component coverage is partial").unwrap()
+        );
+        assert!(
+            text.find("Note: component coverage is partial").unwrap()
+                < text.find("Identity").unwrap()
+        );
+        assert!(
+            text.find("Identity").unwrap()
+                < text.find("Provider/model: history-provider/").unwrap()
+        );
+        assert!(
+            text.find("Provider/model: history-provider/").unwrap()
+                < text.find("Context note: history context note").unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_active_sessions_panel_renders_history_without_changing_selection() {
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        let mut selected = test_session("selected-history", "history");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        let mut harness = test_harness();
+        harness.history = Some(test_history());
+        telemetry.harness = Some(harness);
+        selected.telemetry = Some(telemetry);
+        app.sessions = vec![test_session("other", "other"), selected];
+        app.selected = 1;
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel_active(f, &app, f.area(), &app.theme, true))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("History complete") && text.contains(" T  "),
+            "{text}"
+        );
+        assert_eq!(app.selected, 1);
     }
 
     #[test]
@@ -1370,6 +1546,25 @@ mod tests {
         );
     }
 
+    fn test_history() -> crate::model::PiHarnessHistoryTelemetry {
+        crate::model::PiHarnessHistoryTelemetry {
+            status: crate::model::ReconciliationStatus::Complete,
+            assistant_count: 1,
+            omitted_assistant_points: 0,
+            points: vec![crate::model::PiAssistantUsagePoint {
+                components: Some(crate::model::TokenComponents::default()),
+                attribution: Some(crate::model::PiPointAttribution {
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                }),
+            }],
+            summary_event_count: 0,
+            omitted_summary_events: 0,
+            markers: Vec::new(),
+            reason: None,
+        }
+    }
+
     fn test_harness() -> crate::model::PiHarnessTelemetry {
         crate::model::PiHarnessTelemetry {
             assistant_outcomes: crate::model::AssistantOutcomeTelemetry {
@@ -1427,6 +1622,7 @@ mod tests {
                     ..crate::model::TokenComponents::default()
                 },
             }),
+            history: None,
         }
     }
 

@@ -2,11 +2,12 @@
 
 ## Status
 
-Approved by the owner on 2026-09-13. This branch implements the exact first
-Phase 2 delivery slice.
+Approved by the owner on 2026-09-13. The exact first Phase 2 delivery slice is
+implemented on `main`.
 
-Phase 0 and Phase 1 are on `main`. Their parser, accounting, privacy, and
-attachment contracts remain in force.
+Phase 0 and Phase 1 parser, accounting, privacy, and attachment contracts remain
+in force. The next bounded-history and summary-marker slice is approved in
+[`pi-harness-telemetry-phase-2-history.md`](pi-harness-telemetry-phase-2-history.md).
 
 ## Approved decisions
 

@@ -8,10 +8,12 @@ use crate::herdr::HerdrProcessMarker;
 use crate::herdr::{process_herdr_marker, run_bounded_herdr_json};
 use crate::model::{
     AgentSession, AssistantOutcomeTelemetry, AttachmentConfidence, AttachmentState, ChildProcess,
-    ComponentReconciliation, ContextTelemetryDetails, FleetTelemetry, PiAttributionBucket,
-    PiAttributionTelemetry, PiHarnessTelemetry, ReconciliationStatus, ReportedCostReconciliation,
-    SessionStatus, SessionTelemetry, SourceHealth, TelemetryCompleteness, TelemetryMetadata,
-    TelemetryPrecision, TokenComponents, UsageTelemetryDetails,
+    ComponentReconciliation, ContextTelemetryDetails, FleetTelemetry, PiAssistantUsagePoint,
+    PiAttributionBucket, PiAttributionTelemetry, PiHarnessHistoryTelemetry, PiHarnessTelemetry,
+    PiPointAttribution, PiSummaryMarker, PiSummaryMarkerKind, ReconciliationStatus,
+    ReportedCostReconciliation, SessionStatus, SessionTelemetry, SourceHealth,
+    TelemetryCompleteness, TelemetryMetadata, TelemetryPrecision, TokenComponents,
+    UsageTelemetryDetails,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -136,6 +138,8 @@ struct PiSemantic {
     duplicate_ids: bool,
     #[cfg(test)]
     rich_reduction_calls: Cell<u32>,
+    #[cfg(test)]
+    history_projection_calls: Cell<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -2261,7 +2265,163 @@ fn public_harness_telemetry(
             unavailable: token_components(parent.attribution.unavailable),
             overflow: token_components(parent.attribution.overflow),
         }),
+        // Aggregate validation intentionally remains independent from history.
+        history: public_history_telemetry(semantic, context_complete),
     }
+}
+
+fn point_attribution(metadata: Option<&AssistantMetadata>) -> Option<PiPointAttribution> {
+    match assistant_attribution(metadata) {
+        PiAttribution::Named(key) => Some(PiPointAttribution {
+            provider: key.provider,
+            model: key.model,
+        }),
+        PiAttribution::Unavailable => None,
+    }
+}
+
+/// Projects only bounded, already-reduced semantic observations. It never reads JSON again.
+fn public_history_telemetry(
+    semantic: &PiSemantic,
+    context_complete: bool,
+) -> Option<PiHarnessHistoryTelemetry> {
+    #[cfg(test)]
+    semantic
+        .history_projection_calls
+        .set(semantic.history_projection_calls.get().saturating_add(1));
+
+    let mut assistant_count = 0_u32;
+    let mut points = VecDeque::new();
+    let mut summary_count = 0_u32;
+    let mut candidates: VecDeque<(SummaryKind, u32)> = VecDeque::new();
+    for id in &semantic.order {
+        let entry = semantic.entries.get(id)?;
+        if entry.kind == PiEntryKind::Assistant {
+            assistant_count = assistant_count.saturating_add(1);
+            if points.len() == MAX_TOKEN_HISTORY_POINTS {
+                points.pop_front();
+            }
+            let components = match entry.usage {
+                UsageObservation::Value(usage) => match usage.components {
+                    Observation::Value(value) => Some(token_components(value)),
+                    Observation::Absent | Observation::Invalid => None,
+                },
+                UsageObservation::Absent | UsageObservation::Invalid => None,
+            };
+            points.push_back(PiAssistantUsagePoint {
+                components,
+                attribution: point_attribution(entry.assistant_metadata.as_ref()),
+            });
+        }
+        if let Some(summary) = entry.summary_observation {
+            summary_count = summary_count.saturating_add(1);
+            if candidates.len() == MAX_SUMMARY_OBSERVATIONS {
+                candidates.pop_front();
+            }
+            candidates.push_back((summary.kind, assistant_count));
+        }
+    }
+    let points: Vec<_> = points.into_iter().collect();
+    let visible_start = assistant_count.saturating_sub(points.len() as u32);
+    let mut markers = Vec::new();
+    for (kind, assistants_before) in candidates {
+        if assistants_before >= visible_start && assistants_before <= assistant_count {
+            markers.push(PiSummaryMarker {
+                kind: match kind {
+                    SummaryKind::Compaction => PiSummaryMarkerKind::Compaction,
+                    SummaryKind::BranchSummary => PiSummaryMarkerKind::BranchSummary,
+                },
+                position: assistants_before.saturating_sub(visible_start) as u8,
+            });
+        }
+    }
+    let scan_partial =
+        !context_complete || semantic.limited || semantic.invalid || semantic.duplicate_ids;
+    let status = if scan_partial {
+        if points.is_empty() && markers.is_empty() {
+            ReconciliationStatus::Unavailable
+        } else {
+            ReconciliationStatus::Partial
+        }
+    } else {
+        ReconciliationStatus::Complete
+    };
+    let history = PiHarnessHistoryTelemetry {
+        status,
+        assistant_count,
+        omitted_assistant_points: assistant_count.saturating_sub(points.len() as u32),
+        points,
+        summary_event_count: summary_count,
+        omitted_summary_events: summary_count.saturating_sub(markers.len() as u32),
+        markers,
+        reason: scan_partial.then(|| "persisted session scan is incomplete".to_string()),
+    };
+    history_validates(&history).then_some(history)
+}
+
+fn history_validates(history: &PiHarnessHistoryTelemetry) -> bool {
+    let points_and_markers_present = !history.points.is_empty() || !history.markers.is_empty();
+    let required_reason = "persisted session scan is incomplete";
+    let status_is_valid = match history.status {
+        ReconciliationStatus::Complete => history.reason.is_none(),
+        ReconciliationStatus::Partial => {
+            history.reason.as_deref() == Some(required_reason) && points_and_markers_present
+        }
+        ReconciliationStatus::Unavailable => {
+            history.reason.as_deref() == Some(required_reason) && !points_and_markers_present
+        }
+    };
+    let safe_attribution = history.points.iter().all(|point| {
+        point.attribution.as_ref().is_none_or(|attribution| {
+            valid_public_metadata(&attribution.provider)
+                && valid_public_metadata(&attribution.model)
+        })
+    });
+    let visible_marker_count_is_valid = history.omitted_assistant_points != 0
+        || history.markers.len()
+            == (history.summary_event_count as usize).min(MAX_SUMMARY_OBSERVATIONS);
+    history.points.len() <= MAX_TOKEN_HISTORY_POINTS
+        && history.markers.len() <= MAX_SUMMARY_OBSERVATIONS
+        && history.points.len() == (history.assistant_count as usize).min(MAX_TOKEN_HISTORY_POINTS)
+        && history.omitted_assistant_points
+            == history
+                .assistant_count
+                .saturating_sub(history.points.len() as u32)
+        && history.summary_event_count as usize >= history.markers.len()
+        && history.omitted_summary_events
+            == history
+                .summary_event_count
+                .saturating_sub(history.markers.len() as u32)
+        && visible_marker_count_is_valid
+        && history
+            .markers
+            .iter()
+            .all(|marker| marker.position as usize <= history.points.len())
+        && history
+            .markers
+            .windows(2)
+            .all(|pair| pair[0].position <= pair[1].position)
+        && safe_attribution
+        && history.reason.as_ref().is_none_or(|reason| {
+            reason == required_reason && reason.len() <= MAX_TELEMETRY_ERROR_BYTES
+        })
+        && status_is_valid
+}
+
+fn valid_public_metadata(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SEMANTIC_METADATA_BYTES
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
 }
 
 fn append_reason(reason: &mut Option<String>, addition: &str) {
@@ -6060,8 +6220,6 @@ mod tests {
             "ParentHarnessTelemetry",
             "AssistantOutcomeCounts",
             "BoundedAttributionBreakdown",
-            "assistant_points",
-            "summary_events",
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -6147,6 +6305,11 @@ mod tests {
             1,
             "attachment refresh must build rich telemetry once"
         );
+        assert_eq!(
+            semantic.history_projection_calls.get(),
+            1,
+            "attachment refresh must project history once"
+        );
         let parent = semantic.parent_harness_telemetry(true);
         assert_eq!(parent.attribution.named.len(), MAX_NAMED_ATTRIBUTION_KEYS);
         assert_eq!(parent.attribution.unavailable.input, 1);
@@ -6171,6 +6334,23 @@ mod tests {
         assert_eq!(harness["reported_cost"]["status"], "complete");
         assert!(harness.get("assistant_points").is_none());
         assert!(harness.get("summary_events").is_none());
+        assert!(harness["history"].is_object());
+        let history = &harness["history"];
+        assert_eq!(history["status"], "complete");
+        assert_eq!(history["assistant_count"], 66);
+        assert_eq!(history["omitted_assistant_points"], 2);
+        assert_eq!(history["points"].as_array().unwrap().len(), 64);
+        assert_eq!(
+            history["points"][0]["attribution"]["provider"],
+            "provider-2"
+        );
+        assert!(history["points"][63]["attribution"].is_null());
+        assert_eq!(history["summary_event_count"], 2);
+        assert_eq!(history["omitted_summary_events"], 0);
+        assert_eq!(history["markers"][0]["kind"], "compaction");
+        assert_eq!(history["markers"][0]["position"], 64);
+        assert_eq!(history["markers"][1]["kind"], "branch_summary");
+        assert!(history.get("tokensBefore").is_none());
         let mut text_output = Vec::new();
         crate::write_snapshot(&mut text_output, &app).unwrap();
         let text_output = String::from_utf8(text_output).unwrap();
@@ -6181,6 +6361,9 @@ mod tests {
             "Models",
             "Usage components",
             "reported cost complete",
+            "History",
+            "summaries",
+            "│ change",
         ] {
             assert!(
                 !text_output.contains(label),
@@ -7165,6 +7348,310 @@ mod tests {
                 "missing documented limit: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn history_projection_keeps_known_empty_one_and_latest_sixty_four_in_file_order() {
+        let empty = PiSemantic::default();
+        let empty_history = public_history_telemetry(&empty, true).unwrap();
+        assert_eq!(empty_history.status, ReconciliationStatus::Complete);
+        assert!(empty_history.points.is_empty());
+        assert_eq!(empty_history.assistant_count, 0);
+
+        let mut semantic = PiSemantic::default();
+        for index in 0..65 {
+            assert!(semantic.add(&serde_json::json!({
+                "type": "message", "id": format!("history-{index}"),
+                "parentId": (index > 0).then(|| format!("history-{}", index - 1)),
+                "message": {"role": "assistant", "provider": "p", "model": "m",
+                    "usage": {"input": index, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "content": []}
+            })));
+            let history = public_history_telemetry(&semantic, true).unwrap();
+            assert_eq!(history.assistant_count, index + 1);
+            assert_eq!(history.points.len(), ((index + 1) as usize).min(64));
+            assert_eq!(
+                history.omitted_assistant_points,
+                (index + 1).saturating_sub(64)
+            );
+        }
+        let history = public_history_telemetry(&semantic, true).unwrap();
+        assert_eq!(
+            history.points[0].components.as_ref().unwrap().input_tokens,
+            1
+        );
+        assert_eq!(
+            history.points[63].components.as_ref().unwrap().input_tokens,
+            64
+        );
+        assert_eq!(semantic.session_data(true).token_history.len(), 64);
+    }
+
+    #[test]
+    fn history_projection_uses_response_model_and_preserves_metadata_gaps() {
+        let mut semantic = PiSemantic::default();
+        for (id, response_model, expected) in [
+            ("response", serde_json::json!("actual"), Some("actual")),
+            ("null", serde_json::Value::Null, None),
+            ("invalid", serde_json::json!({"bad": true}), None),
+        ] {
+            assert!(semantic.add(&serde_json::json!({
+                "type": "message", "id": id, "parentId": null,
+                "message": {"role": "assistant", "provider": "provider", "model": "requested",
+                    "responseModel": response_model,
+                    "usage": null, "content": []}
+            })));
+            let point = public_history_telemetry(&semantic, true)
+                .unwrap()
+                .points
+                .last()
+                .unwrap()
+                .clone();
+            assert!(point.components.is_none());
+            assert_eq!(
+                point.attribution.as_ref().map(|value| value.model.as_str()),
+                expected
+            );
+        }
+        assert!(semantic.add(&serde_json::json!({
+            "type": "message", "id": "fallback", "parentId": null,
+            "message": {"role": "assistant", "provider": "provider", "model": "requested",
+                "usage": null, "content": []}
+        })));
+        assert_eq!(
+            public_history_telemetry(&semantic, true)
+                .unwrap()
+                .points
+                .last()
+                .unwrap()
+                .attribution
+                .as_ref()
+                .map(|value| value.model.as_str()),
+            Some("requested")
+        );
+    }
+
+    #[test]
+    fn history_projection_statuses_are_isolated_from_aggregate_harness() {
+        let mut semantic = PiSemantic::default();
+        assert!(semantic.add(&serde_json::json!({
+            "type": "message", "id": "one", "parentId": null,
+            "message": {"role": "assistant", "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "content": []}
+        })));
+        let partial = public_history_telemetry(&semantic, false).unwrap();
+        assert_eq!(partial.status, ReconciliationStatus::Partial);
+        assert_eq!(
+            partial.reason.as_deref(),
+            Some("persisted session scan is incomplete")
+        );
+        let unavailable = public_history_telemetry(&PiSemantic::default(), false).unwrap();
+        assert_eq!(unavailable.status, ReconciliationStatus::Unavailable);
+        assert!(unavailable.points.is_empty() && unavailable.markers.is_empty());
+        let aggregate = semantic.parent_harness_telemetry(true);
+        assert!(public_harness_telemetry(&aggregate, true, &semantic)
+            .components
+            .total
+            .is_some());
+
+        semantic.order.push("missing-entry".to_string());
+        let isolated = public_harness_telemetry(&aggregate, true, &semantic);
+        assert!(isolated.components.total.is_some());
+        assert!(isolated.history.is_none());
+    }
+
+    #[test]
+    fn history_projection_filters_markers_outside_the_visible_assistant_window() {
+        let mut semantic = PiSemantic::default();
+        assert!(semantic.add(&serde_json::json!({
+            "type": "compaction", "id": "before-all", "parentId": null,
+            "tokensBefore": 99
+        })));
+        for index in 0..65 {
+            assert!(semantic.add(&serde_json::json!({
+                "type": "message", "id": format!("assistant-{index}"), "parentId": null,
+                "message": {"role": "assistant", "usage": null, "content": []}
+            })));
+            let summary = match index {
+                0 => Some(("compaction", "at-visible-start")),
+                32 => Some(("branch_summary", "interior")),
+                _ => None,
+            };
+            if let Some((kind, id)) = summary {
+                assert!(semantic.add(&serde_json::json!({
+                    "type": kind, "id": id, "parentId": null, "tokensBefore": 123
+                })));
+            }
+        }
+        assert!(semantic.add(&serde_json::json!({
+            "type": "compaction", "id": "at-final", "parentId": null,
+            "tokensBefore": 456
+        })));
+
+        let history = public_history_telemetry(&semantic, true).unwrap();
+        assert_eq!(history.assistant_count, 65);
+        assert_eq!(history.omitted_assistant_points, 1);
+        assert_eq!(history.summary_event_count, 4);
+        assert_eq!(history.omitted_summary_events, 1);
+        assert_eq!(
+            history
+                .markers
+                .iter()
+                .map(|marker| (marker.kind, marker.position))
+                .collect::<Vec<_>>(),
+            vec![
+                (PiSummaryMarkerKind::Compaction, 0),
+                (PiSummaryMarkerKind::BranchSummary, 32),
+                (PiSummaryMarkerKind::Compaction, 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_validation_accepts_only_the_fixed_incomplete_reason() {
+        let complete = PiHarnessHistoryTelemetry {
+            status: ReconciliationStatus::Complete,
+            assistant_count: 0,
+            omitted_assistant_points: 0,
+            points: Vec::new(),
+            summary_event_count: 0,
+            omitted_summary_events: 0,
+            markers: Vec::new(),
+            reason: None,
+        };
+        assert!(history_validates(&complete));
+
+        let incomplete = "persisted session scan is incomplete".to_string();
+        let partial = PiHarnessHistoryTelemetry {
+            status: ReconciliationStatus::Partial,
+            assistant_count: 1,
+            omitted_assistant_points: 0,
+            points: vec![PiAssistantUsagePoint {
+                components: None,
+                attribution: None,
+            }],
+            summary_event_count: 0,
+            omitted_summary_events: 0,
+            markers: Vec::new(),
+            reason: Some(incomplete.clone()),
+        };
+        let unavailable = PiHarnessHistoryTelemetry {
+            status: ReconciliationStatus::Unavailable,
+            reason: Some(incomplete),
+            ..complete.clone()
+        };
+        assert!(history_validates(&partial));
+        assert!(history_validates(&unavailable));
+
+        for reason in [
+            "",
+            "arbitrary reason",
+            "persisted session scan is incomplete\n",
+            "x",
+        ] {
+            let mut invalid = partial.clone();
+            invalid.reason = Some(reason.to_string());
+            assert!(!history_validates(&invalid), "{reason:?} must be rejected");
+        }
+        let mut oversized = partial.clone();
+        oversized.reason = Some("x".repeat(MAX_TELEMETRY_ERROR_BYTES + 1));
+        assert!(!history_validates(&oversized));
+    }
+
+    #[test]
+    fn history_validation_rejects_inconsistent_status_counts_markers_and_metadata() {
+        let point = PiAssistantUsagePoint {
+            components: Some(TokenComponents::default()),
+            attribution: Some(PiPointAttribution {
+                provider: "provider".into(),
+                model: "model".into(),
+            }),
+        };
+        let history = PiHarnessHistoryTelemetry {
+            status: ReconciliationStatus::Complete,
+            assistant_count: 1,
+            omitted_assistant_points: 0,
+            points: vec![point],
+            summary_event_count: 1,
+            omitted_summary_events: 0,
+            markers: vec![PiSummaryMarker {
+                kind: PiSummaryMarkerKind::Compaction,
+                position: 1,
+            }],
+            reason: None,
+        };
+        assert!(history_validates(&history));
+
+        let mut invalid = history.clone();
+        invalid.omitted_assistant_points = 1;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.status = ReconciliationStatus::Partial;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.summary_event_count = 0;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.markers.clear();
+        invalid.omitted_summary_events = 1;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.markers[0].position = 2;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.points[0].attribution.as_mut().unwrap().model = "bad\u{202e}".into();
+        assert!(!history_validates(&invalid));
+        for value in ["", "bad\nvalue", "bad\u{202e}"] {
+            let mut invalid = history.clone();
+            invalid.points[0].attribution.as_mut().unwrap().provider = value.into();
+            assert!(!history_validates(&invalid), "{value:?} must be rejected");
+        }
+        let mut invalid = history.clone();
+        invalid.points[0].attribution.as_mut().unwrap().model =
+            "m".repeat(MAX_SEMANTIC_METADATA_BYTES + 1);
+        assert!(!history_validates(&invalid));
+        let mut invalid = history.clone();
+        invalid.points = vec![
+            PiAssistantUsagePoint {
+                components: None,
+                attribution: None,
+            };
+            MAX_TOKEN_HISTORY_POINTS + 1
+        ];
+        invalid.assistant_count = invalid.points.len() as u32;
+        assert!(!history_validates(&invalid));
+        let mut invalid = history.clone();
+        invalid.omitted_summary_events = 1;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.markers = vec![
+            PiSummaryMarker {
+                kind: PiSummaryMarkerKind::Compaction,
+                position: 1,
+            },
+            PiSummaryMarker {
+                kind: PiSummaryMarkerKind::BranchSummary,
+                position: 0,
+            },
+        ];
+        invalid.summary_event_count = 2;
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.status = ReconciliationStatus::Unavailable;
+        invalid.reason = Some("persisted session scan is incomplete".into());
+        assert!(!history_validates(&invalid));
+        invalid = history.clone();
+        invalid.status = ReconciliationStatus::Partial;
+        invalid.reason = None;
+        assert!(!history_validates(&invalid));
+        let mut invalid = history;
+        invalid.markers = vec![
+            PiSummaryMarker {
+                kind: PiSummaryMarkerKind::Compaction,
+                position: 0,
+            };
+            MAX_SUMMARY_OBSERVATIONS + 1
+        ];
+        invalid.summary_event_count = invalid.markers.len() as u32;
+        assert!(!history_validates(&invalid));
     }
 
     #[test]
