@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_session_renders_history_at_full_and_compact_thresholds() {
+    fn selected_session_renders_the_same_history_rows_at_wide_and_compact_widths() {
         let mut session = test_session("history", "history");
         let mut telemetry = crate::model::SessionTelemetry::process_only(1);
         let mut harness = test_harness();
@@ -1118,7 +1118,7 @@ mod tests {
         telemetry.harness = Some(harness);
         session.telemetry = Some(telemetry);
 
-        for (width, height, expected_row) in [(120, 14, " I  "), (80, 11, " T  ")] {
+        for (width, height) in [(120, 14), (80, 11)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
@@ -1129,8 +1129,7 @@ mod tests {
                 text.contains("History complete"),
                 "{width}x{height}:\n{text}"
             );
-            assert!(text.contains(expected_row), "{width}x{height}:\n{text}");
-            for required_row in [" $  ", " #  ", " M  ", " E  "] {
+            for required_row in ["Tokens ", "Cost   ", "Tools  ", "Model  ", "Events "] {
                 assert!(
                     text.contains(required_row),
                     "{width}x{height}: {required_row}\n{text}"
@@ -1242,7 +1241,7 @@ mod tests {
             .unwrap();
         let text = format!("{}", terminal.backend());
         assert!(
-            text.contains("History complete") && text.contains(" T  "),
+            text.contains("History complete") && text.contains("Tokens "),
             "{text}"
         );
         assert_eq!(app.selected, 1);
