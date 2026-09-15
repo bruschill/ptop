@@ -1,4 +1,5 @@
 pub mod pi;
+mod pi_live_harness;
 mod pi_subagents;
 mod pi_subagents_availability;
 pub mod process;

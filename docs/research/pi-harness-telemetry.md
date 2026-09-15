@@ -3,12 +3,15 @@
 ## Status
 
 This document is a research basis for later work. Phase 0 and Phase 1 are
-complete. The owner approved and `main` implements the first Phase 2 slice
-specified in [`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md):
-privacy-safe aggregate outcomes, component and cost reconciliation, and Pi model
-attribution in JSON and selected-session detail. Live harness state still needs
-a separate feasibility study because the installed Pi extension API does not
-provide a trusted ptop sidecar protocol or portable process-start identity.
+complete. The owner approved and `main` implements the Phase 2 aggregate and
+bounded-history slices specified in
+[`pi-harness-telemetry-phase-2.md`](pi-harness-telemetry-phase-2.md) and
+[`pi-harness-telemetry-phase-2-history.md`](pi-harness-telemetry-phase-2-history.md).
+Phase 3 is complete and release-accepted. Its optional local AF_UNIX extension
+uses kernel-authenticated endpoint identity under ptop's existing benign
+same-user threat model. The implementation includes the private protocol and
+reducer, embedded extension lifecycle/runtime, credentialed transport, two-tick
+validation, public DTO, and optional selected-session presentation.
 
 ## Summary
 
@@ -36,9 +39,10 @@ contract:
 Passive JSONL does not prove current streaming state, queue depth, retry state,
 an in-flight tool, UI-prompt state, or the active leaf after navigation without
 an append. RPC is not an acceptable monitoring transport because it is a
-content-bearing, mutating control protocol over a Pi subprocess. An optional
-extension sidecar remains a Unix-only design spike until ptop can independently
-prove ownership, freshness, replacement safety, and session binding.
+content-bearing, mutating control protocol over a Pi subprocess. The implemented
+optional Unix AF_UNIX design uses endpoint identity rather than byte authorship
+and passes the global registry, freshness, installation, session-binding, public
+API, and presentation gates in the Phase 3 plan.
 
 **Evidence scope.** This research uses installed first-party Pi `0.85.1` and the
 current ptop implementation and contracts. Where Pi documentation and installed
@@ -264,36 +268,46 @@ for a specific product requirement with:
 - no network or sync; and
 - a documented distinction between live-session and historical totals.
 
-### Optional sidecar feasibility gate
+### Optional sidecar gate: approved AF_UNIX endpoint identity
 
-A sidecar is not an implementation phase yet. Pi does not define a ptop-owned
-sidecar protocol or expose portable trusted process-start identity to an
-extension. A sidecar's self-reported PID, session ID, or start identity proves
-internal consistency, not authorship.
+A sidecar is now an optional Unix product design, not a file-based authorship
+experiment. Local AF_UNIX IPC is permitted for the optional Pi extension.
+Internet, IP, HTTP, RPC, and other network monitoring remain prohibited.
 
-Keep the spike Unix-only until an equally strong Windows mechanism exists. ptop
-must independently bind any sidecar to an already verified Pi process and owned
-session. Ambiguity, stale data, or validation failure leaves JSONL-only or
-process-only behavior unchanged.
+ptop starts sidecar discovery only after independently completing its current
+owned JSONL attachment: process-first discovery, header/CWD/file identity,
+ambiguity, and Unix process-start checks. The socket path and all self-reported
+fields are discovery hints only. ptop accepts only one live candidate whose
+kernel peer credential identifies the exact currently verified Pi PID, whose
+first bounded frame matches the already attached session identity, and whose
+existing process-start identity still matches before and after connection/frame
+handling. Linux uses `SO_PEERCRED`; Darwin support requires runtime-successful
+peer PID/token APIs. Missing or ambiguous APIs fail closed.
 
-A feasibility prototype must specify and test:
+This is kernel-authenticated **endpoint identity**, not per-byte authorship. A
+connected descriptor can be transferred to a different writer. Malicious
+same-UID processes, malicious extensions inside Pi, root/kernel attackers, and
+deliberate descriptor transfer are outside the benign same-user threat model,
+consistent with current local attachment. Never claim that every byte came from
+Pi.
 
-- canonical discovery relative to an already attached session file;
-- regular-file, no-symlink, owner, and permission checks where supported;
-- a versioned schema with bounded file size, strings, enums, and point counts;
-- unknown-version rejection;
-- atomic replacement semantics for each supported platform;
-- stale expiry, monotonic sequence handling, and sequence rollback;
-- session replacement, extension reload, extension crash, PID reuse, and
-  duplicate writers;
-- independent process and session identity checks;
-- no sidecar discovery or access in `--demo`;
-- no collector or extension network requests; and
-- no logging of raw extension events.
+The extension may reduce only generic phase and a sampled pending-message
+boolean. Unknown is `null` for both values, never a fabricated idle/false value
+or an `unknown` phase string. It must reduce events immediately and never retain,
+write, or log payloads, event objects, raw errors, titles, tool names, or paths.
+`--demo` never discovers or connects. A PiCollector-owned global registry scans
+one complete bounded generation, not once per session, stages frames until the
+next normal process snapshot confirms identity, and leaves existing streams alive
+while new discovery is unavailable. Failure leaves valid JSONL telemetry
+unchanged, or otherwise leaves a process-only row. Regular-file sidecars remain
+rejected: permissions, atomic replacement, inode matching, and sequence checks
+do not authenticate writers.
 
-`0600` and atomic rename behavior are Unix-specific implementation details, not
-a portable protocol. Prove authorship and replacement safety before accepting
-any sidecar value.
+The approved contract, measured Linux/Darwin probe evidence, and remaining
+implementation conditions are in
+[`pi-harness-telemetry-phase-3.md`](pi-harness-telemetry-phase-3.md). The
+reviewable execution plan and fixture matrix are in
+[`pi-harness-telemetry-phase-3-plan.md`](pi-harness-telemetry-phase-3-plan.md).
 
 ## Revised roadmap
 
@@ -345,14 +359,21 @@ approved in
 - Preserve existing JSON compatibility where possible.
 - Test wide, compact, and narrow layouts and aligned click targets.
 
-### Phase 3: Unix-only sidecar feasibility spike
+### Phase 3: optional Unix AF_UNIX live telemetry
 
-- Implement only enough disposable instrumentation to prove or reject ownership,
-  discovery, freshness, schema, and replacement safety.
-- Start with generic phase and sampled pending-message state only.
-- Keep exact queue depth, retry progress, and arbitrary tool names out of scope.
-- Keep Windows process-only.
-- Do not merge the spike into monitoring paths until every gate above passes.
+- Implement the owner-approved endpoint-identity contract through the
+  reviewable slices in
+  [`pi-harness-telemetry-phase-3-plan.md`](pi-harness-telemetry-phase-3-plan.md),
+  including explicit local embedded-extension `install`, `status`, and `remove`
+  commands; complete global discovery generations; and cross-tick frame
+  acceptance.
+- Publish generic phase and sampled pending-message state only; keep exact queue
+  depth, retry progress, and arbitrary tool names out of scope.
+- Keep Windows process-only, fleet separate, and `--demo` collector-free.
+- Fail closed on runtime API, credential, discovery, frame, freshness, or
+  ambiguity failure while preserving valid JSONL telemetry or the process row.
+- Phase 3 is complete and release-accepted. The Live row appears only when the
+  selected-session detail has genuine surplus capacity.
 
 ### Deferred: cross-session history
 
@@ -392,16 +413,20 @@ retention contract.
 - Navigation to an earlier leaf without an appended entry.
 - A clear distinction between persisted graph leaves and the unknown live leaf.
 
-### Sidecar spike fixtures
+### Sidecar implementation fixtures
 
-- Normal lifecycle, session replacement, reload, crash, and stale expiry.
-- Symlink, wrong owner, permissive mode, oversized file, unknown version,
-  malformed schema, replacement race, rollback, duplicate writers, and PID
-  reuse.
-- A Pi process launched with `--no-session`, plus ptop TUI, `--json`, and
-  `--demo` behavior.
-- Proof that neither the extension nor collector logs payloads or performs
-  network requests.
+- Normal lifecycle, session replacement, reload, crash, session switch,
+  reconnect, competing connections, EOF, stale expiry, sequence rollback, and
+  PID reuse.
+- Symlink, wrong owner, permissive directory/socket, wrong type, bounded
+  candidate exhaustion, malformed/oversized framing and schema, unknown version,
+  control/bidi strings, wrong peer PID, unsupported Darwin API, and mutation
+  tests for every fail-closed guard.
+- A Pi process launched with `--no-session`, no extension, Linux/macOS
+  differences, Windows process-only behavior, JSON/text privacy sentinels,
+  fleet exclusion, and `--demo` zero access.
+- Proof that neither extension nor collector logs payloads or uses Internet, IP,
+  HTTP, RPC, TCP, or UDP monitoring.
 
 ## Sources
 

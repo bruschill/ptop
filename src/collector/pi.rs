@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use super::pi_live_harness::{SidecarRegistry, VerifiedSidecarAttachment};
 use super::{
     pi_subagents::{pi_subagent_runner_run_id, PiSubagentParent, PiSubagentsCollector},
     process, SharedProcessData,
@@ -68,6 +70,8 @@ pub struct PiCollector {
     tails: HashMap<PathBuf, PiTail>,
     model_catalogs: HashMap<PathBuf, ModelCatalogCache>,
     subagents: PiSubagentsCollector,
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    sidecars: SidecarRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +518,8 @@ impl PiCollector {
             tails: HashMap::new(),
             model_catalogs: HashMap::new(),
             subagents: PiSubagentsCollector::new(),
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+            sidecars: SidecarRegistry::new(),
         }
     }
 
@@ -558,6 +564,26 @@ impl PiCollector {
         let mut read_budget = MAX_TAIL_WORK_BYTES;
         let attachment_results =
             self.resolve_attachments_with_budget(&pi_pids, shared, &mut read_budget);
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        {
+            let sidecar_attachments: Vec<VerifiedSidecarAttachment> = attachment_results
+                .iter()
+                .filter_map(|(pid, result)| {
+                    let attachment = result.attachment.as_ref()?;
+                    let start_id = attachment.start_id.as_deref()?;
+                    let current_start_id = self.start_id_cache.get(pid)?.as_deref()?;
+                    if start_id != current_start_id || !shared.process_info.contains_key(pid) {
+                        return None;
+                    }
+                    Some(VerifiedSidecarAttachment::new(
+                        *pid,
+                        start_id,
+                        &attachment.session_id,
+                    ))
+                })
+                .collect();
+            self.sidecars.poll_at(&sidecar_attachments, observed_at_ms);
+        }
         let owned_paths: HashSet<PathBuf> = attachment_results
             .values()
             .filter_map(|result| {
@@ -646,6 +672,8 @@ impl PiCollector {
                     if let Some(fleet) = fleet_by_session.remove(&attachment.session_id) {
                         telemetry.fleet = fleet;
                     }
+                    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+                    attach_live_harness(&mut telemetry, &self.sidecars, pid);
                 }
                 Some(AgentSession {
                     pid,
@@ -1020,6 +1048,7 @@ impl PiCollector {
                     "pi-subagents status root unavailable",
                 ),
                 harness: data.harness.clone(),
+                live_harness: None,
             },
             data,
         ))
@@ -1180,6 +1209,11 @@ impl PiCollector {
     pub(crate) fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn attach_live_harness(telemetry: &mut SessionTelemetry, sidecars: &SidecarRegistry, pid: u32) {
+    telemetry.live_harness = sidecars.telemetry(pid);
 }
 
 fn telemetry_task_label(attached: bool) -> &'static str {
@@ -3975,6 +4009,28 @@ mod tests {
                 .map(|attachment| attachment.path.clone()),
             Some(fs::canonicalize(path).unwrap())
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn committed_live_observation_is_attached_to_session_telemetry() {
+        let mut sidecars = SidecarRegistry::new();
+        sidecars.inject_healthy_for_test(
+            VerifiedSidecarAttachment::new(10, "start", "live-session"),
+            123,
+        );
+        let mut telemetry = SessionTelemetry::process_only(123);
+
+        attach_live_harness(&mut telemetry, &sidecars, 10);
+
+        let live = telemetry
+            .live_harness
+            .as_ref()
+            .expect("committed live observation");
+        assert_eq!(live.source_health, SourceHealth::Healthy);
+        assert_eq!(live.observed_at_ms, Some(123));
+        assert_eq!(live.phase, None);
+        assert_eq!(live.pending_messages, None);
     }
 
     #[test]

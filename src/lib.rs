@@ -49,6 +49,7 @@ pub mod app;
 pub mod collector;
 pub mod config;
 pub mod demo;
+mod extension_lifecycle;
 mod herdr;
 pub mod host_info;
 pub mod jump;
@@ -184,6 +185,15 @@ fn exit_with_message(message: &str) -> ! {
 
 pub fn run() -> io::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
+    if let Some(command) = extension_command_from_args(&args) {
+        match command.and_then(extension_lifecycle::execute) {
+            Ok(message) => {
+                println!("{message}");
+                return Ok(());
+            }
+            Err(message) => exit_with_message(&message),
+        }
+    }
     let options = match runtime_options_from_args(&args) {
         Ok(options) => options,
         Err(message) => exit_with_message(&message),
@@ -288,6 +298,21 @@ struct RuntimeOptions {
     demo_mode: bool,
     exit_on_jump: bool,
     mouse_capture: bool,
+}
+
+fn extension_command_from_args(
+    args: &[OsString],
+) -> Option<Result<extension_lifecycle::Command, String>> {
+    if args.get(1) != Some(&OsString::from("extension")) {
+        return None;
+    }
+    let result = match (args.get(2).and_then(|value| value.to_str()), args.get(3)) {
+        (Some("install"), None) => Ok(extension_lifecycle::Command::Install),
+        (Some("remove"), None) => Ok(extension_lifecycle::Command::Remove),
+        (Some("status"), None) => Ok(extension_lifecycle::Command::Status),
+        _ => Err("usage: ptop extension <install|status|remove>".to_string()),
+    };
+    Some(result)
 }
 
 fn runtime_options_from_args(args: &[OsString]) -> Result<RuntimeOptions, String> {
@@ -780,6 +805,28 @@ mod tests {
     use crate::model::{TelemetryCompleteness, TelemetryPrecision};
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn extension_commands_are_exact_and_do_not_enter_runtime_options() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            extension_command_from_args(&args(&["ptop", "extension", "status"])),
+            Some(Ok(extension_lifecycle::Command::Status))
+        );
+        assert!(
+            extension_command_from_args(&args(&["ptop", "extension", "status", "now"]))
+                .unwrap()
+                .is_err()
+        );
+        for rejected in ["update", "restore", "force"] {
+            assert!(
+                extension_command_from_args(&args(&["ptop", "extension", rejected]))
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        assert!(extension_command_from_args(&args(&["ptop", "--demo"])).is_none());
+    }
 
     #[test]
     fn mouse_capture_is_opt_in() {

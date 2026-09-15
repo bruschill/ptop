@@ -520,6 +520,40 @@ fn telemetry_metadata_line(
     ])
 }
 
+fn live_phase_label(phase: crate::model::PiLivePhase) -> &'static str {
+    match phase {
+        crate::model::PiLivePhase::Idle => "idle",
+        crate::model::PiLivePhase::Generating => "generating",
+        crate::model::PiLivePhase::ToolRunning => "tool running",
+        crate::model::PiLivePhase::Compacting => "compacting",
+        crate::model::PiLivePhase::WaitingForUser => "waiting for user",
+    }
+}
+
+fn live_harness_line(
+    telemetry: &crate::model::PiLiveHarnessTelemetry,
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    let value = match telemetry.source_health {
+        crate::model::SourceHealth::Healthy => {
+            match (telemetry.phase, telemetry.pending_messages) {
+                (Some(phase), Some(pending)) if !telemetry.stale => format!(
+                    "{} · pending {}",
+                    live_phase_label(phase),
+                    if pending { "yes" } else { "no" }
+                ),
+                _ => "unavailable · values unavailable".to_string(),
+            }
+        }
+        crate::model::SourceHealth::Stale => "stale · values unavailable".to_string(),
+        crate::model::SourceHealth::Unavailable | crate::model::SourceHealth::Error => return None,
+    };
+    Some(Line::from(vec![
+        Span::styled(" Live ", Style::default().fg(theme.graph_text)),
+        Span::styled(value, Style::default().fg(theme.inactive_fg)),
+    ]))
+}
+
 fn draw_pi_metadata(
     f: &mut Frame,
     session: &AgentSession,
@@ -577,6 +611,10 @@ fn draw_pi_metadata(
             )
         })
         .unwrap_or_else(|| "—".to_string());
+    let live_line = telemetry
+        .live_harness
+        .as_ref()
+        .and_then(|live| live_harness_line(live, theme));
     let mut lines = vec![
         Line::from(vec![
             Span::styled(" Attachment ", Style::default().fg(theme.graph_text)),
@@ -604,6 +642,8 @@ fn draw_pi_metadata(
                 Style::default().fg(theme.inactive_fg),
             ),
         ]),
+    ];
+    lines.extend([
         telemetry_metadata_line("Context", context.clone(), &telemetry.context, theme),
         telemetry_metadata_line(
             "Tokens",
@@ -615,36 +655,34 @@ fn draw_pi_metadata(
             &telemetry.usage,
             theme,
         ),
-    ];
+    ]);
 
     if compact_for_runs {
-        lines = vec![
-            Line::from(vec![
-                Span::styled(" Attachment ", Style::default().fg(theme.graph_text)),
-                Span::styled(
-                    telemetry.attachment.label(),
-                    Style::default().fg(theme.main_fg),
+        lines = vec![Line::from(vec![
+            Span::styled(" Attachment ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                telemetry.attachment.label(),
+                Style::default().fg(theme.main_fg),
+            ),
+            Span::styled(" · source ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                telemetry.source_health.label(),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ])];
+        lines.push(Line::from(vec![
+            Span::styled(" Context ", Style::default().fg(theme.graph_text)),
+            Span::styled(context, Style::default().fg(theme.inactive_fg)),
+            Span::styled(" · Tokens ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                format!(
+                    "{}{}",
+                    tokens,
+                    if session.usage_is_partial() { "+" } else { "" }
                 ),
-                Span::styled(" · source ", Style::default().fg(theme.graph_text)),
-                Span::styled(
-                    telemetry.source_health.label(),
-                    Style::default().fg(theme.inactive_fg),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Context ", Style::default().fg(theme.graph_text)),
-                Span::styled(context, Style::default().fg(theme.inactive_fg)),
-                Span::styled(" · Tokens ", Style::default().fg(theme.graph_text)),
-                Span::styled(
-                    format!(
-                        "{}{}",
-                        tokens,
-                        if session.usage_is_partial() { "+" } else { "" }
-                    ),
-                    Style::default().fg(theme.inactive_fg),
-                ),
-            ]),
-        ];
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]));
         if telemetry.harness.is_none() {
             lines.push(Line::from(Span::styled(
                 format!(" Identity {identity}"),
@@ -752,6 +790,13 @@ fn draw_pi_metadata(
                     Style::default().fg(theme.graph_text),
                 ),
             ]));
+        }
+    }
+
+    if lines.len() < area.height as usize {
+        if let Some(line) = live_line {
+            let index = if compact_for_runs { 1 } else { 2 };
+            lines.insert(index.min(lines.len()), line);
         }
     }
 
@@ -914,10 +959,200 @@ mod tests {
     use crate::config::PanelVisibility;
     use crate::model::{
         FleetExecution, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
-        SessionStatus, SourceHealth, TelemetryCompleteness, TelemetryPrecision,
+        PiLiveHarnessProvenance, PiLiveHarnessTelemetry, PiLivePhase, SessionStatus, SourceHealth,
+        TelemetryCompleteness, TelemetryPrecision,
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn live_fixture(
+        phase: Option<PiLivePhase>,
+        pending_messages: Option<bool>,
+        source_health: SourceHealth,
+        stale: bool,
+    ) -> PiLiveHarnessTelemetry {
+        PiLiveHarnessTelemetry {
+            phase,
+            pending_messages,
+            source_health,
+            provenance: PiLiveHarnessProvenance::ExtensionAfUnixV1,
+            observed_at_ms: Some(1),
+            stale,
+            reason: None,
+        }
+    }
+
+    fn line_text(line: Line<'static>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn live_harness_line_covers_phase_pending_unknown_and_health_states() {
+        let theme = Theme::default();
+        for (phase, label) in [
+            (PiLivePhase::Idle, "idle"),
+            (PiLivePhase::Generating, "generating"),
+            (PiLivePhase::ToolRunning, "tool running"),
+            (PiLivePhase::Compacting, "compacting"),
+            (PiLivePhase::WaitingForUser, "waiting for user"),
+        ] {
+            for (pending, answer) in [(false, "no"), (true, "yes")] {
+                let live = live_fixture(Some(phase), Some(pending), SourceHealth::Healthy, false);
+                assert_eq!(
+                    line_text(live_harness_line(&live, &theme).unwrap()),
+                    format!(" Live {label} · pending {answer}")
+                );
+            }
+        }
+
+        for (phase, pending) in [
+            (None, None),
+            (None, Some(true)),
+            (Some(PiLivePhase::Idle), None),
+        ] {
+            let live = live_fixture(phase, pending, SourceHealth::Healthy, false);
+            assert_eq!(
+                line_text(live_harness_line(&live, &theme).unwrap()),
+                " Live unavailable · values unavailable"
+            );
+        }
+        let stale = live_fixture(
+            Some(PiLivePhase::Generating),
+            Some(true),
+            SourceHealth::Stale,
+            true,
+        );
+        assert_eq!(
+            line_text(live_harness_line(&stale, &theme).unwrap()),
+            " Live stale · values unavailable"
+        );
+        for health in [SourceHealth::Unavailable, SourceHealth::Error] {
+            let live = live_fixture(None, None, health, false);
+            assert!(live_harness_line(&live, &theme).is_none());
+        }
+    }
+
+    #[test]
+    fn selected_live_line_keeps_order_and_fits_wide_compact_and_narrow_details() {
+        for width in [120, 80, 45] {
+            let mut session = test_session("selected-live", "selected");
+            let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+            telemetry.live_harness = Some(live_fixture(
+                Some(PiLivePhase::WaitingForUser),
+                Some(true),
+                SourceHealth::Healthy,
+                false,
+            ));
+            session.telemetry = Some(telemetry);
+            let backend = TestBackend::new(width, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_pi_metadata(frame, &session, frame.area(), &Theme::default(), false)
+                })
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("Live waiting for user · pending yes"),
+                "{width}:\n{text}"
+            );
+            assert!(text.find("Source").unwrap() < text.find("Live waiting").unwrap());
+            assert!(text.find("Live waiting").unwrap() < text.find("Identity").unwrap());
+        }
+
+        let mut hidden = test_session("hidden-live", "hidden");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::Idle),
+            Some(false),
+            SourceHealth::Healthy,
+            false,
+        ));
+        hidden.telemetry = Some(telemetry);
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        app.sessions = vec![hidden, test_session("selected-plain", "plain")];
+        app.selected = 1;
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_sessions_panel(frame, &app, frame.area(), &app.theme))
+            .unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("Live idle"));
+
+        let mut narrow = test_session("narrow-live", "narrow");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::WaitingForUser),
+            Some(true),
+            SourceHealth::Healthy,
+            false,
+        ));
+        narrow.telemetry = Some(telemetry);
+        let mut app = App::new(Theme::default(), PanelVisibility::default());
+        app.sessions.push(narrow);
+        let backend = TestBackend::new(45, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_sessions_panel_with_promoted_runs(frame, &app, frame.area(), &app.theme, true)
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains(" Context "), "{text}");
+        assert!(!text.contains("Live waiting"), "{text}");
+    }
+
+    #[test]
+    fn constrained_live_detail_preserves_runs_priority() {
+        let mut session = test_session("live-runs", "live-runs");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::ToolRunning),
+            Some(false),
+            SourceHealth::Healthy,
+            false,
+        ));
+        session.telemetry = Some(telemetry);
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_pi_metadata(frame, &session, frame.area(), &Theme::default(), true))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("pi-subagents telemetry"), "{text}");
+        assert!(!text.contains("Live tool running"), "{text}");
+
+        let mut compact = test_session("live-compact", "live-compact");
+        let mut telemetry = crate::model::SessionTelemetry::process_only(1);
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::ToolRunning),
+            Some(false),
+            SourceHealth::Healthy,
+            false,
+        ));
+        telemetry.harness = Some(test_harness());
+        compact.telemetry = Some(telemetry);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_pi_metadata(frame, &compact, frame.area(), &Theme::default(), true))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        for required in [
+            "Live tool running · pending no",
+            "Outcomes complete",
+            "Models gpt5 145",
+            "Usage components complete",
+            "pi-subagents telemetry",
+        ] {
+            assert!(text.contains(required), "{required}:\n{text}");
+        }
+        assert!(text.find("source unavailable").unwrap() < text.find("Live tool").unwrap());
+        assert!(text.find("Live tool").unwrap() < text.find("Context").unwrap());
+    }
 
     #[test]
     fn non_1m_context_window_does_not_show_1m_suffix() {
@@ -1028,6 +1263,12 @@ mod tests {
         let mut harness = test_harness();
         harness.history = Some(test_history());
         telemetry.harness = Some(harness);
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::Generating),
+            Some(false),
+            SourceHealth::Healthy,
+            false,
+        ));
         session.telemetry = Some(telemetry);
 
         for (width, height, expected_row) in [(120, 12, " I  "), (80, 9, " T  ")] {
@@ -1042,6 +1283,10 @@ mod tests {
                 "{width}x{height}:\n{text}"
             );
             assert!(text.contains(expected_row), "{width}x{height}:\n{text}");
+            assert!(
+                !text.contains("Live generating"),
+                "{width}x{height}:\n{text}"
+            );
             assert!(text.find("Usage components").unwrap() < text.find("History").unwrap());
         }
     }
@@ -1159,6 +1404,12 @@ mod tests {
         let mut session = test_session("harness-priority", "harness");
         let mut telemetry = crate::model::SessionTelemetry::process_only(1);
         telemetry.harness = Some(test_harness());
+        telemetry.live_harness = Some(live_fixture(
+            Some(PiLivePhase::Generating),
+            Some(false),
+            SourceHealth::Healthy,
+            false,
+        ));
         telemetry.fleet.runs.push(FleetRun {
             lifecycle_version: Some(3),
             run_id: "run-1".into(),
@@ -1207,6 +1458,7 @@ mod tests {
         );
         assert!(compact.contains("Usage components complete"), "{compact}");
         assert!(!compact.contains("Identity"), "{compact}");
+        assert!(!compact.contains("Live generating"), "{compact}");
         assert!(compact.contains("Fleet unavailable"), "{compact}");
 
         let backend = TestBackend::new(120, 12);
