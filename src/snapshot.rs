@@ -428,6 +428,14 @@ mod tests {
                 unknown: 0,
                 reason: Some("persisted session scan is incomplete".to_string()),
             },
+            activity: crate::model::PiHarnessActivityTelemetry {
+                status: crate::model::ReconciliationStatus::Complete,
+                tool_calls: Some(0),
+                tool_results: Some(0),
+                compactions: Some(0),
+                branch_summaries: Some(0),
+                reason: None,
+            },
             components: crate::model::ComponentReconciliation {
                 status: crate::model::ReconciliationStatus::Partial,
                 total: Some(components),
@@ -449,6 +457,15 @@ mod tests {
                 unavailable: crate::model::TokenComponents::default(),
                 overflow: crate::model::TokenComponents::default(),
             }),
+            cost_attribution: crate::model::PiCostAttributionTelemetry {
+                status: crate::model::ReconciliationStatus::Unavailable,
+                total: None,
+                named: Vec::new(),
+                unavailable_assistant: None,
+                overflow: None,
+                unattributed_tool_or_summary: None,
+                reason: Some("no reported cost observations".to_string()),
+            },
             history: Some(crate::model::PiHarnessHistoryTelemetry {
                 status: crate::model::ReconciliationStatus::Complete,
                 assistant_count: 1,
@@ -459,6 +476,8 @@ mod tests {
                         provider: "provider".to_string(),
                         model: "model".to_string(),
                     }),
+                    reported_cost: None,
+                    tool_calls: None,
                 }],
                 summary_event_count: 1,
                 omitted_summary_events: 0,
@@ -479,9 +498,11 @@ mod tests {
         assert_eq!(
             sorted_keys(&json),
             vec![
+                "activity",
                 "assistant_outcomes",
                 "attribution",
                 "components",
+                "cost_attribution",
                 "history",
                 "reported_cost",
             ]
@@ -491,6 +512,29 @@ mod tests {
             vec![
                 "aborted", "deferred", "error", "length", "pending", "reason", "status", "stop",
                 "tool_use", "total", "unknown",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["activity"]),
+            vec![
+                "branch_summaries",
+                "compactions",
+                "reason",
+                "status",
+                "tool_calls",
+                "tool_results"
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&json["cost_attribution"]),
+            vec![
+                "named",
+                "overflow",
+                "reason",
+                "status",
+                "total",
+                "unattributed_tool_or_summary",
+                "unavailable_assistant"
             ]
         );
         assert_eq!(
@@ -530,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             sorted_keys(&json["history"]["points"][0]),
-            vec!["attribution", "components"]
+            vec!["attribution", "components", "reported_cost", "tool_calls"]
         );
         assert_eq!(
             sorted_keys(&json["history"]["points"][0]["attribution"]),
@@ -576,6 +620,8 @@ mod tests {
 
         assert!(null_history["history"]["points"][0]["components"].is_null());
         assert!(null_history["history"]["points"][0]["attribution"].is_null());
+        assert!(null_history["history"]["points"][0]["reported_cost"].is_null());
+        assert!(null_history["history"]["points"][0]["tool_calls"].is_null());
         let mut unavailable_harness = harness;
         unavailable_harness.history = None;
         assert!(serde_json::to_value(unavailable_harness).unwrap()["history"].is_null());

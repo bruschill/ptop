@@ -556,14 +556,14 @@ fn draw_pi_metadata(
         .and_then(|harness| harness.history.as_ref())
         .is_some()
         && area.width >= 90
-        && available_metadata_rows >= 12;
+        && available_metadata_rows >= 14;
     let history_compact = telemetry
         .harness
         .as_ref()
         .and_then(|harness| harness.history.as_ref())
         .is_some()
         && area.width < 90
-        && available_metadata_rows >= 9;
+        && available_metadata_rows >= 11;
     let compact_for_runs = (show_runs && !telemetry.fleet.runs.is_empty() && area.height <= 6)
         || (telemetry.harness.is_some()
             && (available_metadata_rows < 8 || history_full || history_compact));
@@ -780,13 +780,10 @@ fn harness_detail_lines(
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let outcomes = &harness.assistant_outcomes;
-    let mut outcome_parts = vec![
-        format!("Outcomes {}", reconciliation_label(outcomes.status)),
-        outcomes.total.to_string(),
-    ];
+    let mut outcome_parts = Vec::new();
     for (label, value) in [
         ("stop", outcomes.stop),
-        ("tool", outcomes.tool_use),
+        ("tool turns", outcomes.tool_use),
         ("length", outcomes.length),
         ("error", outcomes.error),
         ("aborted", outcomes.aborted),
@@ -798,11 +795,26 @@ fn harness_detail_lines(
             outcome_parts.push(format!("{label} {value}"));
         }
     }
+    let activity = &harness.activity;
+    let mut activity_parts = vec![
+        format!("Activity {}", reconciliation_label(activity.status)),
+        format!("turns {}", outcomes.total),
+    ];
+    for (label, value) in [
+        ("calls", activity.tool_calls),
+        ("results", activity.tool_results),
+        ("compactions", activity.compactions),
+        ("summaries", activity.branch_summaries),
+    ] {
+        activity_parts.push(format!(
+            "{label} {}",
+            value.map_or("—".to_string(), |value| value.to_string())
+        ));
+    }
+    activity_parts.extend(outcome_parts);
+    let activity_line = format!(" {}", activity_parts.join(" · "));
     let mut lines = vec![Line::from(Span::styled(
-        format!(
-            " {}",
-            truncate_str(&outcome_parts.join(" · "), width as usize)
-        ),
+        truncate_str(&activity_line, width as usize),
         Style::default().fg(theme.inactive_fg),
     ))];
     let model_line = match &harness.attribution {
@@ -815,13 +827,45 @@ fn harness_detail_lines(
                 } else {
                     shorten_model(&bucket.model, false)
                 };
+                let cost = harness
+                    .cost_attribution
+                    .named
+                    .iter()
+                    .find(|cost| cost.provider == bucket.provider && cost.model == bucket.model)
+                    .map(|cost| format!(" ${:.4}", cost.reported_cost))
+                    .unwrap_or_default();
                 values.push(format!(
-                    "{name} {}",
+                    "{name} {}{cost}",
                     fmt_tokens(token_component_total(&bucket.components))
                 ));
             }
-            if attribution.named.len() > 2 {
-                values.push(format!("+{} models", attribution.named.len() - 2));
+            for bucket in &harness.cost_attribution.named {
+                if values.len() >= 2 {
+                    break;
+                }
+                if !attribution.named.iter().any(|tokens| {
+                    tokens.provider == bucket.provider && tokens.model == bucket.model
+                }) {
+                    values.push(format!(
+                        "{}/{} — ${:.4}",
+                        bucket.provider, bucket.model, bucket.reported_cost
+                    ));
+                }
+            }
+            if attribution
+                .named
+                .len()
+                .max(harness.cost_attribution.named.len())
+                > 2
+            {
+                values.push(format!(
+                    "+{} models",
+                    attribution
+                        .named
+                        .len()
+                        .max(harness.cost_attribution.named.len())
+                        - 2
+                ));
             }
             let unavailable = token_component_total(&attribution.unavailable);
             if unavailable > 0 {
@@ -830,6 +874,21 @@ fn harness_detail_lines(
             let overflow = token_component_total(&attribution.overflow);
             if overflow > 0 {
                 values.push(format!("other models {}", fmt_tokens(overflow)));
+            }
+            for (label, value) in [
+                (
+                    "cost unavailable",
+                    harness.cost_attribution.unavailable_assistant,
+                ),
+                ("cost overflow", harness.cost_attribution.overflow),
+                (
+                    "non-assistant cost",
+                    harness.cost_attribution.unattributed_tool_or_summary,
+                ),
+            ] {
+                if value.unwrap_or(0.0) > 0.0 {
+                    values.push(format!("{label} ${:.4}", value.unwrap_or(0.0)));
+                }
             }
             if values.is_empty() {
                 values.push("none".to_string());
@@ -853,18 +912,34 @@ fn harness_detail_lines(
         Some(value) => format!("${value:.4}"),
         None => reconciliation_label(harness.reported_cost.status).to_string(),
     };
+    let component_values = harness
+        .components
+        .total
+        .map(|value| {
+            format!(
+                "I {} · O {} · R {} · W {}",
+                fmt_tokens(value.input_tokens),
+                fmt_tokens(value.output_tokens),
+                fmt_tokens(value.cache_read_tokens),
+                fmt_tokens(value.cache_write_tokens)
+            )
+        })
+        .unwrap_or_else(|| "I — · O — · R — · W —".to_string());
     lines.push(Line::from(Span::styled(
         format!(
-            " Usage components {} · reported cost {}",
+            " Usage {} · {} · total reported cost {}",
             reconciliation_label(harness.components.status),
+            component_values,
             cost
         ),
         Style::default().fg(theme.inactive_fg),
     )));
     let mut reasons = Vec::new();
     for reason in [
+        harness.activity.reason.as_deref(),
         harness.components.reason.as_deref(),
         harness.reported_cost.reason.as_deref(),
+        harness.cost_attribution.reason.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1008,21 +1083,34 @@ mod tests {
             .unwrap();
         let text = format!("{}", terminal.backend());
         assert!(
-            text.contains("Outcomes complete · 3 · stop 1 · tool 2"),
+            text.contains(
+                "Activity complete · turns 3 · calls 0 · results 0 · compactions 0 · summaries 0 · stop 1 · tool turns 2"
+            ),
             "{text}"
         );
+        assert_eq!(text.matches("turns 3").count(), 1, "{text}");
+        let narrow = harness_detail_lines(&test_harness(), 90, &Theme::default())[0].to_string();
+        assert!(
+            narrow.contains(
+                "Activity complete · turns 3 · calls 0 · results 0 · compactions 0 · summaries 0"
+            ),
+            "{narrow}"
+        );
+        assert_eq!(narrow.matches("turns 3").count(), 1, "{narrow}");
         assert!(
             text.contains("Models openai/gpt-5 145 · unattributed 7 · other models 9"),
             "{text}"
         );
         assert!(
-            text.contains("Usage components complete · reported cost $0.0125"),
+            text.contains(
+                "Usage complete · I 107 · O 39 · R 10 · W 5 · total reported cost $0.0125"
+            ),
             "{text}"
         );
     }
 
     #[test]
-    fn selected_session_renders_history_at_full_and_compact_thresholds() {
+    fn selected_session_renders_the_same_history_rows_at_wide_and_compact_widths() {
         let mut session = test_session("history", "history");
         let mut telemetry = crate::model::SessionTelemetry::process_only(1);
         let mut harness = test_harness();
@@ -1030,7 +1118,7 @@ mod tests {
         telemetry.harness = Some(harness);
         session.telemetry = Some(telemetry);
 
-        for (width, height, expected_row) in [(120, 12, " I  "), (80, 9, " T  ")] {
+        for (width, height) in [(120, 14), (80, 11)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
@@ -1041,8 +1129,13 @@ mod tests {
                 text.contains("History complete"),
                 "{width}x{height}:\n{text}"
             );
-            assert!(text.contains(expected_row), "{width}x{height}:\n{text}");
-            assert!(text.find("Usage components").unwrap() < text.find("History").unwrap());
+            for required_row in ["Tokens ", "Cost   ", "Tools  ", "Model  ", "Events "] {
+                assert!(
+                    text.contains(required_row),
+                    "{width}x{height}: {required_row}\n{text}"
+                );
+            }
+            assert!(text.find("Usage").unwrap() < text.find("History").unwrap());
         }
     }
 
@@ -1054,7 +1147,7 @@ mod tests {
         harness.history = Some(test_history());
         telemetry.harness = Some(harness);
         session.telemetry = Some(telemetry);
-        let backend = TestBackend::new(120, 11);
+        let backend = TestBackend::new(120, 13);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), false))
@@ -1101,7 +1194,7 @@ mod tests {
             .unwrap();
         let text = format!("{}", terminal.backend());
         for label in [
-            "Outcomes complete",
+            "Activity complete",
             "History complete",
             "Note: component coverage is partial",
             "Identity",
@@ -1111,7 +1204,7 @@ mod tests {
         ] {
             assert!(text.contains(label), "{label} missing:\n{text}");
         }
-        assert!(text.find("Outcomes complete").unwrap() < text.find("History complete").unwrap());
+        assert!(text.find("Activity complete").unwrap() < text.find("History complete").unwrap());
         assert!(
             text.find("History complete").unwrap()
                 < text.find("Note: component coverage is partial").unwrap()
@@ -1148,7 +1241,7 @@ mod tests {
             .unwrap();
         let text = format!("{}", terminal.backend());
         assert!(
-            text.contains("History complete") && text.contains(" T  "),
+            text.contains("History complete") && text.contains("Tokens "),
             "{text}"
         );
         assert_eq!(app.selected, 1);
@@ -1186,12 +1279,12 @@ mod tests {
             .draw(|f| draw_pi_metadata(f, &session, f.area(), &Theme::default(), true))
             .unwrap();
         let text = format!("{}", terminal.backend());
-        assert!(text.contains("Outcomes complete"), "{text}");
+        assert!(text.contains("Activity complete"), "{text}");
         assert!(text.contains("Models openai/gpt-5"), "{text}");
-        assert!(text.contains("Usage components complete"), "{text}");
+        assert!(text.contains("Usage complete"), "{text}");
         assert!(text.contains("run-1"), "{text}");
         assert!(
-            text.find("Outcomes").unwrap() < text.find("Identity").unwrap(),
+            text.find("Activity").unwrap() < text.find("run-1").unwrap(),
             "{text}"
         );
 
@@ -1202,10 +1295,10 @@ mod tests {
             .unwrap();
         let compact = format!("{}", terminal.backend());
         assert!(
-            compact.contains("Outcomes complete") && compact.contains("Models openai/gpt-5"),
+            compact.contains("Activity complete") && compact.contains("Models openai/gpt-5"),
             "{compact}"
         );
-        assert!(compact.contains("Usage components complete"), "{compact}");
+        assert!(compact.contains("Usage complete"), "{compact}");
         assert!(!compact.contains("Identity"), "{compact}");
         assert!(compact.contains("Fleet unavailable"), "{compact}");
 
@@ -1216,7 +1309,7 @@ mod tests {
             .unwrap();
         let text = format!("{}", terminal.backend());
         assert!(
-            text.find("Outcomes").unwrap() < text.find("Identity").unwrap(),
+            text.find("Activity").unwrap() < text.find("Fleet unavailable").unwrap(),
             "{text}"
         );
     }
@@ -1238,7 +1331,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(unavailable_text.contains("Models unavailable"));
-        assert!(unavailable_text.contains("Usage components unavailable · reported cost $0.0000"));
+        assert!(unavailable_text
+            .contains("Usage unavailable · I — · O — · R — · W — · total reported cost $0.0000"));
 
         let mut long = test_harness();
         let bucket = &mut long.attribution.as_mut().unwrap().named[0];
@@ -1557,6 +1651,8 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             }],
             summary_event_count: 0,
             omitted_summary_events: 0,
@@ -1578,6 +1674,14 @@ mod tests {
                 deferred: 0,
                 pending: 0,
                 unknown: 0,
+                reason: None,
+            },
+            activity: crate::model::PiHarnessActivityTelemetry {
+                status: crate::model::ReconciliationStatus::Complete,
+                tool_calls: Some(0),
+                tool_results: Some(0),
+                compactions: Some(0),
+                branch_summaries: Some(0),
                 reason: None,
             },
             components: crate::model::ComponentReconciliation {
@@ -1622,6 +1726,15 @@ mod tests {
                     ..crate::model::TokenComponents::default()
                 },
             }),
+            cost_attribution: crate::model::PiCostAttributionTelemetry {
+                status: crate::model::ReconciliationStatus::Complete,
+                total: Some(0.0125),
+                named: Vec::new(),
+                unavailable_assistant: Some(0.0125),
+                overflow: Some(0.0),
+                unattributed_tool_or_summary: Some(0.0),
+                reason: None,
+            },
             history: None,
         }
     }

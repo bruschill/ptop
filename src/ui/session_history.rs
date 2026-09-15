@@ -1,12 +1,14 @@
-use crate::model::{PiHarnessHistoryTelemetry, PiSummaryMarkerKind, TokenComponents};
+use crate::model::{PiHarnessHistoryTelemetry, PiSummaryMarkerKind};
 use crate::theme::Theme;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
-use super::{fmt_tokens, truncate_str};
+use super::{fmt_tokens, grad_at, make_gradient, truncate_str};
 
-const SCALE: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const GRAPH_LABEL_WIDTH: usize = 8;
+// Single-row filled Braille cells use the same visual language as the Context graph.
+const BRAILLE_SCALE: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
 
 pub(crate) fn history_lines(
     history: &PiHarnessHistoryTelemetry,
@@ -14,18 +16,16 @@ pub(crate) fn history_lines(
     max_lines: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    if width < 5 || max_lines == 0 {
+    if width as usize <= GRAPH_LABEL_WIDTH || max_lines == 0 {
         return Vec::new();
     }
-    let full = width >= 90;
-    let needed = if full { 7 } else { 4 };
-    if max_lines < needed {
+    const NEEDED_LINES: usize = 6;
+    if max_lines < NEEDED_LINES {
         return Vec::new();
     }
     let point_count = history.points.len();
-    let available = (width as usize).saturating_sub(4);
-    let legend_target = if full { 44 } else { 32 };
-    let reserve = legend_target.min(available.saturating_sub(1));
+    let available = (width as usize).saturating_sub(GRAPH_LABEL_WIDTH);
+    let reserve = 32.min(available.saturating_sub(1));
     let columns = point_count
         .max(1)
         .min(available.saturating_sub(reserve))
@@ -43,55 +43,48 @@ pub(crate) fn history_lines(
         width as usize,
     );
     let mut lines = vec![text_line(heading, theme)];
-    if full {
-        for (label, component) in [('I', 0), ('O', 1), ('R', 2), ('W', 3)] {
-            let values = component_buckets(history, columns, component);
-            let max = values
-                .iter()
-                .filter_map(|value| value.value)
-                .max()
-                .unwrap_or(0);
-            let graph = values
-                .into_iter()
-                .map(|value| {
-                    let glyph = component_glyph(value, max);
-                    GraphGlyph::new(glyph, !matches!(glyph, '·' | '◌'))
-                })
-                .collect();
-            lines.push(graph_line(
-                label,
-                graph,
-                Some(format!("max {}", fmt_tokens(max))),
-                width,
-                theme,
-            ));
-        }
-    } else {
-        let buckets = total_buckets(history, columns);
-        let max = buckets
-            .iter()
-            .filter_map(|bucket| bucket.value)
-            .max()
-            .unwrap_or(0);
-        let graph = buckets
-            .into_iter()
-            .map(|bucket| {
-                let glyph = total_glyph(bucket, max);
-                GraphGlyph::new(glyph, !matches!(glyph, '·' | '◌'))
-            })
-            .collect();
-        lines.push(graph_line('T', graph, None, width, theme));
-    }
+    let buckets = total_buckets(history, columns);
+    let max = buckets
+        .iter()
+        .filter_map(|bucket| bucket.value)
+        .max()
+        .unwrap_or(0);
+    let gradient = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
+    let graph = buckets
+        .into_iter()
+        .map(|bucket| {
+            let glyph = total_glyph(bucket, max);
+            if matches!(glyph, '!' | '※' | '◌') {
+                GraphGlyph::colored(glyph, theme.warning_fg)
+            } else if let Some(value) = bucket.value {
+                GraphGlyph::colored(
+                    glyph,
+                    grad_at(&gradient, value as f64 / max.max(1) as f64 * 100.0),
+                )
+            } else {
+                GraphGlyph::new(glyph, false)
+            }
+        })
+        .collect();
     lines.push(graph_line(
-        'M',
-        model_graph(history, columns),
+        "Tokens",
+        graph,
+        Some(format!("peak {} / turn", fmt_tokens(max))),
+        width,
+        theme,
+    ));
+    lines.push(cost_line(history, columns, width, theme));
+    lines.push(tool_line(history, columns, width, theme));
+    lines.push(graph_line(
+        "Model",
+        model_graph(history, columns, theme),
         Some("│ change  ? uncertain  ! both".to_string()),
         width,
         theme,
     ));
     lines.push(graph_line(
-        'E',
-        event_graph(history, columns),
+        "Events",
+        event_graph(history, columns, theme),
         Some(format!(
             "summaries {} shown, {} omitted",
             history.markers.len(),
@@ -117,31 +110,44 @@ fn text_line(text: String, theme: &Theme) -> Line<'static> {
 struct GraphGlyph {
     glyph: char,
     active: bool,
+    color: Option<Color>,
 }
 
 impl GraphGlyph {
     fn new(glyph: char, active: bool) -> Self {
-        Self { glyph, active }
+        Self {
+            glyph,
+            active,
+            color: None,
+        }
+    }
+
+    fn colored(glyph: char, color: Color) -> Self {
+        Self {
+            glyph,
+            active: true,
+            color: Some(color),
+        }
     }
 }
 
 fn graph_line(
-    label: char,
+    label: &str,
     graph: Vec<GraphGlyph>,
     legend: Option<String>,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
     let mut spans = vec![Span::styled(
-        format!(" {label}  "),
+        format!(" {label:<6} "),
         Style::default().fg(theme.graph_text),
     )];
     for glyph in &graph {
-        let color = if glyph.active {
+        let color = glyph.color.unwrap_or(if glyph.active {
             theme.pi_agent
         } else {
             theme.inactive_fg
-        };
+        });
         spans.push(Span::styled(
             glyph.glyph.to_string(),
             Style::default().fg(color),
@@ -151,7 +157,7 @@ fn graph_line(
         .iter()
         .map(|glyph| glyph.glyph.width().unwrap_or(0))
         .sum();
-    let remaining = (width as usize).saturating_sub(4 + graph_width);
+    let remaining = (width as usize).saturating_sub(GRAPH_LABEL_WIDTH + graph_width);
     if let Some(legend) = legend.filter(|_| remaining >= 3) {
         spans.push(Span::styled("  ", Style::default().fg(theme.inactive_fg)));
         spans.push(Span::styled(
@@ -165,63 +171,20 @@ fn graph_line(
 fn bounds(column: usize, points: usize, columns: usize) -> (usize, usize) {
     (column * points / columns, (column + 1) * points / columns)
 }
-fn component(component: &TokenComponents, index: usize) -> u64 {
-    [
-        component.input_tokens,
-        component.output_tokens,
-        component.cache_read_tokens,
-        component.cache_write_tokens,
-    ][index]
-}
 #[derive(Clone, Copy)]
 struct ComponentBucket {
     value: Option<u64>,
     null: bool,
 }
-fn component_buckets(
-    history: &PiHarnessHistoryTelemetry,
-    columns: usize,
-    index: usize,
-) -> Vec<ComponentBucket> {
-    if history.points.is_empty() {
-        return vec![ComponentBucket {
-            value: None,
-            null: true,
-        }];
-    }
-    (0..columns)
-        .map(|column| {
-            let (start, end) = bounds(column, history.points.len(), columns);
-            let mut out = ComponentBucket {
-                value: None,
-                null: false,
-            };
-            for point in &history.points[start..end] {
-                match &point.components {
-                    Some(value) => {
-                        out.value = Some(out.value.unwrap_or(0).max(component(value, index)))
-                    }
-                    None => out.null = true,
-                }
-            }
-            out
-        })
-        .collect()
-}
-fn component_glyph(bucket: ComponentBucket, max: u64) -> char {
-    if bucket.null && bucket.value.is_some() {
-        '◌'
-    } else {
-        numeric_glyph(bucket.value, max)
-    }
-}
 #[allow(clippy::manual_div_ceil)]
 fn numeric_glyph(value: Option<u64>, max: u64) -> char {
     match value {
         None => '·',
-        Some(_) if max == 0 => SCALE[0],
+        Some(0) => BRAILLE_SCALE[0],
+        Some(_) if max == 0 => BRAILLE_SCALE[0],
         Some(value) => {
-            SCALE[(((value as u128 * 7 + max as u128 - 1) / max as u128) as usize).min(7)]
+            let level = (value as u128 * 8 + max as u128 - 1) / max as u128;
+            BRAILLE_SCALE[(level as usize).clamp(1, 8)]
         }
     }
 }
@@ -265,6 +228,180 @@ fn total_buckets(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<Tot
         })
         .collect()
 }
+fn cost_line(
+    history: &PiHarnessHistoryTelemetry,
+    columns: usize,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let values = cost_buckets(history, columns);
+    let max = values
+        .iter()
+        .filter_map(|value| value.value)
+        .fold(0.0_f64, f64::max);
+    let gradient = make_gradient(
+        theme.free_grad.start,
+        theme.free_grad.mid,
+        theme.free_grad.end,
+    );
+    let graph = values
+        .into_iter()
+        .map(|value| {
+            if value.null && value.value.is_some() {
+                return GraphGlyph::colored('◌', theme.warning_fg);
+            }
+            match value.value {
+                Some(value) => GraphGlyph::colored(
+                    cost_glyph(value, max),
+                    grad_at(&gradient, percentage(value, max)),
+                ),
+                None => GraphGlyph::new('·', false),
+            }
+        })
+        .collect();
+    graph_line(
+        "Cost",
+        graph,
+        Some(format!("peak ${} / turn", fmt_cost_peak(max))),
+        width,
+        theme,
+    )
+}
+
+fn fmt_cost_peak(value: f64) -> String {
+    if value == 0.0 {
+        "0.0000".to_string()
+    } else if value < 0.0001 || value >= 1_000_000.0 {
+        format!("{value:.4e}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+fn percentage(value: f64, max: f64) -> f64 {
+    if max > 0.0 {
+        (value / max * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+fn cost_glyph(value: f64, max: f64) -> char {
+    if max == 0.0 || value == 0.0 {
+        BRAILLE_SCALE[0]
+    } else {
+        BRAILLE_SCALE[((value / max * 8.0).ceil() as usize).clamp(1, 8)]
+    }
+}
+
+struct CostBucket {
+    value: Option<f64>,
+    null: bool,
+}
+
+fn cost_buckets(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<CostBucket> {
+    if history.points.is_empty() {
+        return vec![CostBucket {
+            value: None,
+            null: true,
+        }];
+    }
+    (0..columns)
+        .map(|column| {
+            let (start, end) = bounds(column, history.points.len(), columns);
+            let mut out = CostBucket {
+                value: None,
+                null: false,
+            };
+            for point in &history.points[start..end] {
+                match point
+                    .reported_cost
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                {
+                    Some(value) => {
+                        out.value = Some(out.value.unwrap_or(0.0).max(value));
+                    }
+                    None => out.null = true,
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+fn tool_line(
+    history: &PiHarnessHistoryTelemetry,
+    columns: usize,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let values = optional_buckets(history, columns, |point| point.tool_calls.map(u64::from));
+    let max = values
+        .iter()
+        .filter_map(|value| value.value)
+        .max()
+        .unwrap_or(0);
+    let gradient = make_gradient(
+        theme.proc_grad.start,
+        theme.proc_grad.mid,
+        theme.proc_grad.end,
+    );
+    let graph = values
+        .into_iter()
+        .map(|bucket| {
+            if bucket.null && bucket.value.is_some() {
+                return GraphGlyph::colored('◌', theme.warning_fg);
+            }
+            match bucket.value {
+                Some(value) => GraphGlyph::colored(
+                    numeric_glyph(Some(value), max),
+                    grad_at(&gradient, value as f64 / max.max(1) as f64 * 100.0),
+                ),
+                None => GraphGlyph::new('·', false),
+            }
+        })
+        .collect();
+    graph_line(
+        "Tools",
+        graph,
+        Some(format!("peak {max} calls / turn")),
+        width,
+        theme,
+    )
+}
+
+fn optional_buckets<F>(
+    history: &PiHarnessHistoryTelemetry,
+    columns: usize,
+    value: F,
+) -> Vec<ComponentBucket>
+where
+    F: Fn(&crate::model::PiAssistantUsagePoint) -> Option<u64>,
+{
+    if history.points.is_empty() {
+        return vec![ComponentBucket {
+            value: None,
+            null: true,
+        }];
+    }
+    (0..columns)
+        .map(|column| {
+            let (start, end) = bounds(column, history.points.len(), columns);
+            let mut out = ComponentBucket {
+                value: None,
+                null: false,
+            };
+            for point in &history.points[start..end] {
+                match value(point) {
+                    Some(value) => out.value = Some(out.value.unwrap_or(0).max(value)),
+                    None => out.null = true,
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 fn total_glyph(bucket: TotalBucket, max: u64) -> char {
     if bucket.overflow {
         if bucket.null {
@@ -278,7 +415,11 @@ fn total_glyph(bucket: TotalBucket, max: u64) -> char {
         numeric_glyph(bucket.value, max)
     }
 }
-fn model_graph(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<GraphGlyph> {
+fn model_graph(
+    history: &PiHarnessHistoryTelemetry,
+    columns: usize,
+    theme: &Theme,
+) -> Vec<GraphGlyph> {
     let mut states = Vec::new();
     for (index, point) in history.points.iter().enumerate() {
         states.push(if index == 0 {
@@ -303,20 +444,24 @@ fn model_graph(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<Graph
             let (start, end) = bounds(column, states.len(), columns);
             let state = &states[start..end];
             if state.contains(&'│') && state.contains(&'?') {
-                GraphGlyph::new('!', true)
+                GraphGlyph::colored('!', theme.warning_fg)
             } else if state.contains(&'│') {
-                GraphGlyph::new('│', true)
+                GraphGlyph::colored('│', theme.status_fg)
             } else if state.contains(&'?') {
                 GraphGlyph::new('?', false)
             } else {
                 // A known initial or unchanged attribution is semantic state,
                 // not a graph gap, even though both use the same dot glyph.
-                GraphGlyph::new('·', true)
+                GraphGlyph::colored('·', theme.pi_agent)
             }
         })
         .collect()
 }
-fn event_graph(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<GraphGlyph> {
+fn event_graph(
+    history: &PiHarnessHistoryTelemetry,
+    columns: usize,
+    theme: &Theme,
+) -> Vec<GraphGlyph> {
     let points = history.points.len();
     let mut kinds = vec![(false, false); columns];
     for marker in &history.markers {
@@ -335,9 +480,9 @@ fn event_graph(history: &PiHarnessHistoryTelemetry, columns: usize) -> Vec<Graph
     kinds
         .into_iter()
         .map(|(c, b)| match (c, b) {
-            (true, true) => GraphGlyph::new('*', true),
-            (true, false) => GraphGlyph::new('C', true),
-            (false, true) => GraphGlyph::new('B', true),
+            (true, true) => GraphGlyph::colored('*', theme.hi_fg),
+            (true, false) => GraphGlyph::colored('C', theme.warning_fg),
+            (false, true) => GraphGlyph::colored('B', theme.status_fg),
             (false, false) => GraphGlyph::new('·', false),
         })
         .collect()
@@ -348,7 +493,7 @@ mod tests {
     use super::*;
     use crate::model::{
         PiAssistantUsagePoint, PiHarnessHistoryTelemetry, PiPointAttribution, PiSummaryMarker,
-        ReconciliationStatus,
+        ReconciliationStatus, TokenComponents,
     };
 
     fn history(points: Vec<PiAssistantUsagePoint>) -> PiHarnessHistoryTelemetry {
@@ -387,11 +532,13 @@ mod tests {
                 provider: "p".into(),
                 model: "m".into(),
             }),
+            reported_cost: None,
+            tool_calls: None,
         };
         let graph = history_lines(
             &history(vec![point(Some(0)), point(None), point(Some(7))]),
             90,
-            7,
+            9,
             &Theme::default(),
         );
         let text: String = graph
@@ -400,7 +547,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains('▁') && text.contains('·') && text.contains('C') && text.contains('B'),
+            text.contains('⣿') && text.contains('·') && text.contains('C') && text.contains('B'),
             "{text}"
         );
         assert!(graph.iter().all(|line| line.width() <= 90));
@@ -408,13 +555,13 @@ mod tests {
     #[test]
     fn zero_point_history_uses_gap_columns_and_inactive_gap_color() {
         let theme = Theme::default();
-        let graph = history_lines(&history(Vec::new()), 90, 7, &theme);
-        let model = &graph[5];
+        let graph = history_lines(&history(Vec::new()), 90, 9, &theme);
+        let model = &graph[4];
         assert_eq!(model.spans[1].content, "·");
         assert_eq!(model.spans[1].style.fg, Some(theme.inactive_fg));
-        let events = &graph[6];
+        let events = &graph[5];
         assert_eq!(events.spans[1].content, "*");
-        assert_eq!(events.spans[1].style.fg, Some(theme.pi_agent));
+        assert_eq!(events.spans[1].style.fg, Some(theme.hi_fg));
     }
 
     #[test]
@@ -423,6 +570,8 @@ mod tests {
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             };
             3
         ]);
@@ -440,7 +589,10 @@ mod tests {
                 position: 3,
             },
         ];
-        assert_eq!(graph_text(&event_graph(&fixture, 3)), "CBC");
+        assert_eq!(
+            graph_text(&event_graph(&fixture, 3, &Theme::default())),
+            "CBC"
+        );
     }
 
     #[test]
@@ -456,17 +608,27 @@ mod tests {
                     provider: "p".into(),
                     model: "m".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ];
-        let graph = history_lines(&history(points), 90, 7, &theme);
-        let input = &graph[1];
-        assert_eq!(input.spans[1].style.fg, Some(theme.pi_agent));
-        assert_eq!(input.spans[2].style.fg, Some(theme.inactive_fg));
-        let model = &graph[5];
+        let graph = history_lines(&history(points), 90, 9, &theme);
+        let tokens = &graph[1];
+        assert_eq!(
+            tokens.spans[1].style.fg,
+            Some(grad_at(
+                &make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end),
+                100.0
+            ))
+        );
+        assert_eq!(tokens.spans[2].style.fg, Some(theme.inactive_fg));
+        let model = &graph[4];
         assert_eq!(model.spans[1].style.fg, Some(theme.pi_agent));
         assert_eq!(model.spans[2].style.fg, Some(theme.inactive_fg));
     }
@@ -482,18 +644,24 @@ mod tests {
             PiAssistantUsagePoint {
                 components: None,
                 attribution: Some(known.clone()),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: Some(known),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
-        let graph = history_lines(&fixture, 90, 7, &theme);
-        let model = &graph[5];
+        let graph = history_lines(&fixture, 90, 6, &theme);
+        let model = &graph[4];
         assert_eq!(model.spans[1].content, "·");
         assert_eq!(model.spans[1].style.fg, Some(theme.pi_agent));
         assert_eq!(model.spans[2].content, "·");
@@ -501,9 +669,9 @@ mod tests {
         assert_eq!(model.spans[3].content, "?");
         assert_eq!(model.spans[3].style.fg, Some(theme.inactive_fg));
 
-        let zero = history_lines(&history(Vec::new()), 90, 7, &theme);
-        assert_eq!(zero[5].spans[1].content, "·");
-        assert_eq!(zero[5].spans[1].style.fg, Some(theme.inactive_fg));
+        let zero = history_lines(&history(Vec::new()), 90, 6, &theme);
+        assert_eq!(zero[4].spans[1].content, "·");
+        assert_eq!(zero[4].spans[1].style.fg, Some(theme.inactive_fg));
 
         let changed_then_unknown = history(vec![
             PiAssistantUsagePoint {
@@ -512,6 +680,8 @@ mod tests {
                     provider: "p".into(),
                     model: "a".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
@@ -519,13 +689,17 @@ mod tests {
                     provider: "p".into(),
                     model: "b".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
-        let combined = model_graph(&changed_then_unknown, 1);
+        let combined = model_graph(&changed_then_unknown, 1, &Theme::default());
         assert_eq!(graph_text(&combined), "!");
         assert!(combined[0].active);
 
@@ -536,10 +710,14 @@ mod tests {
                     provider: "p".into(),
                     model: "a".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
@@ -547,9 +725,14 @@ mod tests {
                     provider: "p".into(),
                     model: "a".into(),
                 }),
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
-        assert_eq!(graph_text(&model_graph(&known_null_known, 1)), "?");
+        assert_eq!(
+            graph_text(&model_graph(&known_null_known, 1, &Theme::default())),
+            "?"
+        );
     }
 
     #[test]
@@ -561,12 +744,16 @@ mod tests {
                 ..TokenComponents::default()
             }),
             attribution: None,
+            reported_cost: None,
+            tool_calls: None,
         };
         let fixture = history(vec![
             overflowing.clone(),
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
         assert_eq!(
@@ -574,29 +761,32 @@ mod tests {
             '!'
         );
         assert_eq!(total_glyph(total_buckets(&fixture, 1)[0], 0), '※');
-        let rendered = history_lines(&fixture, 5, 4, &Theme::default());
+        let rendered = history_lines(&fixture, 9, 6, &Theme::default());
         assert_eq!(rendered[1].spans[1].content, "※");
         assert_eq!(
             rendered[1].spans[1].style.fg,
-            Some(Theme::default().pi_agent)
+            Some(Theme::default().warning_fg)
         );
 
         let mixed = history(vec![
             PiAssistantUsagePoint {
                 components: Some(TokenComponents::default()),
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: None,
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
         assert_eq!(total_glyph(total_buckets(&mixed, 1)[0], 0), '◌');
-        assert_eq!(component_glyph(component_buckets(&mixed, 1, 0)[0], 0), '◌');
     }
 
     #[test]
-    fn full_rows_use_independent_scales_and_all_zero_is_lowest_glyph() {
+    fn token_row_uses_component_total_and_braille_scale() {
         let fixture = history(vec![
             PiAssistantUsagePoint {
                 components: Some(TokenComponents {
@@ -605,6 +795,8 @@ mod tests {
                     ..TokenComponents::default()
                 }),
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
             PiAssistantUsagePoint {
                 components: Some(TokenComponents {
@@ -613,47 +805,20 @@ mod tests {
                     ..TokenComponents::default()
                 }),
                 attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             },
         ]);
+        let buckets = total_buckets(&fixture, 2);
+        assert_eq!(buckets[0].value, Some(101));
+        assert_eq!(buckets[1].value, Some(3));
+        assert_eq!(total_glyph(buckets[0], 101), '⣿');
+        assert_eq!(total_glyph(buckets[1], 101), '⡀');
         assert_eq!(
-            graph_text(
-                &component_buckets(&fixture, 2, 0)
-                    .into_iter()
-                    .map(|b| GraphGlyph::new(component_glyph(b, 2), true))
-                    .collect::<Vec<_>>()
-            ),
-            "▅█"
-        );
-        assert_eq!(
-            graph_text(
-                &component_buckets(&fixture, 2, 1)
-                    .into_iter()
-                    .map(|b| GraphGlyph::new(component_glyph(b, 100), true))
-                    .collect::<Vec<_>>()
-            ),
-            "█▂"
-        );
-        let zeros = history(vec![
-            PiAssistantUsagePoint {
-                components: Some(TokenComponents::default()),
-                attribution: None,
-            };
-            8
-        ]);
-        assert_eq!(
-            graph_text(
-                &component_buckets(&zeros, 8, 0)
-                    .into_iter()
-                    .map(|b| GraphGlyph::new(component_glyph(b, 0), true))
-                    .collect::<Vec<_>>()
-            ),
-            "▁▁▁▁▁▁▁▁"
-        );
-        assert_eq!(
-            (0..=7)
-                .map(|value| numeric_glyph(Some(value), 7))
+            (0..=8)
+                .map(|value| numeric_glyph(Some(value), 8))
                 .collect::<String>(),
-            SCALE.iter().collect::<String>()
+            BRAILLE_SCALE.iter().collect::<String>()
         );
     }
 
@@ -662,14 +827,16 @@ mod tests {
         let fixture = history(vec![
             PiAssistantUsagePoint {
                 components: None,
-                attribution: None
+                attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             };
             64
         ]);
         for (width, expected_rows, expected_columns) in
-            [(5, 4, 1), (60, 4, 24), (89, 4, 53), (90, 7, 42)]
+            [(9, 6, 1), (60, 6, 20), (89, 6, 49), (90, 6, 50)]
         {
-            let lines = history_lines(&fixture, width, 7, &Theme::default());
+            let lines = history_lines(&fixture, width, 6, &Theme::default());
             assert_eq!(lines.len(), expected_rows, "{width}");
             assert!(
                 lines.iter().all(|line| line.width() <= width as usize),
@@ -692,7 +859,9 @@ mod tests {
         let mut fixture = history(vec![
             PiAssistantUsagePoint {
                 components: None,
-                attribution: None
+                attribution: None,
+                reported_cost: None,
+                tool_calls: None,
             };
             64
         ]);
@@ -706,8 +875,150 @@ mod tests {
                 position: 32,
             },
         ];
-        assert!(graph_text(&event_graph(&fixture, 1)).contains('*'));
-        assert!(graph_text(&event_graph(&fixture, 64)).contains('*'));
+        assert!(graph_text(&event_graph(&fixture, 1, &Theme::default())).contains('*'));
+        assert!(graph_text(&event_graph(&fixture, 64, &Theme::default())).contains('*'));
+    }
+
+    #[test]
+    fn history_is_atomic_at_six_rows_for_every_width() {
+        let fixture = history(vec![PiAssistantUsagePoint {
+            components: Some(TokenComponents::default()),
+            attribution: None,
+            reported_cost: Some(0.0),
+            tool_calls: Some(0),
+        }]);
+        assert!(history_lines(&fixture, 90, 5, &Theme::default()).is_empty());
+        assert_eq!(history_lines(&fixture, 90, 6, &Theme::default()).len(), 6);
+        assert!(history_lines(&fixture, 89, 5, &Theme::default()).is_empty());
+        assert_eq!(history_lines(&fixture, 89, 6, &Theme::default()).len(), 6);
+    }
+
+    #[test]
+    fn cost_scaling_preserves_fractional_and_huge_finite_values() {
+        assert_eq!(cost_glyph(0.0, 0.000_000_5), '⠀');
+        assert_eq!(cost_glyph(0.000_000_25, 0.000_000_5), '⣤');
+        assert_eq!(cost_glyph(0.000_000_5, 0.000_000_5), '⣿');
+        assert_eq!(fmt_cost_peak(0.000_000_5), "5.0000e-7");
+        assert_eq!(fmt_cost_peak(1.0e300), "1.0000e300");
+
+        let fixture = history(vec![
+            PiAssistantUsagePoint {
+                components: None,
+                attribution: None,
+                reported_cost: Some(0.000_000_5),
+                tool_calls: Some(1),
+            },
+            PiAssistantUsagePoint {
+                components: None,
+                attribution: None,
+                reported_cost: Some(1.0e300),
+                tool_calls: None,
+            },
+        ]);
+        let buckets = cost_buckets(&fixture, 2);
+        assert_eq!(buckets[0].value, Some(0.000_000_5));
+        assert_eq!(buckets[1].value, Some(1.0e300));
+        let mixed = cost_buckets(&fixture, 1);
+        assert_eq!(mixed[0].value, Some(1.0e300));
+        assert!(!mixed[0].null);
+
+        let mut with_gap = fixture;
+        with_gap.points[1].reported_cost = None;
+        let mixed = cost_buckets(&with_gap, 1);
+        assert_eq!(mixed[0].value, Some(0.000_000_5));
+        assert!(mixed[0].null);
+        let line = cost_line(&with_gap, 1, 40, &Theme::default());
+        assert_eq!(line.spans[1].content, "◌");
+        assert_eq!(line.spans[1].style.fg, Some(Theme::default().warning_fg));
+    }
+
+    #[test]
+    fn metric_families_use_distinct_theme_colors_and_preserve_tool_uncertainty() {
+        let theme = Theme::default();
+        let mut fixture = history(vec![
+            PiAssistantUsagePoint {
+                components: Some(TokenComponents {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: 3,
+                    cache_write_tokens: 4,
+                }),
+                attribution: Some(PiPointAttribution {
+                    provider: "p".into(),
+                    model: "a".into(),
+                }),
+                reported_cost: Some(0.25),
+                tool_calls: Some(1),
+            },
+            PiAssistantUsagePoint {
+                components: Some(TokenComponents {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    cache_read_tokens: 4,
+                    cache_write_tokens: 5,
+                }),
+                attribution: Some(PiPointAttribution {
+                    provider: "p".into(),
+                    model: "b".into(),
+                }),
+                reported_cost: Some(0.5),
+                tool_calls: None,
+            },
+        ]);
+        fixture.markers = vec![
+            PiSummaryMarker {
+                kind: PiSummaryMarkerKind::Compaction,
+                position: 0,
+            },
+            PiSummaryMarker {
+                kind: PiSummaryMarkerKind::BranchSummary,
+                position: 1,
+            },
+        ];
+        fixture.summary_event_count = 2;
+
+        let lines = history_lines(&fixture, 120, 6, &theme);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(
+            lines[1].spans[1].style.fg,
+            Some(grad_at(
+                &make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end,),
+                10.0 / 14.0 * 100.0,
+            ))
+        );
+        assert_eq!(
+            lines[2].spans[1].style.fg,
+            Some(grad_at(
+                &make_gradient(
+                    theme.free_grad.start,
+                    theme.free_grad.mid,
+                    theme.free_grad.end,
+                ),
+                50.0,
+            ))
+        );
+        assert_eq!(
+            lines[3].spans[1].style.fg,
+            Some(grad_at(
+                &make_gradient(
+                    theme.proc_grad.start,
+                    theme.proc_grad.mid,
+                    theme.proc_grad.end,
+                ),
+                100.0,
+            ))
+        );
+        assert_eq!(lines[4].spans[1].style.fg, Some(theme.pi_agent));
+        assert_eq!(lines[4].spans[2].style.fg, Some(theme.status_fg));
+        assert_eq!(lines[5].spans[1].style.fg, Some(theme.warning_fg));
+        assert_eq!(lines[5].spans[2].style.fg, Some(theme.status_fg));
+
+        let tool_bucket = optional_buckets(&fixture, 1, |point| point.tool_calls.map(u64::from));
+        assert_eq!(tool_bucket[0].value, Some(1));
+        assert!(tool_bucket[0].null);
+        let tool = tool_line(&fixture, 1, 40, &theme);
+        assert_eq!(tool.spans[1].content, "◌");
+        assert_eq!(tool.spans[1].style.fg, Some(theme.warning_fg));
     }
 
     #[test]
