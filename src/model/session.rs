@@ -490,10 +490,12 @@ pub struct PiPointAttribution {
     pub model: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PiAssistantUsagePoint {
     pub components: Option<TokenComponents>,
     pub attribution: Option<PiPointAttribution>,
+    pub reported_cost: Option<f64>,
+    pub tool_calls: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -509,7 +511,7 @@ pub struct PiSummaryMarker {
     pub position: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PiHarnessHistoryTelemetry {
     pub status: ReconciliationStatus,
     pub assistant_count: u32,
@@ -522,11 +524,41 @@ pub struct PiHarnessHistoryTelemetry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PiHarnessActivityTelemetry {
+    pub status: ReconciliationStatus,
+    pub tool_calls: Option<u32>,
+    pub tool_results: Option<u32>,
+    pub compactions: Option<u32>,
+    pub branch_summaries: Option<u32>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PiCostAttributionBucket {
+    pub provider: String,
+    pub model: String,
+    pub reported_cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PiCostAttributionTelemetry {
+    pub status: ReconciliationStatus,
+    pub total: Option<f64>,
+    pub named: Vec<PiCostAttributionBucket>,
+    pub unavailable_assistant: Option<f64>,
+    pub overflow: Option<f64>,
+    pub unattributed_tool_or_summary: Option<f64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PiHarnessTelemetry {
     pub assistant_outcomes: AssistantOutcomeTelemetry,
+    pub activity: PiHarnessActivityTelemetry,
     pub components: ComponentReconciliation,
     pub reported_cost: ReportedCostReconciliation,
     pub attribution: Option<PiAttributionTelemetry>,
+    pub cost_attribution: PiCostAttributionTelemetry,
     pub history: Option<PiHarnessHistoryTelemetry>,
 }
 
