@@ -86,6 +86,7 @@ pub struct SessionTelemetryView {
     /// from parent transcript totals to avoid adapter double counting.
     pub fleet: FleetTelemetry,
     pub harness: Option<PiHarnessTelemetry>,
+    pub live_harness: Option<crate::model::PiLiveHarnessTelemetry>,
 }
 
 /// A single session, flattened and curated for JSON consumers.
@@ -246,6 +247,7 @@ impl App {
                         },
                         fleet: telemetry.fleet.clone(),
                         harness: telemetry.harness.clone(),
+                        live_harness: telemetry.live_harness.clone(),
                     }
                 }),
             })
@@ -283,7 +285,8 @@ mod tests {
     use crate::demo::populate_demo;
     use crate::model::{
         FleetExecution, FleetRun, FleetRunMode, FleetRunState, FleetTelemetry, FleetUsage,
-        SessionStatus, SourceHealth, TelemetryCompleteness, TelemetryPrecision,
+        PiLiveHarnessProvenance, PiLiveHarnessTelemetry, PiLivePhase, SessionStatus, SourceHealth,
+        TelemetryCompleteness, TelemetryPrecision,
     };
     use crate::theme::Theme;
     use std::time::{Duration, UNIX_EPOCH};
@@ -324,6 +327,67 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&status).unwrap(), wire);
         }
+    }
+
+    #[test]
+    fn live_harness_json_has_exact_keys_and_wire_values() {
+        let telemetry = PiLiveHarnessTelemetry {
+            phase: Some(PiLivePhase::WaitingForUser),
+            pending_messages: Some(true),
+            source_health: SourceHealth::Healthy,
+            provenance: PiLiveHarnessProvenance::ExtensionAfUnixV1,
+            observed_at_ms: Some(123),
+            stale: false,
+            reason: None,
+        };
+        let json = serde_json::to_value(telemetry).unwrap();
+        assert_eq!(
+            sorted_keys(&json),
+            vec![
+                "observed_at_ms",
+                "pending_messages",
+                "phase",
+                "provenance",
+                "reason",
+                "source_health",
+                "stale",
+            ]
+        );
+        assert_eq!(json["phase"], "waiting_for_user");
+        for (phase, wire) in [
+            (PiLivePhase::Idle, "idle"),
+            (PiLivePhase::Generating, "generating"),
+            (PiLivePhase::ToolRunning, "tool_running"),
+            (PiLivePhase::Compacting, "compacting"),
+            (PiLivePhase::WaitingForUser, "waiting_for_user"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), wire);
+        }
+        assert_eq!(json["provenance"], "extension_af_unix_v1");
+        assert_eq!(json["source_health"], "healthy");
+        assert!(json["reason"].is_null());
+    }
+
+    #[test]
+    fn snapshot_copies_live_harness_without_changing_once_fields() {
+        let mut app = demo_app();
+        let live = PiLiveHarnessTelemetry {
+            phase: Some(PiLivePhase::Generating),
+            pending_messages: Some(false),
+            source_health: SourceHealth::Healthy,
+            provenance: PiLiveHarnessProvenance::ExtensionAfUnixV1,
+            observed_at_ms: Some(456),
+            stale: false,
+            reason: None,
+        };
+        app.sessions[0].telemetry.as_mut().unwrap().live_harness = Some(live.clone());
+
+        let snapshot = app.to_snapshot(2_000);
+        let session = &snapshot.sessions[0];
+        let telemetry = session.telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.live_harness, Some(live));
+        assert_eq!(session.status, app.sessions[0].status);
+        assert_eq!(session.summary, app.session_summary(&app.sessions[0]));
     }
 
     #[test]
@@ -643,11 +707,13 @@ mod tests {
                 "error",
                 "fleet",
                 "harness",
+                "live_harness",
                 "source_health",
                 "usage",
             ]
         );
         assert!(telemetry["harness"].is_null());
+        assert!(telemetry["live_harness"].is_null());
         assert_eq!(
             sorted_keys(&telemetry["context"]),
             vec![

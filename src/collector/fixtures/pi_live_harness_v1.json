@@ -1,0 +1,22 @@
+{
+  "wire_keys": ["magic", "version", "epoch", "sequence", "session_id", "phase", "pending_messages"],
+  "phases": ["idle", "generating", "tool_running", "compacting", "waiting_for_user"],
+  "limits": {"max_frame_bytes":512,"max_buffer_bytes":1024,"max_session_id_bytes":256,"epoch_hex_bytes":32,"max_tool_ids":32,"max_tool_call_id_bytes":256,"max_nesting":4,"heartbeat_ms":1000},
+  "valid_frames": [
+    {"name":"initial","json":"{\"magic\":\"ptop-live\",\"version\":1,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"sequence\":0,\"session_id\":\"attached-session-id\",\"phase\":null,\"pending_messages\":null}"},
+    {"name":"later_idle","json":"{\"magic\":\"ptop-live\",\"version\":1,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"sequence\":1,\"session_id\":\"attached-session-id\",\"phase\":\"idle\",\"pending_messages\":false}"}
+  ],
+  "invalid_frames": [
+    {"name":"unknown_key","error":"invalid_schema","json":"{\"magic\":\"ptop-live\",\"version\":1,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"sequence\":0,\"session_id\":\"attached-session-id\",\"phase\":null,\"pending_messages\":null,\"future\":true}"},
+    {"name":"bad_phase","error":"invalid_schema","json":"{\"magic\":\"ptop-live\",\"version\":1,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"sequence\":0,\"session_id\":\"attached-session-id\",\"phase\":\"future\",\"pending_messages\":null}"},
+    {"name":"bad_epoch","error":"invalid_identity","json":"{\"magic\":\"ptop-live\",\"version\":1,\"epoch\":\"ABCDEF0123456789abcdef0123456789\",\"sequence\":0,\"session_id\":\"attached-session-id\",\"phase\":null,\"pending_messages\":null}"}
+  ],
+  "reducer_cases": [
+    {"name":"agent_lifecycle","events":[{"hook":"session_start"},{"hook":"agent_start"},{"hook":"agent_end"},{"hook":"agent_settled","is_idle":false},{"hook":"agent_settled","is_idle":true}],"phases":[null,"generating",null,null,"idle"]},
+    {"name":"tool_duplicate_unmatched_recovery","events":[{"hook":"session_start"},{"hook":"tool_execution_start","tool_call_id":"tool-a"},{"hook":"tool_execution_start","tool_call_id":"tool-a"},{"hook":"tool_execution_end","tool_call_id":"tool-a"},{"hook":"tool_execution_start","tool_call_id":"recover"},{"hook":"tool_execution_end","tool_call_id":"missing"},{"hook":"agent_settled","is_idle":true}],"phases":[null,"tool_running",null,null,"tool_running",null,"idle"]},
+    {"name":"tool_overflow_recovery","events":[{"hook":"session_start"},{"hook":"tool_execution_start","tool_call_id_prefix":"overflow-","repeat":33},{"hook":"tool_execution_start","tool_call_id":"recover"}],"phases":[null,null,"tool_running"]},
+    {"name":"compaction_complete_failed_unmatched_recovery","events":[{"hook":"session_start"},{"hook":"session_before_compact"},{"hook":"session_before_compact"},{"hook":"session_compact"},{"hook":"session_compact_failed"},{"hook":"session_compact"},{"hook":"session_before_compact"}],"phases":[null,"compacting","compacting","compacting",null,null,"compacting"]},
+    {"name":"ui_prompt_nesting_unmatched_recovery","events":[{"hook":"session_start"},{"hook":"ui_prompt_start"},{"hook":"ui_prompt_start"},{"hook":"ui_prompt_end"},{"hook":"ui_prompt_end"},{"hook":"ui_prompt_end"},{"hook":"ui_prompt_start"}],"phases":[null,"waiting_for_user","waiting_for_user","waiting_for_user",null,null,"waiting_for_user"]},
+    {"name":"shutdown","events":[{"hook":"session_start"},{"hook":"agent_start"},{"hook":"session_shutdown"}],"phases":[null,"generating",null],"closed":[false,false,true]}
+  ]
+}

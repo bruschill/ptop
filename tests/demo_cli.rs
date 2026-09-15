@@ -14,6 +14,8 @@ fn pi_demo_once_uses_safe_fixture_data_without_task_descriptions() {
     assert!(stdout.contains("provider/model: anthropic/claude-sonnet-4-6"));
     assert!(!stdout.contains("security review"));
     assert!(!stdout.contains("payment boundary"));
+    assert!(!stdout.contains("live harness:"));
+    assert!(!stdout.contains("Live unavailable"));
 }
 
 #[test]
@@ -26,6 +28,7 @@ fn pi_demo_json_uses_the_supported_fleet_contract() {
     assert_eq!(sessions.len(), 3);
     for session in sessions {
         assert!(session["telemetry"].is_object());
+        assert!(session["telemetry"]["live_harness"].is_null());
         assert!(session.get("agent_cli").is_none());
         assert!(session.get("chat_messages").is_none());
         assert!(session.get("tool_calls").is_none());

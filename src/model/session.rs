@@ -530,6 +530,33 @@ pub struct PiHarnessTelemetry {
     pub history: Option<PiHarnessHistoryTelemetry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiLivePhase {
+    Idle,
+    Generating,
+    ToolRunning,
+    Compacting,
+    WaitingForUser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiLiveHarnessProvenance {
+    ExtensionAfUnixV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiLiveHarnessTelemetry {
+    pub phase: Option<PiLivePhase>,
+    pub pending_messages: Option<bool>,
+    pub source_health: SourceHealth,
+    pub provenance: PiLiveHarnessProvenance,
+    pub observed_at_ms: Option<u64>,
+    pub stale: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionTelemetry {
     pub attachment: AttachmentState,
@@ -542,6 +569,7 @@ pub struct SessionTelemetry {
     pub usage_details: UsageTelemetryDetails,
     pub fleet: FleetTelemetry,
     pub harness: Option<PiHarnessTelemetry>,
+    pub live_harness: Option<PiLiveHarnessTelemetry>,
 }
 
 impl SessionTelemetry {
@@ -570,6 +598,7 @@ impl SessionTelemetry {
                 "owned parent session identity unavailable",
             ),
             harness: None,
+            live_harness: None,
         }
     }
 }

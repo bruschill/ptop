@@ -14,6 +14,7 @@ ptop monitors local Pi coding-agent processes only. Process discovery is indepen
 | Terminal jump | Herdr, cmux, tmux, iTerm2 | Herdr, cmux, tmux | Disabled |
 | Herdr workspace presence | Yes | Yes | Disabled |
 | Pi process kill | Yes | Yes | Disabled |
+| Packaged live-harness extension lifecycle | Yes | Yes | Parsed but unsupported |
 
 Windows uses `sysinfo` and `netstat -ano`. It reports load average as 0. Jump and kill controls remain disabled until ptop can apply the same trusted process-identity checks used on Unix.
 
@@ -66,9 +67,17 @@ Unknown lifecycle versions do not become trusted run telemetry.
 
 Fleet telemetry also reports conservative `pi-subagents` availability: `Installed`, `NotInstalled`, or `Unknown`. ptop reads bounded (256 KiB) global `settings.json` plus an existing project `.pi/settings.json`, and examines at most 128 documented `packages` entries per file. Exact `npm:pi-subagents` names (with any nonempty version/range) and canonical GitHub `nicobailon/pi-subagents` Git/URL sources with an optional valid `@` ref prove `Installed`; a complete scan where every package is clearly different proves `NotInstalled`. Local, bare, unfamiliar, malformed, symlinked, replaced, oversized, or structurally ambiguous declarations produce `Unknown`. Negative package evidence is available only for owned session files lexically beneath the default `~/.pi/agent/sessions/` root; custom agent or session directories remain `Unknown`. A readable lifecycle status root also proves `Installed`. Process-only parent identity remains separate from extension availability.
 
+## Optional packaged live-harness extension
+
+`ptop extension install`, `status`, and `remove` are explicit local operations on macOS and Linux. The embedded self-contained TypeScript asset is installed only at the effective global Pi path `extensions/ptop-live-harness.ts`: `PI_CODING_AGENT_DIR` when it is an absolute path or exact supported `~` / `~/relative` form, otherwise `~/.pi/agent`. Lifecycle operations use descriptor-relative no-follow traversal and a bounded modifying-command lock. They verify exact SHA-256 bytes against the current asset or one of at most eight prior official records; the current release has no prior record. Unknown or modified content is never overwritten or removed. `status` is strictly read-only and creates neither directories nor lock files.
+
+There is no force, backup, rollback, update, restore, journal, or automated cleanup. Upgrade explicitly with `remove` followed by `install`; run `/reload` or restart Pi only after both succeed. A failed install can leave a partial or unknown fixed install temp before publication, a recognized target/temp pair after publication, or an installed target with durability uncertainty after directory sync. A completed remove unlink with a failed directory sync reports removal durability as uncertain. ptop does not recover or delete any state. After stopping Pi, users must inspect exact extension files before manually removing any residue. Windows parses the three commands and reports unsupported without filesystem mutation. JSONL attachment and process-only fallback are unchanged if optional live telemetry is absent.
+
+The installed extension starts its session-scoped AF_UNIX listener only after Pi `session_start`. It reduces only protocol-v1 phase and sampled pending-message state, and must not retain or emit event payloads, transcripts, tool data, titles, paths, or IDs. It stays inactive when JSON escaping would make a session identifier exceed the bounded 512-byte canonical frame; JSONL and process-only fallback remain available. The collector stages each frame until the next process snapshot revalidates its attachment, socket identity, and peer credentials. A committed observation is published as `telemetry.live_harness` in JSON. Healthy data may contain the reduced values. The first expiry tick reports stale and clears both values; the next tick or any stream rejection makes the field `null`. Selected-session detail adds at most one row after source metadata: known healthy values use `Live <phase> · pending <yes/no>`, unknown healthy values report unavailable, stale data uses `Live stale · values unavailable`, and unavailable telemetry adds no row. Existing height limits and Runs priority apply. Text `--once` output is unchanged.
+
 ## Privacy boundary
 
-The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. For attached version-3 sessions, JSON and selected-session detail may publish aggregate assistant outcomes, reconciled parent components and reported cost, at most 64 sorted Pi attribution buckets, and the approved bounded history projection: at most 64 latest assistant component observations in file order (with `null` gaps), safe per-point Pi attribution, and at most 64 positioned compaction or branch-summary markers. History publishes no IDs, timestamps, text, outcomes, costs, summary data, or compaction `tokensBefore` values. `telemetry.harness` is `null` for process-only rows, versions 1 and 2, unsupported sessions, failed attachments, and inconsistent projections. Its unavailable authoritative totals are `null`; `history` is an object only when its separate bounded projection validates, otherwise `null` without suppressing valid aggregates. It does not retain or publish:
+The parent JSONL parser retains identity, model/provider metadata, thinking level, numeric usage, context size, compaction state, and safe activity labels. The optional live harness publishes only the fixed phase enum, sampled pending-message boolean, source health, fixed AF_UNIX-v1 provenance, receipt time, stale flag, and fixed ptop reason after cross-tick validation. It publishes no epoch, sequence, PID, socket path or identity, session ID, credentials, event data, or reducer bookkeeping. For attached version-3 sessions, JSON and selected-session detail may publish aggregate assistant outcomes, reconciled parent components and reported cost, at most 64 sorted Pi attribution buckets, and the approved bounded history projection: at most 64 latest assistant component observations in file order (with `null` gaps), safe per-point Pi attribution, and at most 64 positioned compaction or branch-summary markers. History publishes no IDs, timestamps, text, outcomes, costs, summary data, or compaction `tokensBefore` values. `telemetry.harness` is `null` for process-only rows, versions 1 and 2, unsupported sessions, failed attachments, and inconsistent projections. Its unavailable authoritative totals are `null`; `history` is an object only when its separate bounded projection validates, otherwise `null` without suppressing valid aggregates. It does not retain or publish:
 
 - prompt text
 - assistant text
@@ -128,6 +137,7 @@ Orphan detection is cross-tick state. A child port becomes orphaned only after i
 - fleet runs and children
 - privacy-safe child process labels
 - `telemetry.harness` aggregate version-3 parent telemetry when validated
+- `telemetry.live_harness` reduced extension telemetry when cross-tick validation succeeds
 - orphan ports
 
 Snapshots omit monitor-mode discriminators, account quota, MCP server state, per-session transcript data, tool previews, file-audit data, and old multi-agent identifiers.
@@ -159,3 +169,5 @@ CI must pass on macOS, Linux, and Windows. Release builds must retain process-on
 ## Compatibility policy
 
 Pi session files and `pi-subagents` lifecycle files are local implementation contracts. New schema versions remain unavailable until explicitly supported and tested. ptop fails closed on ambiguous ownership and preserves the process row instead of inventing telemetry.
+
+Version 0.7.0 adds `live_harness` to the public `SessionTelemetry` and `SessionTelemetryView` Rust structs. The JSON change is additive, but exhaustive external Rust struct literals must add the new optional field, so this is an intentional pre-1.0 source break.
