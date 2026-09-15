@@ -178,10 +178,10 @@ fn connect_refuses_mode_or_inode_change_after_enumeration() {
     assert!(UnixLiveHarnessStream::connect(&candidate).is_err());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    drop(listener);
     fs::remove_file(&path).unwrap();
     let _replacement = bind_private_socket(&path);
     assert!(UnixLiveHarnessStream::connect(&candidate).is_err());
+    drop(listener);
 }
 
 #[test]
