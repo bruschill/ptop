@@ -50,7 +50,6 @@ mod unix {
     const INSTALL_TEMP: &[u8] = b".ptop-live-install\0";
     const LOCK: &[u8] = b".ptop-live-harness.lock\0";
     const MAX_BYTES: usize = 64 * 1024;
-    const MAX_PRIOR_OFFICIAL: usize = 8;
     // Current asset plus capacity for exactly eight prior official releases.
     // No historic digest is fabricated for this first lifecycle release.
     const PRIOR_OFFICIAL: [(&str, [u8; 32]); 0] = [];
@@ -347,7 +346,7 @@ mod unix {
                     }
                 })
     }
-    const _: () = assert!(PRIOR_OFFICIAL.len() <= MAX_PRIOR_OFFICIAL);
+    const _: () = assert!(PRIOR_OFFICIAL.len() <= 8);
 
     fn canonical_identity(dir: &Dir, name: &[u8]) -> Result<Identity, String> {
         let mut s = unsafe { std::mem::zeroed::<libc::stat>() };
